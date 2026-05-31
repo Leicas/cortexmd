@@ -1,32 +1,100 @@
 name: release
 
-# Build the `cortexmd` Rust binary for Linux / macOS / Windows on a version-tag
-# push, attach the archives to a GitHub Release, and (optionally) publish the
-# TS server to npm. CI (build/test) and contract parity live in their own
-# workflows; this one only runs on tags.
+# Continuous release driven by semantic-release (Conventional Commits).
+#
+# On every push to main:
+#   1. semantic-release analyzes commits, and if a release is warranted, creates
+#      the GitHub Release + git tag vX.Y.Z and the release notes.
+#   2. If (and only if) a release was published, build + push the server Docker
+#      image to GHCR (ghcr.io/<owner>/cortexmd:X.Y.Z + :latest), and build the
+#      Rust `cortexmd` binaries and attach them to the release.
+#
+# Deploy side: a host that runs `image: ghcr.io/<owner>/cortexmd:latest` (e.g. a
+# Komodo stack with auto-update) pulls the new image automatically — no build on
+# the deploy host, no source checkout. See docs/deploy-http.md.
 
 on:
   push:
-    tags:
-      - "v*"
+    branches: [main]
   workflow_dispatch:
-    inputs:
-      publish_server:
-        description: "Also publish @cortexmd/server to npm"
-        type: boolean
-        default: false
 
-permissions:
-  contents: write   # create releases + upload assets
-
+# Avoid overlapping releases.
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
-  build-cli:
-    name: cortexmd (${{ matrix.target }})
+  release:
+    name: semantic-release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write        # create releases + tags
+      issues: write          # semantic-release release/PR comments
+      pull-requests: write
+    outputs:
+      published: ${{ steps.semantic.outputs.new_release_published }}
+      version: ${{ steps.semantic.outputs.new_release_version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0      # full history so commit analysis works
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Run semantic-release
+        id: semantic
+        uses: cycjimmy/semantic-release-action@v4
+        with:
+          # Config lives in .releaserc.json (commit-analyzer + notes + github;
+          # NO npm publish).
+          extra_plugins: |
+            @semantic-release/commit-analyzer
+            @semantic-release/release-notes-generator
+            @semantic-release/github
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  docker:
+    name: Build + push GHCR image
+    needs: release
+    if: needs.release.outputs.published == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write        # push to GHCR
+    steps:
+      - uses: actions/checkout@v4
+      - name: Lowercase image name
+        id: img
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/cortexmd" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@v3
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build + push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ steps.img.outputs.name }}:${{ needs.release.outputs.version }}
+            ${{ steps.img.outputs.name }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  binaries:
+    name: cortexmd binary (${{ matrix.target }})
+    needs: release
+    if: needs.release.outputs.published == 'true'
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write        # upload assets to the release
     strategy:
       fail-fast: false
       matrix:
@@ -43,23 +111,16 @@ jobs:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             ext: ".exe"
-    defaults:
-      run:
-        working-directory: crates/cli
     steps:
       - uses: actions/checkout@v4
-
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: crates/cli
-
       - name: Build release binary
-        run: cargo build --release --locked --target ${{ matrix.target }}
-
+        run: cargo build --release --locked --target ${{ matrix.target }} --bin cortexmd
       - name: Package
         shell: bash
         run: |
@@ -68,63 +129,16 @@ jobs:
           stage="cortexmd-${{ matrix.target }}"
           mkdir -p "$stage"
           cp "$bin" "$stage/"
-          cp ../../README.md ../../LICENSE "$stage/" 2>/dev/null || true
+          cp README.md LICENSE "$stage/" 2>/dev/null || true
           if [ "${{ matrix.os }}" = "windows-latest" ]; then
             7z a "$stage.zip" "$stage" >/dev/null
-            echo "ASSET=crates/cli/$stage.zip" >> "$GITHUB_ENV"
+            echo "ASSET=$stage.zip" >> "$GITHUB_ENV"
           else
             tar -czf "$stage.tar.gz" "$stage"
-            echo "ASSET=crates/cli/$stage.tar.gz" >> "$GITHUB_ENV"
+            echo "ASSET=$stage.tar.gz" >> "$GITHUB_ENV"
           fi
-
-      - name: Upload build artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: cortexmd-${{ matrix.target }}
-          path: ${{ env.ASSET }}
-          if-no-files-found: error
-
-  release:
-    name: Publish GitHub Release
-    needs: build-cli
-    runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v')
-    steps:
-      - name: Download all build artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: dist
-          merge-multiple: true
-
-      - name: Create / update release and attach binaries
-        uses: softprops/action-gh-release@v2
-        with:
-          files: dist/*
-          generate_release_notes: true
-          fail_on_unmatched_files: true
-
-  publish-server:
-    name: Publish @cortexmd/server to npm
-    needs: build-cli
-    runs-on: ubuntu-latest
-    # Opt-in: tag push only publishes when NPM_TOKEN is configured, or via the
-    # workflow_dispatch checkbox. Never blocks the binary release.
-    if: |
-      (startsWith(github.ref, 'refs/tags/v') && vars.PUBLISH_SERVER == 'true') ||
-      (github.event_name == 'workflow_dispatch' && inputs.publish_server)
-    defaults:
-      run:
-        working-directory: packages/server
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          registry-url: https://registry.npmjs.org
-          cache: npm
-          cache-dependency-path: packages/server/package-lock.json
-      - run: npm ci
-      - run: npm run build
-      - run: npm publish --access public
+      - name: Attach to release
+        shell: bash
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "v${{ needs.release.outputs.version }}" "$ASSET" --clobber

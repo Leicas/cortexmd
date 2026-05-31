@@ -44,7 +44,7 @@ import { saveSessions, loadSessions } from './lib/persistence.js';
 import type { PersistedSession } from './lib/persistence.js';
 import { cleanupExpired, checkRateLimit } from './lib/rate-limit.js';
 import type { RequestCategory } from './lib/metrics.js';
-import { dashboardRouter } from './dashboard.js';
+import { dashboardRouter } from './dashboard/index.js';
 import { oauthRouter } from './oauth.js';
 
 // Tool registration imports
@@ -1758,8 +1758,11 @@ function indexInfoForVault(vaultPath: string): { indexedDocs?: number; status: s
   }
 }
 
-// GET /api/source-vaults — list effective (env + persisted) read-only vaults.
-app.get('/api/source-vaults', dashboardAuthMiddleware, (_req: Request, res: Response) => {
+// GET /dashboard/api/source-vaults — list effective (env + persisted) read-only
+// vaults. Lives under /dashboard so it shares the dashboard's auth scope (cookie
+// session / API key / forward-auth Remote-User); a /api/* path is NOT covered by
+// the proxy's /dashboard forward-auth and 401s.
+app.get('/dashboard/api/source-vaults', dashboardAuthMiddleware, (_req: Request, res: Response) => {
   try {
     const envNames = new Set(config.sourceVaultConfigs.map((v) => v.name));
     const vaults = listSourceVaults().map((v) => {
@@ -1786,8 +1789,8 @@ const addSourceVaultSchema = z.object({
   includeGlobs: z.array(z.string()).optional(),
 });
 
-// POST /api/source-vaults — register a new persisted read-only vault.
-app.post('/api/source-vaults', dashboardAuthMiddleware, (req: Request, res: Response) => {
+// POST /dashboard/api/source-vaults — register a new persisted read-only vault.
+app.post('/dashboard/api/source-vaults', dashboardAuthMiddleware, (req: Request, res: Response) => {
   const parsed = addSourceVaultSchema.safeParse(req.body);
   if (!parsed.success) {
     res.status(400).json({ error: parsed.error.issues[0]?.message ?? 'Invalid request body' });
@@ -1812,8 +1815,8 @@ app.post('/api/source-vaults', dashboardAuthMiddleware, (req: Request, res: Resp
   }
 });
 
-// DELETE /api/source-vaults/:name — remove a persisted read-only vault.
-app.delete('/api/source-vaults/:name', dashboardAuthMiddleware, (req: Request, res: Response) => {
+// DELETE /dashboard/api/source-vaults/:name — remove a persisted read-only vault.
+app.delete('/dashboard/api/source-vaults/:name', dashboardAuthMiddleware, (req: Request, res: Response) => {
   const name = String(req.params.name ?? '');
   try {
     removeSourceVault(name);

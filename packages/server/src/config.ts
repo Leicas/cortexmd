@@ -157,7 +157,10 @@ function parseSourceVaultEntry(rawEntry: string): SourceVault {
   let pathPart = rest;
   let includeGlobs: string[] = [];
   const lastColon = rest.lastIndexOf(':');
-  if (lastColon > 0) {
+  // A leading Windows drive-letter colon ("C:/vault", "D:\notes") is part of
+  // the path, not the path:glob separator — don't split on it.
+  const isDriveColon = lastColon === 1 && /^[A-Za-z]:/.test(rest);
+  if (lastColon > 0 && !isDriveColon) {
     const maybeGlobs = rest.slice(lastColon + 1);
     if (/[|*?\[\/]/.test(maybeGlobs)) {
       pathPart = rest.slice(0, lastColon).trim();

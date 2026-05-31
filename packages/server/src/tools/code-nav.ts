@@ -701,7 +701,7 @@ export function registerCodeIndexRepo(server: McpServer): void {
 
 const SymbolKind = z.enum([
   'function', 'class', 'method', 'interface', 'type',
-  'const-export', 'struct', 'enum', 'trait', 'impl',
+  'const-export', 'struct', 'enum', 'trait', 'impl', 'union',
 ]);
 const Language = z.enum(['typescript', 'tsx', 'javascript', 'python', 'rust', 'go', 'cpp']);
 

@@ -1,5 +1,5 @@
 /**
- * Input sanitization utilities for the Obsidian MCP server.
+ * Input sanitization utilities for the cortexmd server.
  */
 
 /**

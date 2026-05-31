@@ -20,6 +20,7 @@ const SKIP_DIRS: &[&str] = &[
     "venv",
     ".venv",
     "vendor",
+    ".history",
 ];
 
 const DENIED_SEGMENTS: &[&str] = &[".obsidian", ".sync", ".trash"];

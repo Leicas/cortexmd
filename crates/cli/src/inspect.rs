@@ -59,6 +59,7 @@ const SKIP_DIRS: &[&str] = &[
     "venv",
     ".venv",
     "vendor",
+    ".history",
 ];
 
 fn now_secs() -> u64 {

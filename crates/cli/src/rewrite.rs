@@ -726,12 +726,21 @@ fn fetch_repo_paths_from_server() -> Result<Vec<CachedRepo>> {
 mod tests {
     use super::*;
 
+    // Absolute fixture root that is valid on the host OS: `D:/...` is only an
+    // absolute path on Windows (match_indexed_path joins cwd otherwise), so the
+    // Unix variant uses a POSIX-absolute root. Keeps these unit tests honest on
+    // the whole CI matrix.
+    #[cfg(windows)]
+    const BASE: &str = "D:/dev";
+    #[cfg(not(windows))]
+    const BASE: &str = "/dev";
+
     fn repos() -> Vec<CachedRepo> {
         vec![
             CachedRepo {
                 slug: "demo".to_string(),
                 paths: vec![CachedRepoPath {
-                    abs_path: "D:/dev/demo".to_string(),
+                    abs_path: format!("{BASE}/demo"),
                 }],
             },
         ]
@@ -800,10 +809,8 @@ mod tests {
 
     #[test]
     fn rewrite_grep_with_indexed_path_matches() {
-        let toks: Vec<String> = vec!["grep", "fooBar", "D:/dev/demo/src"]
-            .into_iter()
-            .map(String::from)
-            .collect();
+        let toks: Vec<String> =
+            vec!["grep".into(), "fooBar".into(), format!("{BASE}/demo/src")];
         let r = rewrite_grep_like(&toks, &repos());
         assert!(r.is_some());
         let s = r.unwrap();
@@ -814,19 +821,18 @@ mod tests {
 
     #[test]
     fn rewrite_grep_regex_pattern_skipped() {
-        let toks: Vec<String> = vec!["grep", "foo.*", "D:/dev/demo/src"]
-            .into_iter()
-            .map(String::from)
-            .collect();
+        let toks: Vec<String> =
+            vec!["grep".into(), "foo.*".into(), format!("{BASE}/demo/src")];
         assert!(rewrite_grep_like(&toks, &repos()).is_none());
     }
 
     #[test]
     fn rewrite_grep_bre_alternation_emits_or_query() {
-        let toks: Vec<String> = vec!["grep", "speech\\|tts\\|speak", "D:/dev/demo/src"]
-            .into_iter()
-            .map(String::from)
-            .collect();
+        let toks: Vec<String> = vec![
+            "grep".into(),
+            "speech\\|tts\\|speak".into(),
+            format!("{BASE}/demo/src"),
+        ];
         let r = rewrite_grep_like(&toks, &repos());
         assert!(r.is_some(), "alternation should rewrite");
         let s = r.unwrap();
@@ -841,28 +847,27 @@ mod tests {
     #[test]
     fn rewrite_grep_alternation_with_regex_term_skipped() {
         // One alternation arm has a regex meta — whole thing must fall through.
-        let toks: Vec<String> = vec!["grep", "speech\\|foo.*", "D:/dev/demo/src"]
-            .into_iter()
-            .map(String::from)
-            .collect();
+        let toks: Vec<String> = vec![
+            "grep".into(),
+            "speech\\|foo.*".into(),
+            format!("{BASE}/demo/src"),
+        ];
         assert!(rewrite_grep_like(&toks, &repos()).is_none());
     }
 
     #[test]
     fn rewrite_grep_unindexed_path_skipped() {
-        let toks: Vec<String> = vec!["grep", "fooBar", "D:/dev/somewhere-else"]
-            .into_iter()
-            .map(String::from)
-            .collect();
+        let toks: Vec<String> = vec![
+            "grep".into(),
+            "fooBar".into(),
+            format!("{BASE}/somewhere-else"),
+        ];
         assert!(rewrite_grep_like(&toks, &repos()).is_none());
     }
 
     #[test]
     fn rewrite_cat_indexed_source_matches() {
-        let toks: Vec<String> = vec!["cat", "D:/dev/demo/src/foo.ts"]
-            .into_iter()
-            .map(String::from)
-            .collect();
+        let toks: Vec<String> = vec!["cat".into(), format!("{BASE}/demo/src/foo.ts")];
         let r = rewrite_file_view(&toks, &repos());
         assert!(r.is_some());
         assert!(r.unwrap().contains("code-outline"));
@@ -870,19 +875,18 @@ mod tests {
 
     #[test]
     fn rewrite_cat_non_source_skipped() {
-        let toks: Vec<String> = vec!["cat", "D:/dev/demo/README.md"]
-            .into_iter()
-            .map(String::from)
-            .collect();
+        let toks: Vec<String> = vec!["cat".into(), format!("{BASE}/demo/README.md")];
         assert!(rewrite_file_view(&toks, &repos()).is_none());
     }
 
     #[test]
     fn rewrite_head_with_n_flag_strips_it() {
-        let toks: Vec<String> = vec!["head", "-n", "50", "D:/dev/demo/src/foo.ts"]
-            .into_iter()
-            .map(String::from)
-            .collect();
+        let toks: Vec<String> = vec![
+            "head".into(),
+            "-n".into(),
+            "50".into(),
+            format!("{BASE}/demo/src/foo.ts"),
+        ];
         let r = rewrite_head_tail(&toks, &repos());
         assert!(r.is_some());
         assert!(r.unwrap().contains("code-outline"));

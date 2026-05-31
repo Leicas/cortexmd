@@ -8,6 +8,8 @@ import { resetRateLimit, resetAllRateLimits } from '../../lib/rate-limit.js';
 import { killSession } from '../../index.js';
 import { rebuildIndex, getDocMeta } from '../../lib/search.js';
 import { kgBootstrap, isKgInitialized } from '../../lib/knowledge-graph.js';
+import { backfillEntities } from '../../lib/entity-backfill.js';
+import { acquireOperation, releaseOperation } from '../../lib/operation-mutex.js';
 import { getBenchmarkResults, setBenchmarkResults } from '../../lib/metrics.js';
 import { runBenchmark, saveAsGroundTruth } from '../../lib/benchmark.js';
 import { runMigration } from '../../lib/migration.js';
@@ -88,6 +90,31 @@ export function registerActionRoutes(router: Router): void {
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       res.status(500).json({ error: msg });
+    }
+  });
+
+  // Scan the indexed corpus, run heuristic entity detection, and (re)populate the
+  // persistent entity registry (+ optional KG mentions_* triples). Idempotent.
+  // MUST stay under /dashboard/* — an /api/* route 401s behind forward-auth.
+  router.post('/dashboard/api/entities/rebuild', async (req: Request, res: Response) => {
+    if (!acquireOperation('entity-rebuild')) {
+      res.status(409).json({ error: 'Entity rebuild already running' });
+      return;
+    }
+    try {
+      const body = (req.body ?? {}) as { limit?: number; minConfidence?: number; seedKg?: boolean };
+      const dm = getDocMeta();
+      const result = backfillEntities(dm, {
+        limit: body.limit,
+        minConfidence: body.minConfidence,
+        seedKg: body.seedKg,
+      });
+      res.json({ ok: true, ...result });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      res.status(500).json({ error: msg });
+    } finally {
+      releaseOperation('entity-rebuild');
     }
   });
 

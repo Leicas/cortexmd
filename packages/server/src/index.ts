@@ -89,6 +89,7 @@ import { register as registerKgInvalidate } from './tools/kg-invalidate.js';
 import { register as registerCheckDuplicate } from './tools/check-duplicate.js';
 import { register as registerConversationsMine } from './tools/conversations-mine.js';
 import { register as registerEntityDetect } from './tools/entity-detect.js';
+import { register as registerEntityRebuild } from './tools/entity-rebuild.js';
 import { register as registerMemoryWakeup } from './tools/memory-wakeup.js';
 import { register as registerGraphTraverse } from './tools/graph-traverse.js';
 import { register as registerDiaryWrite } from './tools/diary-write.js';
@@ -204,6 +205,7 @@ const allRegistrations = [
   registerIndexRepair,
   registerGraphStats,
   registerKgStats,
+  registerEntityRebuild,
   registerVaultStatus,
   registerVaultTaxonomy,
   registerNotesDelete,

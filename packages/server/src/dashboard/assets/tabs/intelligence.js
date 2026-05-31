@@ -13,6 +13,39 @@ export default {
 
   /** One-time: register the action callbacks the server fragment calls. */
   init(el, ctx) {
+    var self = this;
+
+    // Rebuild the entity registry: scan the indexed corpus, run heuristic entity
+    // detection, and (re)populate the persistent registry (+ KG mentions_* triples).
+    // POSTs to the dashboard-scoped endpoint, toggles the button, toasts the
+    // summary, and re-renders the Entity Intelligence panel from the live registry.
+    window.cortex.rebuildEntities = function () {
+      var btn = ctx.$('btnEntityRebuild');
+      if (btn) { btn.disabled = true; btn.textContent = 'Rebuilding...'; }
+      fetch('/dashboard/api/entities/rebuild', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: '{}',
+      })
+        .then(function (r) { return r.json(); })
+        .then(function (d) {
+          if (btn) { btn.disabled = false; btn.textContent = 'Rebuild entities'; }
+          if (d.ok) {
+            ctx.toast('Entity rebuild complete: ' + (d.uniqueEntities || 0) + ' entities from ' + (d.scanned || 0) + ' notes', 'success');
+            // Re-render the panel immediately from the now-populated live registry
+            // (it also refreshes on the next SSE tick — no stale cache).
+            var panel = ctx.$('tab-intelligence');
+            if (panel && self.refresh) self.refresh(panel, ctx);
+          } else {
+            ctx.toast(d.error || 'Entity rebuild failed', 'error');
+          }
+        })
+        .catch(function (e) {
+          if (btn) { btn.disabled = false; btn.textContent = 'Rebuild entities'; }
+          ctx.toast('Entity rebuild failed: ' + e.message, 'error');
+        });
+    };
+
     // Run a dream cycle (optionally with LLM consolidation). Toggles the button
     // state and toasts the outcome — matches legacy window.runDreamCycle.
     window.cortex.runDreamCycle = function (withLlm) {

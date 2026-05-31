@@ -109,7 +109,10 @@ export function renderIntelligenceTab(): string {
   <!-- Row 4: Entity Intelligence + Knowledge Graph -->
   <div class="row row-2">
     <div class="card">
-      <div class="section-title">Entity Intelligence</div>
+      <div class="section-head">
+        <div class="section-title" style="margin-bottom:0">Entity Intelligence</div>
+        <button class="btn btn-primary" id="btnEntityRebuild" onclick="cortex.rebuildEntities()">Rebuild entities</button>
+      </div>
       <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:.75rem;margin-bottom:.75rem">
         <div>
           <div class="card-label">Total Entities</div>

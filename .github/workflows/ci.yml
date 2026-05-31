@@ -17,19 +17,17 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
-    defaults:
-      run:
-        working-directory: packages/server
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: npm
-          cache-dependency-path: packages/server/package-lock.json
+          cache-dependency-path: package-lock.json
+      # Install the whole npm workspace from the root lockfile, then build the
+      # server (its `build` script runs tsc, which type-checks + emits).
       - run: npm ci
-      - run: npx tsc --noEmit
-      - run: npm run build
+      - run: npm run build:server
 
   cli:
     name: Rust CLI (build + test)

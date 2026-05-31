@@ -26,7 +26,7 @@ jobs:
         with:
           node-version: 22
           cache: npm
-          cache-dependency-path: packages/server/package-lock.json
+          cache-dependency-path: package-lock.json
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -36,12 +36,12 @@ jobs:
       # pipeline and fail if it differs from the checked-in expected JSON.
       - name: Rust parser — regen + diff vs expected
         run: |
-          cargo run --release --locked --manifest-path crates/cli/Cargo.toml -- \
+          cargo run --release --locked --bin cortexmd --manifest-path crates/cli/Cargo.toml -- \
             contract regen contract/fixtures/sample-repo --emit expected \
             > contract/fixtures/out/rust.json
           if ! diff -u contract/fixtures/expected-symbol-ids.json contract/fixtures/out/rust.json; then
             echo "::error::Rust parser drifted from contract/fixtures/expected-symbol-ids.json."
-            echo "::error::Regenerate with: cargo run -p cortexmd-cli -- contract regen contract/fixtures/sample-repo --emit expected"
+            echo "::error::Regenerate with: cargo run --bin cortexmd -- contract regen contract/fixtures/sample-repo --emit expected"
             exit 1
           fi
           echo "Rust parser matches expected-symbol-ids.json"
@@ -50,11 +50,9 @@ jobs:
       # the SAME parseFile() the server uses over the SAME sample-repo and diffs
       # its symbol IDs against the SAME expected JSON.
       - name: Install server deps
-        working-directory: packages/server
         run: npm ci
       - name: Build server
-        working-directory: packages/server
-        run: npm run build
+        run: npm run build:server
       - name: TS parser — parity vs expected
         working-directory: packages/server
         # The harness imports the compiled parser, which transitively loads

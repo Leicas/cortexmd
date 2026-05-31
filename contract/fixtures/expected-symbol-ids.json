@@ -1,0 +1,146 @@
+{
+  "src/helper.rs": [
+    {
+      "name": "clamp",
+      "kind": "function",
+      "id": "3b3f978c3b275a09",
+      "signature_normalized": "pub fn clamp(value: i64, lo: i64, hi: i64) -> i64"
+    }
+  ],
+  "src/lib.rs": [
+    {
+      "name": "reduce_sum",
+      "kind": "function",
+      "id": "c3980af9639c3c39",
+      "signature_normalized": "pub fn reduce_sum<T>( items: &[T], seed: i64, ) -> i64"
+    },
+    {
+      "name": "add",
+      "kind": "function",
+      "id": "b686c7a39bff80b1",
+      "signature_normalized": "pub fn add(a: i64, b: i64) -> i64"
+    },
+    {
+      "name": "Vec2",
+      "kind": "struct",
+      "id": "5e6ff695c649d345",
+      "signature_normalized": "pub struct Vec2"
+    },
+    {
+      "name": "Vec2",
+      "kind": "impl",
+      "id": "6e1af3abd0a68c02",
+      "signature_normalized": "impl Vec2"
+    },
+    {
+      "name": "length",
+      "kind": "method",
+      "id": "742b00cf805d255c",
+      "signature_normalized": "pub fn length(&self) -> i64"
+    }
+  ],
+  "src/math.go": [
+    {
+      "name": "ReduceSum",
+      "kind": "function",
+      "id": "8c54330c8315a20f",
+      "signature_normalized": "func ReduceSum( seed int, items ...int, ) int"
+    },
+    {
+      "name": "Add",
+      "kind": "function",
+      "id": "3e360f2f8e0701f9",
+      "signature_normalized": "func Add(a int, b int) int"
+    },
+    {
+      "name": "Clamp",
+      "kind": "function",
+      "id": "54f5929a0019a709",
+      "signature_normalized": "func Clamp(value int, lo int, hi int) int"
+    }
+  ],
+  "src/math.ts": [
+    {
+      "name": "add",
+      "kind": "function",
+      "id": "d11b9fb921acabc8",
+      "signature_normalized": "function add(a: number, b: number): number"
+    },
+    {
+      "name": "reduceSum",
+      "kind": "function",
+      "id": "72ba8c998552da75",
+      "signature_normalized": "function reduceSum<T>(items: T[], seed: number = 0, ...extra: number[]): number"
+    },
+    {
+      "name": "Point",
+      "kind": "interface",
+      "id": "8654df6167397c60",
+      "signature_normalized": "interface Point"
+    },
+    {
+      "name": "Vec2",
+      "kind": "class",
+      "id": "58bce144c502249b",
+      "signature_normalized": "class Vec2"
+    },
+    {
+      "name": "constructor",
+      "kind": "method",
+      "id": "8794f645989f7b24",
+      "signature_normalized": "constructor(public p: Point)"
+    },
+    {
+      "name": "length",
+      "kind": "method",
+      "id": "c1394ce9588e0e2f",
+      "signature_normalized": "length(): number"
+    }
+  ],
+  "src/util.py": [
+    {
+      "name": "clamp",
+      "kind": "function",
+      "id": "9bcb7988b3dd5c73",
+      "signature_normalized": "def clamp(value, lo=0, hi=1)"
+    },
+    {
+      "name": "reduce_sum",
+      "kind": "function",
+      "id": "58ac92d741bae371",
+      "signature_normalized": "def reduce_sum(items, seed=0, *extra, **opts)"
+    },
+    {
+      "name": "Vec2",
+      "kind": "class",
+      "id": "746a588c57277fd5",
+      "signature_normalized": "class Vec2"
+    },
+    {
+      "name": "__init__",
+      "kind": "method",
+      "id": "e21398929a10de6e",
+      "signature_normalized": "def __init__(self, x, y)"
+    },
+    {
+      "name": "length",
+      "kind": "method",
+      "id": "119662c3a9b30044",
+      "signature_normalized": "def length(self)"
+    }
+  ],
+  "src/util.ts": [
+    {
+      "name": "clamp",
+      "kind": "function",
+      "id": "fcf67b1b0a675fc1",
+      "signature_normalized": "function clamp(value: number, lo: number = 0, hi: number = 1): number"
+    },
+    {
+      "name": "identity",
+      "kind": "const-export",
+      "id": "b845786b150dca64",
+      "signature_normalized": "const identity = (x: number): number => x"
+    }
+  ]
+}

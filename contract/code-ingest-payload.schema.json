@@ -1,0 +1,112 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cortexmd.dev/contract/code-ingest-payload.schema.json",
+  "title": "code_ingest_repo payload",
+  "description": "Wire format emitted by the cortexmd-cli indexer and consumed by the cortexmd server. All field names are snake_case.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["repo_id", "files"],
+  "properties": {
+    "repo_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Stable, immutable repo identifier. Part of every symbol_id hash."
+    },
+    "git_origin": {
+      "type": ["string", "null"],
+      "description": "Remote origin URL, or null if unknown / no remote."
+    },
+    "files": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/file" }
+    }
+  },
+  "$defs": {
+    "file": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["relative_path", "language", "symbols"],
+      "properties": {
+        "relative_path": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Repo-relative POSIX path. Part of every symbol_id hash."
+        },
+        "language": {
+          "type": "string",
+          "enum": ["typescript", "tsx", "javascript", "python", "rust", "go", "cpp"]
+        },
+        "symbols": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/symbol" }
+        },
+        "calls": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/call" },
+          "default": []
+        },
+        "imports": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/import" },
+          "default": []
+        }
+      }
+    },
+    "symbol": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "kind", "name", "signature", "start_line", "end_line"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{16}$",
+          "description": "sha1(repo_id|relative_path|name|kind|signature_normalized)[:16]."
+        },
+        "kind": {
+          "type": "string",
+          "description": "Symbol kind, e.g. function, method, class, struct, interface, enum, type, const."
+        },
+        "name": { "type": "string", "minLength": 1 },
+        "signature": {
+          "type": "string",
+          "description": "Raw signature text; normalized before hashing (whitespace collapsed, trimmed, empty -> '<no-sig>')."
+        },
+        "start_line": { "type": "integer", "minimum": 1 },
+        "end_line": { "type": "integer", "minimum": 1 },
+        "docstring": { "type": ["string", "null"] },
+        "body_simhash": {
+          "type": ["string", "null"],
+          "description": "Optional 64-bit SimHash of the symbol body (hex), used for copy-paste detection."
+        }
+      }
+    },
+    "call": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["caller", "callee"],
+      "properties": {
+        "caller": {
+          "type": "string",
+          "description": "symbol_id of the calling symbol."
+        },
+        "callee": {
+          "type": "string",
+          "description": "Resolved symbol_id of the callee, or the raw callee name when unresolved."
+        },
+        "line": { "type": ["integer", "null"], "minimum": 1 }
+      }
+    },
+    "import": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["module"],
+      "properties": {
+        "module": {
+          "type": "string",
+          "description": "Imported module specifier as written in source."
+        },
+        "line": { "type": ["integer", "null"], "minimum": 1 }
+      }
+    }
+  }
+}

@@ -1,0 +1,36 @@
+# ---- Node / TypeScript (packages/server) ----
+node_modules/
+dist/
+build/
+*.tsbuildinfo
+npm-debug.log*
+.npm/
+coverage/
+
+# ---- Rust (crates/cli) ----
+target/
+**/*.rs.bk
+
+# ---- Runtime data / indexes ----
+data/
+*.hnsw
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.db
+
+# ---- Secrets / config ----
+.env
+.env.*
+!.env.example
+
+# ---- OS junk ----
+.DS_Store
+Thumbs.db
+desktop.ini
+*~
+.*.swp
+
+# ---- Editors ----
+.vscode/
+.idea/

@@ -1,0 +1,10 @@
+[workspace]
+members = ["crates/*"]
+resolver = "2"
+
+# Release profile lives at the workspace root (Cargo ignores profiles declared
+# in non-root member manifests).
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1

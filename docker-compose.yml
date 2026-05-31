@@ -1,0 +1,89 @@
+# cortexmd — env-driven Docker Compose deployment.
+#
+# Quick start:
+#   1. Point BRAIN_VAULT at a writable host dir, and (optionally) SOURCE_VAULTS
+#      at one or more read-only note dirs.
+#   2. docker compose up -d --build
+#   3. Grab the generated API key / dashboard password from the logs the first
+#      time it boots (or set API_KEY / DASHBOARD_PASSWORD yourself).
+#
+# Everything is parametrized via the environment — nothing host-specific is
+# baked in. Set values in a `.env` file next to this one, e.g.:
+#
+#   BRAIN_VAULT=./data/brain          # writable; the ONLY dir the server writes
+#   SOURCE_VAULTS=./data/notes        # read-only sources, comma-separated
+#   API_PORT=3000
+#   # API_KEY=                        # auto-generated + printed if unset
+#   # DASHBOARD_PASSWORD=             # auto-generated + printed if unset
+#   ENABLE_EMBEDDINGS=true
+#   DREAM_SCHEDULE=                   # cron; empty disables consolidation
+
+services:
+  cortexmd:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: cortexmd
+    container_name: cortexmd
+    ports:
+      - "${API_PORT:-3000}:${API_PORT:-3000}"
+    environment:
+      NODE_ENV: production
+      API_PORT: "${API_PORT:-3000}"
+      DATA_DIR: /app/data
+      # Vault layout inside the container (bind-mounted from the host below).
+      BRAIN_VAULT: /app/brain
+      SOURCE_VAULTS: "${SOURCE_VAULTS_CONTAINER:-/app/sources}"
+      # Externally reachable base URL — set this for OAuth metadata/callbacks.
+      PUBLIC_URL: "${PUBLIC_URL:-http://localhost:${API_PORT:-3000}}"
+      # Secrets: left unset here so the server auto-generates and persists them
+      # under DATA_DIR on first boot (printed once to the logs). Override by
+      # exporting API_KEY / DASHBOARD_PASSWORD in your .env — never commit them.
+      API_KEY: "${API_KEY:-}"
+      DASHBOARD_PASSWORD: "${DASHBOARD_PASSWORD:-}"
+      # Features.
+      ENABLE_EMBEDDINGS: "${ENABLE_EMBEDDINGS:-true}"
+      DREAM_SCHEDULE: "${DREAM_SCHEDULE:-}"
+      # --- Optional: reranker (off by default; no default host/model) ---------
+      # Bring your own inference endpoint; nothing is hardcoded.
+      #   ENABLE_RERANKER: "true"
+      #   RERANKER_PROVIDER: openai-compatible
+      #   RERANKER_BASE_URL: "${RERANKER_BASE_URL}"   # e.g. http://inference:4040
+      #   RERANKER_MODEL: "${RERANKER_MODEL}"
+      ENABLE_RERANKER: "${ENABLE_RERANKER:-false}"
+      # --- Optional: forward-auth (off by default) ----------------------------
+      # Only enable when a trusted reverse proxy (Authelia, oauth2-proxy,
+      # Traefik forward-auth, …) actually terminates auth in front of the
+      # server; otherwise clients could spoof the forwarded headers.
+      # See docs/deploy-http.md §2.
+      #   PROXY_AUTH: "true"
+    volumes:
+      # Writable brain vault. Example host paths in comments — adjust to taste.
+      #   ${BRAIN_VAULT}=./data/brain  (relative to this compose file)
+      - "${BRAIN_VAULT:-./data/brain}:/app/brain"
+      # Read-only source vault(s). For multiple sources, add more `:ro` mounts
+      # and list them (comma-separated) in SOURCE_VAULTS_CONTAINER.
+      #   ${SOURCE_VAULTS}=./data/notes
+      - "${SOURCE_VAULTS:-./data/notes}:/app/sources:ro"
+      # Persistent server state: SQLite cache, HNSW index, model + source cache.
+      - cortexmd-data:/app/data
+    restart: unless-stopped
+    stop_grace_period: 15s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:'+(process.env.API_PORT||3000)+'/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+volumes:
+  cortexmd-data:

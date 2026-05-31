@@ -1,0 +1,11 @@
+# Build context excludes — keep the image lean and reproducible.
+node_modules
+**/node_modules
+dist
+**/dist
+target
+.git
+.github
+.env
+**/.env
+*.log

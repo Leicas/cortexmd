@@ -1,0 +1,65 @@
+name: contract
+
+# Symbol-ID parity gate. Both toolchains ingest contract/fixtures/sample-repo
+# and must agree, byte-for-byte, with the checked-in
+# contract/fixtures/expected-symbol-ids.json (the Rust indexer is the source of
+# truth — see contract/symbol-id.md). If either side drifts, this job goes red.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: contract-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  contract:
+    name: Symbol-ID golden-fixture parity
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Toolchains mirror .github/workflows/ci.yml: Node 22 + stable Rust.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: packages/server/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/cli
+
+      # (a) Rust side — regenerate the golden file from the production parser
+      # pipeline and fail if it differs from the checked-in expected JSON.
+      - name: Rust parser — regen + diff vs expected
+        run: |
+          cargo run --release --locked --manifest-path crates/cli/Cargo.toml -- \
+            contract regen contract/fixtures/sample-repo --emit expected \
+            > contract/fixtures/out/rust.json
+          if ! diff -u contract/fixtures/expected-symbol-ids.json contract/fixtures/out/rust.json; then
+            echo "::error::Rust parser drifted from contract/fixtures/expected-symbol-ids.json."
+            echo "::error::Regenerate with: cargo run -p cortexmd-cli -- contract regen contract/fixtures/sample-repo --emit expected"
+            exit 1
+          fi
+          echo "Rust parser matches expected-symbol-ids.json"
+
+      # (b) TS side — build the server, then run the parity harness, which runs
+      # the SAME parseFile() the server uses over the SAME sample-repo and diffs
+      # its symbol IDs against the SAME expected JSON.
+      - name: Install server deps
+        working-directory: packages/server
+        run: npm ci
+      - name: Build server
+        working-directory: packages/server
+        run: npm run build
+      - name: TS parser — parity vs expected
+        working-directory: packages/server
+        # The harness imports the compiled parser, which transitively loads
+        # config.js — that module requires API_KEY at import time. The value is
+        # never used for parsing; a dummy keeps the import side-effect happy.
+        env:
+          API_KEY: ci-contract-dummy
+        run: npm run contract:check

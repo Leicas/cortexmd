@@ -1,0 +1,12 @@
+{
+  "name": "cortexmd",
+  "private": true,
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "build:server": "npm -w packages/server run build",
+    "test:server": "npm -w packages/server run test",
+    "dev:server": "npm -w packages/server run dev"
+  }
+}

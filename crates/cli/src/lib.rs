@@ -270,6 +270,14 @@ fn run_index(args: IndexArgs) -> Result<()> {
         return Ok(());
     }
 
+    // Nothing parsed (e.g. a docker/config/data repo with no supported source).
+    // Skip the round-trip — a full_replace ingest with 0 files is refused by the
+    // server, and an empty payload is never what the user wants to send anyway.
+    if payload.files.is_empty() {
+        println!("[client] no indexable source files found — skipping ingest.");
+        return Ok(());
+    }
+
     if payload_json.len() > (9.5 * 1024.0 * 1024.0) as usize {
         eprintln!(
             "[client] WARN: payload {:.1} KB approaches the server's 10 MB body limit. Consider chunking.",

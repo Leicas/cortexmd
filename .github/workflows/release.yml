@@ -93,6 +93,7 @@ jobs:
     needs: release
     if: needs.release.outputs.published == 'true'
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 25      # fail fast instead of hanging on a stuck runner
     permissions:
       contents: write        # upload assets to the release
     strategy:
@@ -105,7 +106,9 @@ jobs:
           - os: macos-latest
             target: aarch64-apple-darwin
             ext: ""
-          - os: macos-13
+          # Cross-compile the Intel target on the arm64 runner — GitHub's
+          # macos-13 (Intel) runners are queue-starved and hang for hours.
+          - os: macos-latest
             target: x86_64-apple-darwin
             ext: ""
           - os: windows-latest

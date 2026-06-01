@@ -23,6 +23,7 @@ import { computeHealth as computeDreamHealth } from '../../lib/dream-engine.js';
 import { config } from '../../config.js';
 import { logger } from '../../lib/logger.js';
 import { computeHealthScore } from './health.js';
+import { computeDerived } from './derive.js';
 import {
   getMemoryStackCache, setMemoryStackCache,
   getAgentDiaryCache, setAgentDiaryCache,
@@ -217,6 +218,11 @@ export function buildSsePayload(): Record<string, unknown> {
     }
     payload.entityStats = { tierCounts, typeCounts, total: entities.length };
   } catch { /* non-critical */ }
+
+  // Derived insight signals (errorRatePct, rpmTrend, healthTrend, …) — computed
+  // once per tick over the already-capped arrays. Attached under `derived` so
+  // every existing field is untouched and the single-EventSource model is intact.
+  payload.derived = computeDerived(payload);
 
   return payload;
 }

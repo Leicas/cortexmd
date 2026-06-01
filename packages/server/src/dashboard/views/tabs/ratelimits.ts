@@ -1,32 +1,55 @@
 /**
  * Rate Limits tab — server-rendered HTML fragment for #tab-ratelimits.
  *
- * Migrated from the legacy `dashboard.ts` (the `<!-- TAB 3: Rate Limits -->`
- * block), minus the outer `<div id="tab-ratelimits" class="tab-panel">` wrapper
- * which the layout now supplies. The inline flex header is replaced by the
- * `sectionHead` component; the "Reset All" action calls the core-seeded
- * `cortex.postAction`. Fragment is static; the client module
- * `assets/tabs/ratelimits.js` fills `#rateLimitTableBody` over SSE.
+ * REVAMP.md §5 TAB 3: the data is *auth-failure throttling*, not capacity —
+ * framed as SECURITY. Layout mirrors the Overview reference (REVAMP.md §5 TAB 1):
+ *   • a header KPI strip (IPs throttled now · suspicious IPs · auth-failure rate)
+ *   • the live table, now with a countdown bar to `resetAt` + per-IP health state.
+ *
+ * Data source is unchanged: `assets/tabs/ratelimits.js` fills `#rateLimitTableBody`
+ * and the KPI ids over SSE from `ctx.data.rateLimits` / `recentAuthFailures` /
+ * `derived`. Every action still calls the core-seeded `cortex.postAction` /
+ * `cortex.resetRl`. Existing id `#rateLimitTableBody` is preserved.
  */
-import { sectionHead } from '../components.js';
+import { kpi, sectionHead } from '../components.js';
 
 export function renderRateLimitsTab(): string {
-  return `
-  <div class="row row-1">
-    <div class="card">
+  // ── Header KPI strip — the security read (REVAMP.md §5 TAB 3) ──────────────
+  const kpiStrip = `
+  <div class="grid">
+    <div class="col-4">${kpi({
+      label: 'IPs Throttled Now', valueId: 'rlThrottled', value: '0',
+      subId: 'rlThrottledSub', sub: 'no IPs at limit', pillId: 'rlThrottledPill',
+    })}</div>
+    <div class="col-4">${kpi({
+      label: 'Suspicious IPs', valueId: 'rlSuspicious', value: '0',
+      subId: 'rlSuspiciousSub', sub: 'throttled + failing auth', pillId: 'rlSuspiciousPill',
+    })}</div>
+    <div class="col-4">${kpi({
+      label: 'Auth Failures / min', valueId: 'rlAuthRate', value: '0',
+      subId: 'rlAuthSub', sub: 'last 15 min', sparkId: 'rlAuthSpark',
+    })}</div>
+  </div>`;
+
+  // ── "So what?" one-liner + live tracking table ────────────────────────────
+  const table = `
+  <div class="grid">
+    <div class="col-12 card">
       ${sectionHead(
-        'Rate Limits',
-        `<button class="btn btn-danger" onclick="cortex.postAction('/dashboard/api/rate-limit/reset-all',{})">Reset All</button>`,
+        'Tracked IPs',
+        `<button type="button" class="btn btn-danger btn--sm" onclick="cortex.postAction('/dashboard/api/rate-limit/reset-all',{})">Reset All</button>`,
       )}
+      <div class="sowhat" id="rlSoWhat"></div>
       <div class="table-wrap">
         <table>
           <thead>
             <tr>
-              <th>IP Address</th>
-              <th>Request Count</th>
-              <th>Remaining</th>
-              <th>Reset At</th>
-              <th>Actions</th>
+              <th data-col="ip">IP Address <span class="sort-arrow"></span></th>
+              <th>Status</th>
+              <th data-col="count" class="num">Auth Failures <span class="sort-arrow"></span></th>
+              <th data-col="remaining" class="num">Remaining <span class="sort-arrow"></span></th>
+              <th>Window Reset</th>
+              <th class="num">Actions</th>
             </tr>
           </thead>
           <tbody id="rateLimitTableBody"></tbody>
@@ -34,4 +57,6 @@ export function renderRateLimitsTab(): string {
       </div>
     </div>
   </div>`;
+
+  return kpiStrip + table;
 }

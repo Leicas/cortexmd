@@ -17,21 +17,33 @@ export type TabId =
   | 'overview' | 'sessions' | 'ratelimits' | 'vault'
   | 'intelligence' | 'agents' | 'code' | 'logs';
 
+/** Visual cluster a tab belongs to (REVAMP.md §4). Does NOT affect the SSE/tab contract. */
+export type TabGroup = 'ops' | 'knowledge' | 'build';
+
 export interface TabDef {
   id: TabId;
   /** Tab-bar text, e.g. 'Vault & Memory'. */
   label: string;
+  /** Visual cluster (Operations / Knowledge / Build). Tab-bar grouping only. */
+  group: TabGroup;
   /** Server-rendered HTML fragment for #tab-<id> (no panel wrapper). */
   render(): string;
 }
 
 export const TABS: readonly TabDef[] = [
-  { id: 'overview',     label: 'Overview',       render: renderOverviewTab },
-  { id: 'sessions',     label: 'Sessions',       render: renderSessionsTab },
-  { id: 'ratelimits',   label: 'Rate Limits',    render: renderRateLimitsTab },
-  { id: 'vault',        label: 'Vault & Memory', render: renderVaultTab },
-  { id: 'intelligence', label: 'Intelligence',   render: renderIntelligenceTab },
-  { id: 'agents',       label: 'Agents',         render: renderAgentsTab },
-  { id: 'code',         label: 'Code',           render: renderCodeTab },
-  { id: 'logs',         label: 'Logs',           render: renderLogsTab },
+  { id: 'overview',     label: 'Overview',       group: 'ops',       render: renderOverviewTab },
+  { id: 'sessions',     label: 'Sessions',       group: 'ops',       render: renderSessionsTab },
+  { id: 'ratelimits',   label: 'Rate Limits',    group: 'ops',       render: renderRateLimitsTab },
+  { id: 'logs',         label: 'Logs',           group: 'ops',       render: renderLogsTab },
+  { id: 'vault',        label: 'Vault & Memory', group: 'knowledge', render: renderVaultTab },
+  { id: 'intelligence', label: 'Intelligence',   group: 'knowledge', render: renderIntelligenceTab },
+  { id: 'agents',       label: 'Agents',         group: 'build',     render: renderAgentsTab },
+  { id: 'code',         label: 'Code',           group: 'build',     render: renderCodeTab },
 ] as const;
+
+/** Human label for each cluster caption, in render order. */
+export const TAB_GROUP_LABELS: Record<TabGroup, string> = {
+  ops: 'Operations',
+  knowledge: 'Knowledge',
+  build: 'Build',
+};

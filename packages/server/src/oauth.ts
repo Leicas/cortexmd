@@ -1,7 +1,7 @@
 import crypto from 'node:crypto';
 import { Router } from 'express';
 import type { Request, Response } from 'express';
-import { SignJWT, jwtVerify } from 'jose';
+import { SignJWT, jwtVerify, type JWTPayload } from 'jose';
 import { config } from './config.js';
 import { logger } from './lib/logger.js';
 import { loadOrCreateJwtSecret, loadClients, saveClients } from './lib/persistence.js';
@@ -10,6 +10,36 @@ import { checkRateLimit } from './lib/rate-limit.js';
 // ── Signing key (persisted across restarts) ─────────────────────────────────
 const JWT_SECRET = loadOrCreateJwtSecret(config.dataDir);
 const JWT_ISSUER = config.publicUrl;
+
+// Token lifetimes. The access token is a short-ish bearer JWT; the refresh
+// token is a long-lived, signed JWT (kind:"refresh") that lets OAuth clients
+// (e.g. n8n) transparently mint new access tokens via the refresh_token grant
+// without re-running the browser authorize flow. Both are stateless — they
+// survive a server restart as long as DATA_DIR (the JWT secret) is persisted.
+const ACCESS_TOKEN_TTL = 2_592_000; // 30 days
+const REFRESH_TOKEN_TTL = 31_536_000; // 365 days
+
+/** Mint a signed access-token JWT carrying sub/scope/client_id. */
+async function signAccessToken(sub: string, clientId: string, scope: string): Promise<string> {
+  const now = Math.floor(Date.now() / 1000);
+  return new SignJWT({ sub, scope, client_id: clientId })
+    .setProtectedHeader({ alg: 'HS256' })
+    .setIssuedAt(now)
+    .setExpirationTime(now + ACCESS_TOKEN_TTL)
+    .setIssuer(JWT_ISSUER)
+    .sign(JWT_SECRET);
+}
+
+/** Mint a signed refresh-token JWT (marked kind:"refresh", long expiry). */
+async function signRefreshToken(sub: string, clientId: string, scope: string): Promise<string> {
+  const now = Math.floor(Date.now() / 1000);
+  return new SignJWT({ sub, scope, client_id: clientId, kind: 'refresh' })
+    .setProtectedHeader({ alg: 'HS256' })
+    .setIssuedAt(now)
+    .setExpirationTime(now + REFRESH_TOKEN_TTL)
+    .setIssuer(JWT_ISSUER)
+    .sign(JWT_SECRET);
+}
 
 // ── Stores (persisted to disk) ──────────────────────────────────────────────
 
@@ -68,7 +98,7 @@ oauthRouter.get('/.well-known/oauth-authorization-server', (_req: Request, res: 
     token_endpoint: `${config.publicUrl}/token`,
     registration_endpoint: `${config.publicUrl}/register`,
     response_types_supported: ['code'],
-    grant_types_supported: ['authorization_code'],
+    grant_types_supported: ['authorization_code', 'refresh_token'],
     code_challenge_methods_supported: ['S256'],
     token_endpoint_auth_methods_supported: ['client_secret_post', 'none'],
     scopes_supported: ['mcp:tools'],
@@ -109,7 +139,23 @@ oauthRouter.post('/register', (req: Request, res: Response) => {
   };
 
   clients.set(clientId, client);
-  saveClients(config.dataDir, clients);
+  try {
+    saveClients(config.dataDir, clients);
+  } catch (err) {
+    // Most commonly an unwritable DATA_DIR (volume not mounted, or owned by a
+    // different uid than the container's `node` user). Surface the real cause
+    // in the logs and return a spec-compliant error rather than a bare 500.
+    clients.delete(clientId);
+    logger.error('OAuth client registration failed to persist', {
+      error: err instanceof Error ? err.message : String(err),
+      dataDir: config.dataDir,
+    });
+    res.status(500).json({
+      error: 'server_error',
+      error_description: 'Failed to persist client registration',
+    });
+    return;
+  }
   logger.info('OAuth client registered', { clientId, clientName: client.client_name });
 
   res.status(201).json({
@@ -209,6 +255,51 @@ oauthRouter.post('/token', async (req: Request, res: Response) => {
     }
   }
 
+  // ── Refresh Token grant (RFC 6749 §6) ──────────────────────────────────────
+  // The refresh token is a signed JWT (kind:"refresh"); validation is stateless.
+  // We rotate it on each use (issue a fresh refresh token alongside the access
+  // token) so clients that persist the latest value keep a rolling 365-day window.
+  if (grant_type === 'refresh_token') {
+    const { refresh_token } = req.body;
+    if (!refresh_token || typeof refresh_token !== 'string') {
+      res.status(400).json({ error: 'invalid_request', error_description: 'refresh_token required' });
+      return;
+    }
+    let payload: JWTPayload;
+    try {
+      ({ payload } = await jwtVerify(refresh_token, JWT_SECRET, { issuer: JWT_ISSUER }));
+    } catch {
+      res.status(400).json({ error: 'invalid_grant', error_description: 'Invalid or expired refresh token' });
+      return;
+    }
+    if (payload.kind !== 'refresh') {
+      res.status(400).json({ error: 'invalid_grant', error_description: 'Not a refresh token' });
+      return;
+    }
+    const tokenClientId = payload.client_id as string;
+    // If the client identified itself (body or Basic header), it must match.
+    if (client_id && tokenClientId !== client_id) {
+      logger.warn('OAuth /token refresh client_id mismatch', { expected: tokenClientId, got: client_id });
+      res.status(400).json({ error: 'invalid_grant', error_description: 'client_id mismatch' });
+      return;
+    }
+    const sub = payload.sub as string;
+    const scope = (payload.scope as string) || '';
+
+    const accessToken = await signAccessToken(sub, tokenClientId, scope);
+    const newRefreshToken = await signRefreshToken(sub, tokenClientId, scope);
+    logger.info('Access token refreshed', { user: sub, clientId: tokenClientId });
+
+    res.json({
+      access_token: accessToken,
+      token_type: 'Bearer',
+      expires_in: ACCESS_TOKEN_TTL,
+      refresh_token: newRefreshToken,
+      scope,
+    });
+    return;
+  }
+
   if (grant_type !== 'authorization_code') {
     res.status(400).json({ error: 'unsupported_grant_type' });
     return;
@@ -259,28 +350,19 @@ oauthRouter.post('/token', async (req: Request, res: Response) => {
     }
   }
 
-  // Issue JWT
-  const now = Math.floor(Date.now() / 1000);
-  const expiresIn = 2_592_000; // 30 days
-
-  const accessToken = await new SignJWT({
-    sub: entry.user,
-    scope: entry.scopes.join(' '),
-    client_id: entry.clientId,
-  })
-    .setProtectedHeader({ alg: 'HS256' })
-    .setIssuedAt(now)
-    .setExpirationTime(now + expiresIn)
-    .setIssuer(JWT_ISSUER)
-    .sign(JWT_SECRET);
+  // Issue access + refresh token pair
+  const scope = entry.scopes.join(' ');
+  const accessToken = await signAccessToken(entry.user, entry.clientId, scope);
+  const refreshToken = await signRefreshToken(entry.user, entry.clientId, scope);
 
   logger.info('Access token issued', { user: entry.user, clientId: entry.clientId });
 
   res.json({
     access_token: accessToken,
     token_type: 'Bearer',
-    expires_in: expiresIn,
-    scope: entry.scopes.join(' '),
+    expires_in: ACCESS_TOKEN_TTL,
+    refresh_token: refreshToken,
+    scope,
   });
 });
 

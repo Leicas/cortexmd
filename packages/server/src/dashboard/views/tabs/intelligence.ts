@@ -1,32 +1,29 @@
 /**
  * Intelligence tab — server-rendered HTML fragment for #tab-intelligence.
  *
- * Revamped onto the new design system (REVAMP.md §5 TAB 5): the most
- * insight-shaped tab, so it leans in. Structure now reads top-down as
- *   Band A — KPI scorecards (vault health + trend, entity confirmation, KG
- *            density, dream cadence) — the "is this good, which way?" readouts
- *   Band B — Health gauge + factor waterfall (biggest-lever framing)
- *   Band C — Dream insights (run controls) + Local LLM
- *   Band D — Theme clusters + AI recommendations
- *   Band E — Orphan memories
- *   Band F — Entity intelligence + Knowledge graph
- *   Band G — Dream history (drawMulti) + agent awareness
+ * Redesigned per INTELLIGENCE-REDESIGN.md: 7 stacked bands collapsed to 3
+ * always-open bands + 1 collapsed disclosure, so the health hero + primary
+ * action land above the fold and scroll roughly halves. Render order:
+ *   Band 1 — VITALS: KPI row + so-what strip + gauge (col-3) / factors (col-9)
+ *   Band 2 — DREAM ENGINE: dream insights (col-8) + Local LLM (col-4)
+ *   Band 3 — DREAM FINDINGS: recommendations / themes / orphans, 3-up col-4
+ *   Band 4 — STRUCTURE: entity intelligence (col-8) + knowledge graph (col-4)
+ *   Band 5 — HISTORY & AGENTS: collapsed <details>, col-7 / col-5 inside
  *
- * Built from the shared component vocabulary (`kpi`, `statusPill`,
- * `sectionHead`, `.grid`/`.col-*`, `.card--kpi`, `.sowhat`, `.chart-legend`,
- * `drawGauge`/`drawMulti`) — no ad-hoc styles. Every dynamic id the client
- * module writes is preserved (`healthArc`, `healthScoreValue`, `healthFactors`,
- * `dreamStatus`/`dreamNarrative`/`dreamActivity`, `llm*`, `themeClusters`,
- * `aiRecommendations`/`recsCount`, `orphanTableBody`/`orphanSummary`,
- * `entityTierBar`/`entityTypeBars`/`entityRegistryBody`/`ei*`, `kg*`,
- * `chartDreamHealth`, `dreamHistoryTable`, `agentDiariesBody`,
- * `agentRecentActivity`). Action buttons keep their `onclick="cortex.*"` bridge.
+ * Built from the shared component vocabulary (`kpi`, `sectionHead`,
+ * `.grid`/`.col-*`, `.card--kpi`, `.sowhat`, `.chart-legend`, `.table-wrap`,
+ * `drawGauge`/`drawMulti`/`drawChart`) — no ad-hoc styles. Every dynamic id the
+ * client module writes is preserved (49 total); ids may live in a different
+ * ancestor container but the client's `getElementById` writes are indifferent
+ * to ancestry, so no binding moves. Action buttons keep their
+ * `onclick="cortex.*"` bridge verbatim. `assets/tabs/intelligence.js` is NOT
+ * touched.
  */
 import { kpi, sectionHead } from '../components.js';
 
 export function renderIntelligenceTab(): string {
-  // ── Band A — KPI scorecards ────────────────────────────────────────────────
-  const kpis = `
+  // ── Band 1 — VITALS: KPI scorecards ────────────────────────────────────────
+  const vitalsKpis = `
   <div class="grid">
     <div class="col-3">${kpi({
       label: 'Vault Health', valueId: 'kpiHealthVal', value: '—',
@@ -47,22 +44,23 @@ export function renderIntelligenceTab(): string {
     })}</div>
   </div>`;
 
+  // So-what strip sits between the two Vitals grid rows (full width, no col).
   const soWhat = `<div class="sowhat" id="intelSoWhat"></div>`;
 
-  // ── Band B — Health gauge + factor waterfall ──────────────────────────────
-  const healthBand = `
+  // ── Band 1 — VITALS: gauge (col-3) + health factors (col-9) ────────────────
+  const vitalsGauge = `
   <div class="grid">
-    <div class="col-4 card card--center">
+    <div class="col-3 card card--center">
       <div class="section-title" style="margin-bottom:.25rem">Vault Health Score</div>
       <div class="chart-wrap" style="height:150px" role="img" aria-labelledby="healthScoreValue healthGradeValue">
         <svg id="healthGauge" viewBox="0 0 600 140" preserveAspectRatio="xMidYMid meet" aria-hidden="true"></svg>
       </div>
       <div style="display:flex;align-items:baseline;justify-content:center;gap:.5rem;margin-top:-.25rem">
-        <span id="healthScoreValue" class="card-value">—</span>
+        <span id="healthScoreValue" class="card-sub" style="margin-top:0">—</span>
         <span id="healthGradeValue" class="card-sub" style="margin-top:0">—</span>
       </div>
     </div>
-    <div class="col-8 card">
+    <div class="col-9 card">
       <div class="section-head">
         <div class="section-title" style="margin-bottom:0">Health Factors</div>
         <span class="card-sub" style="margin-top:0">contribution vs. potential — your biggest lever</span>
@@ -71,8 +69,8 @@ export function renderIntelligenceTab(): string {
     </div>
   </div>`;
 
-  // ── Band C — Dream insights + Local LLM ───────────────────────────────────
-  const dreamLlmBand = `
+  // ── Band 2 — DREAM ENGINE: dream insights (col-8) + Local LLM (col-4) ──────
+  const dreamEngine = `
   <div class="grid">
     <div class="col-8 card">
       ${sectionHead('Dream Insights', `
@@ -99,29 +97,24 @@ export function renderIntelligenceTab(): string {
     </div>
   </div>`;
 
-  // ── Band D — Theme clusters + AI recommendations ──────────────────────────
-  const themeRecBand = `
+  // ── Band 3 — DREAM FINDINGS: recommendations / themes / orphans (3-up) ─────
+  const findings = `
   <div class="grid">
-    <div class="col-6 card">
-      <div class="section-title">Theme Clusters</div>
-      <div id="themeClusters" style="max-height:340px;overflow-y:auto">
-        <span class="empty-msg">Run a dream cycle to detect recurring themes across your memories.</span>
-      </div>
-    </div>
-    <div class="col-6 card">
+    <div class="col-4 card">
       ${sectionHead('AI Recommendations', `<span id="recsCount" class="card-sub" style="margin-top:0"></span>`)}
       <div id="aiRecommendations" style="max-height:340px;overflow-y:auto">
         <span class="empty-msg">Run a dream cycle to generate connection suggestions and consolidation opportunities.</span>
       </div>
     </div>
-  </div>`;
-
-  // ── Band E — Orphan memories ──────────────────────────────────────────────
-  const orphanBand = `
-  <div class="grid">
-    <div class="col-12 card">
+    <div class="col-4 card">
+      <div class="section-title">Theme Clusters</div>
+      <div id="themeClusters" style="max-height:340px;overflow-y:auto">
+        <span class="empty-msg">Run a dream cycle to detect recurring themes across your memories.</span>
+      </div>
+    </div>
+    <div class="col-4 card">
       ${sectionHead('Orphan Memories', `<div id="orphanSummary" class="kpi-foot" style="margin-top:0"></div>`)}
-      <div class="table-wrap" style="max-height:280px;overflow-y:auto">
+      <div class="table-wrap" style="max-height:340px;overflow:auto">
         <table>
           <thead><tr>
             <th>Title</th>
@@ -138,10 +131,10 @@ export function renderIntelligenceTab(): string {
     </div>
   </div>`;
 
-  // ── Band F — Entity intelligence + Knowledge graph ────────────────────────
-  const entityKgBand = `
+  // ── Band 4 — STRUCTURE: entity intelligence (col-8) + KG (col-4) ───────────
+  const structure = `
   <div class="grid">
-    <div class="col-7 card">
+    <div class="col-8 card">
       ${sectionHead('Entity Intelligence', `<button class="btn btn-primary" id="btnEntityRebuild" onclick="cortex.rebuildEntities()">Rebuild entities</button>`)}
       <div class="grid" style="grid-template-columns:repeat(3,1fr);margin-bottom:.75rem">
         <div>
@@ -178,7 +171,7 @@ export function renderIntelligenceTab(): string {
         </div>
       </div>
     </div>
-    <div class="col-5 card">
+    <div class="col-4 card">
       ${sectionHead('Knowledge Graph', `<button class="btn btn-primary" id="btnKgBootstrap" onclick="cortex.postAction('/dashboard/api/kg/bootstrap',{})">Bootstrap KG</button>`)}
       <div class="grid" style="grid-template-columns:repeat(2,1fr);margin-bottom:.75rem">
         <div>
@@ -197,38 +190,41 @@ export function renderIntelligenceTab(): string {
     </div>
   </div>`;
 
-  // ── Band G — Dream history + agent awareness ──────────────────────────────
-  const historyBand = `
-  <div class="grid">
-    <div class="col-7 card">
-      <div class="section-title">Dream History</div>
-      <div class="chart-wrap">
-        <svg id="chartDreamHealth" viewBox="0 0 600 140" preserveAspectRatio="none" aria-hidden="true"></svg>
+  // ── Band 5 — HISTORY & AGENTS: collapsed disclosure, col-7 / col-5 ─────────
+  const historyAgents = `
+  <details class="section">
+    <summary>History &amp; Agents</summary>
+    <div class="grid">
+      <div class="col-7 card">
+        <div class="section-title">Dream History</div>
+        <div class="chart-wrap">
+          <svg id="chartDreamHealth" viewBox="0 0 600 140" preserveAspectRatio="none" aria-hidden="true"></svg>
+        </div>
+        <div class="chart-legend">
+          <span><i style="background:var(--ok)"></i>Health Score</span>
+          <span><i style="background:var(--warn)"></i>Themes</span>
+          <span><i style="background:var(--err)"></i>Orphans</span>
+          <span><i style="background:var(--info)"></i>Decayed</span>
+        </div>
+        <div id="dreamHistoryTable" style="margin-top:.5rem;max-height:170px;overflow-y:auto">
+          <span class="empty-msg">No dream cycles recorded yet.</span>
+        </div>
       </div>
-      <div class="chart-legend">
-        <span><i style="background:var(--ok)"></i>Health Score</span>
-        <span><i style="background:var(--warn)"></i>Themes</span>
-        <span><i style="background:var(--err)"></i>Orphans</span>
-        <span><i style="background:var(--info)"></i>Decayed</span>
-      </div>
-      <div id="dreamHistoryTable" style="margin-top:.5rem;max-height:170px;overflow-y:auto">
-        <span class="empty-msg">No dream cycles recorded yet.</span>
+      <div class="col-5 card">
+        <div class="section-title">Agent Awareness</div>
+        <div class="card-sub" style="margin-top:0;margin-bottom:.5rem">What the AI has been thinking about</div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Agent</th><th>Last Active</th><th class="num">Entries</th></tr></thead>
+            <tbody id="agentDiariesBody">
+              <tr><td colspan="3" class="empty-msg" style="text-align:center">No agent diaries found.</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div id="agentRecentActivity" style="margin-top:.75rem;max-height:170px;overflow-y:auto"></div>
       </div>
     </div>
-    <div class="col-5 card">
-      <div class="section-title">Agent Awareness</div>
-      <div class="card-sub" style="margin-top:0;margin-bottom:.5rem">What the AI has been thinking about</div>
-      <div class="table-wrap">
-        <table>
-          <thead><tr><th>Agent</th><th>Last Active</th><th class="num">Entries</th></tr></thead>
-          <tbody id="agentDiariesBody">
-            <tr><td colspan="3" class="empty-msg" style="text-align:center">No agent diaries found.</td></tr>
-          </tbody>
-        </table>
-      </div>
-      <div id="agentRecentActivity" style="margin-top:.75rem;max-height:170px;overflow-y:auto"></div>
-    </div>
-  </div>`;
+  </details>`;
 
-  return kpis + soWhat + healthBand + dreamLlmBand + themeRecBand + orphanBand + entityKgBand + historyBand;
+  return vitalsKpis + soWhat + vitalsGauge + dreamEngine + findings + structure + historyAgents;
 }

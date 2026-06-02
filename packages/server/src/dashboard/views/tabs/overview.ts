@@ -95,8 +95,9 @@ export function renderOverviewTab(): string {
   </div>`;
 
   // ── Band D — Operational detail (legacy ids preserved verbatim) ───────────
+  // NOTE: the former `#ovSoWhat` summary strip was removed — it duplicated the
+  // KPI scorecards directly above it (rpm / error rate / vault grade / sessions).
   const detail = `
-  <div class="sowhat" id="ovSoWhat"></div>
   <div class="grid">
     <div class="col-6 card">
       <div class="section-title">Requests / min</div>

@@ -70,6 +70,11 @@
 }
 
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+/* Buttons don't inherit text color by default — they fall back to the UA
+   `ButtonText` (black). Our KPI tiles render as <button> when they deep-link,
+   so without this their `.card-value` went black on the dark card. Explicit
+   button styles (.btn/.pill/.tab-btn) set their own color and still win. */
+button{color:inherit;font-family:inherit}
 html{font-size:14px}
 body{
   background:var(--bg);color:var(--text);
@@ -199,9 +204,12 @@ body[data-sse="reconnecting"] .sse-label::before{content:"Reconnecting\2026"}
    row is the same height and the trailing element (spark / sub / bar) pins to a
    shared baseline — no more ragged feet across the scorecard row. */
 .card--kpi{padding:var(--card-pad-tight);position:relative;overflow:hidden;
-  display:flex;flex-direction:column;min-height:128px}
+  display:flex;flex-direction:column;min-height:124px;color:var(--text)}
 .card--kpi > :last-child{margin-bottom:0}
-.card--kpi .kpi-spark{margin-top:auto}     /* spark always hugs the bottom */
+/* The value's auto bottom-margin pushes everything after it (pill / sub / bar /
+   spark) to the bottom of the tile, so across a row the headline numbers align
+   at the top and the meta hugs a shared baseline — no ragged half-empty tiles. */
+.card--kpi .card-value{margin-bottom:auto;color:var(--text)}
 .card--kpi.is-link{cursor:pointer}
 .card--kpi.is-link:hover{border-color:var(--border-strong)}
 /* spectral top rule replaces the old flat border-top accent */

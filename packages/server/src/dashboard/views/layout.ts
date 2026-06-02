@@ -13,7 +13,7 @@ import { TABS, TAB_GROUP_LABELS, type TabGroup } from './tabs.js';
  * Asset cache-bust token. Bump on deploy (or wire to package version later).
  * Appended as `?v=` to the <link>/<script> URLs in renderPage().
  */
-export const ASSET_VERSION = '3';
+export const ASSET_VERSION = '4';
 
 /** Minimal HTML-escape for the (static) tab labels. */
 function esc(s: string): string {

@@ -40,19 +40,34 @@ shown to be lossy.
 ➡ **Strategy:** turn this into a trust advantage — publish *honest* benchmark numbers (we have
 the harness) and offer only *measured, opt-in* compaction.
 
+## Correction: two "gaps" already exist (the recon agent couldn't see `crates/cli`)
+
+The first audit pass listed "per-message recall hook" and "one-command install" as gaps.
+Inspecting `crates/cli` + `docs/hooks.md` shows **both already ship**:
+
+- **Per-message recall (= mempalace `sweep`)** — the `UserPromptSubmit` "Memory recall" hook
+  (`cortexmd recall --hook`) already tokenizes each prompt, recalls the top matching
+  memories/notes, and injects them as context. This is the sweep equivalent.
+- **One-command Claude wiring** — `cortexmd init` already writes `CORTEXMD.md`, references it
+  from `CLAUDE.md`, drops the hook scripts, and idempotently patches `settings.json`.
+
+So the real remaining surface is narrower than the first pass implied.
+
 ## Real gaps & prioritized roadmap
 
-| # | Gap | Effort | Notes |
-|---|-----|--------|-------|
-| 1 | **One-command install** — Node build *and* Rust `cargo build` vs mempalace's single `pip install` + `init` | **L** | Ship a prebuilt distribution (npx-runnable or single bundled binary incl. the Rust indexer) + a `cortexmd init` that writes the MCP client config, picks a default `BRAIN_VAULT`, and downloads the embedding model. Biggest real adoption blocker. |
-| 2 | **Per-message recall hook** (mempalace `sweep`) | **M** | Add a `UserPromptSubmit`/`PreToolUse` hook that runs a cheap `memory_recall` against the latest message and injects a small top-k snippet. Pairs with the existing recall + reranker. Hook-side (see `docs/hooks.md`), not server core. |
-| 3 | **Compact L0 identity floor + low default wakeup budget** (~900 → sub-200 tokens) | **S** | The L0–L3 machinery exists (`memory-stack.ts`); add a `tiny` wakeup preset + an identity-file generator and document a ~150–200 token `IDENTITY_FILE`. Don't lower the global default blindly — gate behind a preset to avoid recall regressions. |
-| 4 | **Published recall benchmarks** | **M** | `lib/benchmark.ts` + `benchmark_run` already exist. Run LongMemEval/LoCoMo-style R@k and publish in the README with **honest methodology** (state the embedding model; separate retrieval-recall from end-to-end QA). |
-| 5 | **Honest optional compaction** (instead of AAAK) | **M** | Opt-in lossy summarization on **cold** memories only (keep verbatim hot tier); measure the recall delta with the harness and document it transparently. |
-| 6 | **Multilingual embedding option** | **S** | Already swappable via `EMBEDDING_MODEL` (`config.embeddingModel`); document an `embedding-gemma-300m`-class multilingual option for non-English vaults. Mostly docs. |
+| # | Gap | Effort | Status |
+|---|-----|--------|--------|
+| 1 | **One-command *server* bring-up** — `cortexmd init` wires the client, but the server still needs a Node build **and** a Rust `cargo build` to run | **L** | Open — biggest adoption blocker. Ship a prebuilt distribution (single bundled binary incl. the Rust indexer, or a published image) so `docker compose up` / one binary is the whole story. |
+| 2 | **Compact L0 floor + low startup budget** (~900 → sub-200) | **S** | **Done** — `memory_wakeup` now takes `preset: tiny` (~180) / `standard` / `full`; default unchanged (no recall regression). |
+| 3 | **Claude Code plugin** | **M** | In progress — package the MCP server + the existing hooks + the `CORTEXMD.md` skill as an installable `.claude-plugin` (the modern alternative to `init`'s settings.json patching, one-click from a marketplace). |
+| 4 | **Published recall benchmarks** | **M** | Open — `lib/benchmark.ts` + `benchmark_run` exist; run LongMemEval/LoCoMo-style R@k and publish with **honest methodology** (state the embedding model; separate retrieval-recall from end-to-end QA). |
+| 5 | **Honest optional compaction** (instead of AAAK) | **M** | Open — opt-in lossy summarization on **cold** memories only (keep verbatim hot tier); measure the recall delta with the harness; document transparently. |
+| 6 | **Multilingual embedding option** | **S** | Mostly docs — already swappable via `EMBEDDING_MODEL` (`config.embeddingModel`); document an `embedding-gemma-300m`-class option for non-English vaults. |
 
 ## Status
 
-- [x] Correct the stale "parity 100% complete" memory note (re-audit appended 2026-06-03).
-- [x] This roadmap committed.
-- [ ] Items 1–6 above — separate, scoped follow-ups (1, 4, 5 are the highest-leverage).
+- [x] Corrected the stale "parity 100% complete" memory note (re-audit appended 2026-06-03).
+- [x] Corrected the audit: per-message recall hook + `cortexmd init` already exist.
+- [x] Startup-budget presets shipped (`memory_wakeup` `preset`).
+- [~] Claude Code plugin — in progress this session.
+- [ ] Server one-liner install (1), published benchmarks (4), cold-only compaction (5) — scoped follow-ups.

@@ -1,0 +1,14 @@
+{
+  "name": "cortexmd",
+  "owner": {
+    "name": "Antoine Weill--Duflos",
+    "url": "https://github.com/Leicas/cortexmd"
+  },
+  "plugins": [
+    {
+      "name": "cortexmd",
+      "source": "./plugin/cortexmd",
+      "description": "Second-brain MCP server for Claude Code: memory + knowledge graph + code navigation + dream consolidation, with the automation hooks wired in one install."
+    }
+  ]
+}

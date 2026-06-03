@@ -1,0 +1,25 @@
+{
+  "name": "cortexmd",
+  "displayName": "cortexmd",
+  "version": "0.1.0",
+  "description": "Second-brain MCP server for Claude Code: memory store/recall with temperature decay, a knowledge graph, code navigation, a dream consolidation engine, and a web dashboard. This plugin wires the MCP server + the automation hooks in one install.",
+  "author": {
+    "name": "Antoine Weill--Duflos",
+    "email": "antoine@haply.co"
+  },
+  "homepage": "https://github.com/Leicas/cortexmd",
+  "repository": "https://github.com/Leicas/cortexmd",
+  "license": "MIT",
+  "keywords": ["mcp", "memory", "knowledge-graph", "code-nav", "second-brain", "obsidian"],
+  "mcpServers": "./.mcp.json",
+  "hooks": "./hooks/hooks.json",
+  "skills": "./skills/",
+  "userConfig": {
+    "server_url": {
+      "type": "string",
+      "title": "cortexmd server URL",
+      "description": "Base URL of your running cortexmd server (the MCP endpoint is <url>/mcp).",
+      "default": "http://localhost:3000"
+    }
+  }
+}

@@ -35,6 +35,7 @@ export function isEmbeddingsReady(): boolean {
 }
 
 export function getEmbeddingStats(): {
+  enabled: boolean;
   ready: boolean;
   model: string;
   indexSize: number;
@@ -42,6 +43,7 @@ export function getEmbeddingStats(): {
   lastPersist: number;
 } {
   return {
+    enabled: config.enableEmbeddings,
     ready,
     model: config.embeddingModel,
     indexSize: pathToId.size,

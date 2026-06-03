@@ -83,9 +83,11 @@ export function ForceGraph(canvas, data) {
     neighbors = {};
     var s = cssSize();
     nodes.forEach(function (n, i) {
-      // Seed on a spiral so the layout unfolds deterministically.
+      // Seed on a spiral so the layout unfolds deterministically. A wider
+      // initial radius keeps the sim from starting in a tight ball it can't
+      // escape (attraction + gravity otherwise win before it spreads).
       var ang = i * 2.399963229; // golden angle
-      var rad = 6 * Math.sqrt(i + 1);
+      var rad = 16 * Math.sqrt(i + 1);
       n.x = s.w / 2 + rad * Math.cos(ang);
       n.y = s.h / 2 + rad * Math.sin(ang);
       byId[n.id] = n;
@@ -107,7 +109,7 @@ export function ForceGraph(canvas, data) {
     if (!n) return;
     var s = cssSize();
     var area = s.w * s.h;
-    var k = Math.max(18, Math.sqrt(area / n) * 0.7); // ideal edge length
+    var k = Math.max(28, Math.sqrt(area / n) * 1.25); // ideal edge length (longer → more spread)
     var k2 = k * k;
     var cx = s.w / 2, cy = s.h / 2;
 
@@ -140,8 +142,8 @@ export function ForceGraph(canvas, data) {
     var maxStep = 8 + 40 * alpha;
     for (var c = 0; c < n; c++) {
       var nd = nodes[c];
-      nd._dx += (cx - nd.x) * 0.012;
-      nd._dy += (cy - nd.y) * 0.012;
+      nd._dx += (cx - nd.x) * 0.006;
+      nd._dy += (cy - nd.y) * 0.006;
       if (nd === dragNode && dragging) continue;
       var dlen = Math.sqrt(nd._dx * nd._dx + nd._dy * nd._dy) || 0.01;
       var step = Math.min(dlen, maxStep) * alpha;

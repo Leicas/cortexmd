@@ -3,21 +3,24 @@
  * projects" pass.
  *
  * Where findConsolidationCandidates clusters cold notes by SHARED TAGS only and
- * applyAutoConsolidation MERGES + DELETES them, this module clusters cold notes
- * by SHARED ENTITIES (+ tags) and reconciles each cluster into a project note
- * by LINKING — originals are never deleted. It is additive and runs alongside
- * the existing destructive tag-consolidation path.
+ * applyAutoConsolidation merges them into a generic Memories/consolidated/
+ * "insight" note, this module clusters cold notes by SHARED ENTITIES (+ tags)
+ * and consolidates each cluster into a PROJECT note (Projects/<slug>.md),
+ * folding each source's full body in and then DELETING the originals — the
+ * project note becomes their durable home. It runs alongside the existing
+ * tag-consolidation path.
  *
  * Clustering signal: two cold notes join the same cluster when they share ≥1
  * high-confidence entity (person/org/project) OR ≥2 tags. Entity overlap is the
  * key generalization — notes about the same thing that were tagged
  * inconsistently (or not at all) still cluster.
  */
-import { getDocMeta, indexNote } from './search.js';
-import { readNote, writeNote } from './vault.js';
+import { getDocMeta, indexNote, removeFromIndex } from './search.js';
+import { readNote, writeNote, deleteNote } from './vault.js';
 import { parseFrontmatter, stringifyFrontmatter } from './frontmatter.js';
 import { detectEntities } from './entity-detector.js';
 import { updateGraphForNote } from './graph.js';
+import { recordConsolidation } from './metrics.js';
 import { logger } from './logger.js';
 
 export interface ColdCluster {
@@ -37,9 +40,9 @@ export interface ReconcileOptions {
   minClusterSize?: number;
   /**
    * Entity-detection confidence gate for clustering (default 0.6 — lower than
-   * the 0.7 auto-LINK gate on purpose: reconciliation is non-destructive and
-   * produces a clearly-marked, opt-out project note, so a single solid
-   * person/org mention is enough to group notes the tag-only path would miss).
+   * the 0.7 auto-LINK gate on purpose: reconciliation produces a single durable
+   * project note from the cluster, so a single solid person/org mention is
+   * enough to group notes the tag-only path would miss).
    */
   minEntityConfidence?: number;
   /** Cap how many notes we scan bodies for (perf guard; default 1500). */
@@ -50,8 +53,10 @@ export interface ProjectReconciliation {
   projectPath: string;
   /** True when a new project note was created (vs an existing one updated). */
   created: boolean;
-  /** Source notes linked into the project this run. */
-  linkedPaths: string[];
+  /** Source notes folded into the project (and deleted, unless dryRun). */
+  sourcePaths: string[];
+  /** Originals actually deleted this run (empty in dryRun). */
+  deleted: string[];
   title: string;
   basis: string;
 }
@@ -63,6 +68,8 @@ function slugify(text: string): string {
 /**
  * Cluster cold (optionally warm) notes by shared entities / tags. Reads note
  * bodies from the in-memory index (DocMeta.content) — no extra disk I/O.
+ * Project notes themselves are excluded so the dream never consolidates its
+ * own output.
  */
 export function clusterColdNotes(opts: ReconcileOptions = {}): ColdCluster[] {
   const minSize = opts.minClusterSize ?? 2;
@@ -75,6 +82,8 @@ export function clusterColdNotes(opts: ReconcileOptions = {}): ColdCluster[] {
   let scanned = 0;
   for (const [path, meta] of dm) {
     if (meta.archived === true) continue;
+    // Never re-consolidate project notes (or anything under Projects/).
+    if (meta.collection === 'projects' || meta.type === 'project' || /^Projects\//i.test(path)) continue;
     const temp = meta.temperature;
     const eligible = opts.includeWarm ? (temp === 'cold' || temp === 'warm') : temp === 'cold';
     if (!eligible) continue;
@@ -164,13 +173,18 @@ export function clusterColdNotes(opts: ReconcileOptions = {}): ColdCluster[] {
   return clusters;
 }
 
+/** Strip a leading `# Title` line + surrounding blank lines from a note body. */
+function stripLeadingTitle(body: string): string {
+  return body.replace(/^\s*#\s+.*(?:\r?\n)+/, '').trim();
+}
+
 /**
- * Reconcile one cold cluster into a project note by LINKING (never deleting):
- * create/update Projects/<slug>.md (type:'project'), append a "## Related
- * memories" section of [[wikilinks]] + digests, and add a non-destructive
- * `reconciled_into` marker + project back-link to each source note. Idempotent:
- * already-linked sources are skipped. Returns null on hard failure or when
- * there is nothing new to link. Respects dryRun (computes, writes nothing).
+ * Consolidate one cold cluster into a project note, then DELETE the originals.
+ * Create/update Projects/<slug>.md (type:'project'), fold each source's FULL
+ * body into a "## Consolidated memories" section (so deletion is lossless),
+ * record `consolidated_from`, then remove the source notes from disk + index.
+ * Returns null on hard failure or when there is nothing new to fold. Respects
+ * dryRun (computes the plan, writes/deletes nothing).
  */
 export async function reconcileClusterIntoProject(
   cluster: ColdCluster,
@@ -180,19 +194,16 @@ export async function reconcileClusterIntoProject(
   const projectPath = `Projects/${slug}.md`;
   const todayStr = new Date().toISOString().slice(0, 10);
 
-  // Read sources (skip ones already reconciled into THIS project).
-  type Src = { path: string; title: string; data: Record<string, any>; body: string; snippet: string };
+  // Read sources (skip the project note itself if a path collides).
+  type Src = { path: string; title: string; data: Record<string, any>; body: string };
   const sources: Src[] = [];
   for (const p of cluster.paths) {
+    if (p === projectPath) continue;
     try {
       const { content } = await readNote(p);
       const { data, body } = parseFrontmatter(content);
-      if (data.reconciled_into === projectPath) continue; // already linked
       const title = data.title || p.replace(/\.md$/, '').split('/').pop() || p;
-      sources.push({
-        path: p, title, data, body,
-        snippet: body.trim().replace(/^#.*$/m, '').trim().slice(0, 160).replace(/\s+/g, ' '),
-      });
+      sources.push({ path: p, title, data, body });
     } catch {
       // Skip unreadable source.
     }
@@ -234,27 +245,44 @@ export async function reconcileClusterIntoProject(
     cluster.sharedEntities.forEach((e) => ent.add(e));
     projData.entities = [...ent];
   }
+  const consolidatedFrom = new Set<string>(Array.isArray(projData.consolidated_from) ? projData.consolidated_from : []);
+  // Merge any related/sources frontmatter the originals carried.
+  const mergedRelated = new Set<string>(Array.isArray(projData.related) ? projData.related : []);
+  for (const s of sources) {
+    consolidatedFrom.add(s.path);
+    if (Array.isArray(s.data.related)) for (const r of s.data.related) mergedRelated.add(r);
+  }
+  projData.consolidated_from = [...consolidatedFrom];
+  if (mergedRelated.size > 0) projData.related = [...mergedRelated];
 
-  // Append a "Related memories" section (dedup against links already present).
-  const newLines = sources
-    .filter((s) => !projBody.includes(`[[${s.path}]]`))
-    .map((s) => `- [[${s.path}]] — ${s.title}${s.snippet ? `\n  > ${s.snippet}…` : ''}`);
-  if (newLines.length === 0 && !created) return null;
+  // Fold each source's FULL body in (lossless), under a dated subsection.
+  // Skip sources already folded in (idempotent on the project body).
+  const newEntries = sources.filter((s) => !projBody.includes(`<!-- src:${s.path} -->`));
+  if (newEntries.length === 0 && !created) return null;
 
-  if (newLines.length > 0) {
-    const header = '## Related memories';
+  if (newEntries.length > 0) {
+    const blocks = newEntries.map((s) => {
+      const content = stripLeadingTitle(s.body);
+      return `<!-- src:${s.path} -->\n### ${s.title}\n_was ${s.path}_\n\n${content || '(no body)'}\n`;
+    });
+    const header = '## Consolidated memories';
     if (projBody.includes(header)) {
-      projBody = projBody.replace(header, `${header}\n${newLines.join('\n')}`);
+      projBody = projBody.replace(header, `${header}\n\n${blocks.join('\n')}`);
     } else {
-      projBody = `${projBody.replace(/\s*$/, '')}\n\n${header}\n${newLines.join('\n')}\n`;
+      projBody = `${projBody.replace(/\s*$/, '')}\n\n${header}\n\n${blocks.join('\n')}`;
     }
   }
 
   if (dryRun) {
-    return { projectPath, created, linkedPaths: sources.map((s) => s.path), title: cluster.suggestedTitle, basis: cluster.basis };
+    return {
+      projectPath, created,
+      sourcePaths: sources.map((s) => s.path),
+      deleted: [],
+      title: cluster.suggestedTitle, basis: cluster.basis,
+    };
   }
 
-  // Write the project note.
+  // Write the project note BEFORE deleting any source.
   try {
     const projContent = stringifyFrontmatter(projData, projBody);
     await writeNote(projectPath, projContent);
@@ -267,33 +295,26 @@ export async function reconcileClusterIntoProject(
     return null;
   }
 
-  // Link each source back to the project — non-destructively. We use
-  // `reconciled_into` (NOT `consolidated_into`) on purpose: it records the tie
-  // without making the note eligible for auto-archive.
-  const linkedPaths: string[] = [];
-  for (const s of sources) {
+  // Delete the originals only after the project note is safely written.
+  const deleted: string[] = [];
+  for (const s of newEntries) {
     try {
-      s.data.reconciled_into = projectPath;
-      const related = new Set<string>(Array.isArray(s.data.related) ? s.data.related : []);
-      related.add(`[[${projectPath}]]`);
-      s.data.related = [...related];
-      let body = s.body;
-      const backlink = `[[${projectPath}]]`;
-      if (!body.includes(backlink)) {
-        body = `${body.replace(/\s*$/, '')}\n\n## Project\nReconciled into ${backlink}.\n`;
-      }
-      const updated = stringifyFrontmatter(s.data, body);
-      await writeNote(s.path, updated);
-      await indexNote(s.path);
-      updateGraphForNote(s.path, updated);
-      linkedPaths.push(s.path);
+      await deleteNote(s.path);
+      removeFromIndex(s.path);
+      deleted.push(s.path);
     } catch (err) {
-      logger.warn('reconcileClusterIntoProject: source link failed', {
+      logger.warn('reconcileClusterIntoProject: source delete failed', {
         path: s.path, error: err instanceof Error ? err.message : String(err),
       });
     }
   }
 
-  logger.info('Project reconciliation applied', { projectPath, created, linked: linkedPaths.length });
-  return { projectPath, created, linkedPaths, title: cluster.suggestedTitle, basis: cluster.basis };
+  recordConsolidation(deleted.length);
+  logger.info('Project reconciliation applied', { projectPath, created, deleted: deleted.length });
+  return {
+    projectPath, created,
+    sourcePaths: sources.map((s) => s.path),
+    deleted,
+    title: cluster.suggestedTitle, basis: cluster.basis,
+  };
 }

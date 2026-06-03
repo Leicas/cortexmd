@@ -136,9 +136,10 @@ export interface DreamReport {
   promotions: Array<PromotionCandidate & { applied: boolean }>;
 
   /**
-   * Cold notes reconciled into project notes by shared entity/tag overlap and
-   * LINKED (never deleted). Empty when reconcileProjects=false. In dryRun these
-   * are the would-be reconciliations (nothing written).
+   * Cold notes consolidated into project notes by shared entity/tag overlap:
+   * each source's full body is folded into Projects/<slug>.md and the original
+   * is deleted. Empty when reconcileProjects=false. In dryRun these are the
+   * would-be reconciliations (nothing written/deleted).
    */
   projectReconciliations: ProjectReconciliation[];
 
@@ -184,9 +185,9 @@ export interface DreamOptions {
   scope?: 'memories' | 'vault';
 
   /**
-   * Reconcile clusters of related cold notes into project notes (link-and-keep,
-   * never delete). Runs alongside the existing destructive tag-consolidation
-   * path. Default: true.
+   * Reconcile clusters of related cold notes into project notes (fold each
+   * source's body into Projects/<slug>.md, then delete the originals). Runs
+   * alongside the existing tag-consolidation path. Default: true.
    */
   reconcileProjects?: boolean;
   /** Restrict reconciliation to cold notes only (default true; false also pulls warm). */
@@ -955,9 +956,9 @@ function generateNarrative(report: DreamReport): string {
 
   if (report.projectReconciliations.length > 0) {
     const created = report.projectReconciliations.filter((r) => r.created).length;
-    const linked = report.projectReconciliations.reduce((n, r) => n + r.linkedPaths.length, 0);
+    const linked = report.projectReconciliations.reduce((n, r) => n + r.deleted.length, 0);
     parts.push(
-      `Reconciled ${linked} cold ${linked === 1 ? 'memory' : 'memories'} into ` +
+      `Consolidated ${linked} cold ${linked === 1 ? 'memory' : 'memories'} into ` +
       `${report.projectReconciliations.length} project${report.projectReconciliations.length === 1 ? '' : 's'}` +
       `${created > 0 ? ` (${created} new)` : ''}.`,
     );

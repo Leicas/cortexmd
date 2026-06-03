@@ -19,7 +19,7 @@ export function register(server: McpServer): void {
       maxOrphans: z.number().min(1).max(50).optional().describe('Maximum orphan memories to report (default: 20)'),
       maxConnections: z.number().min(1).max(30).optional().describe('Maximum connection suggestions (default: 10)'),
       maxConsolidations: z.number().min(1).max(20).optional().describe('Maximum consolidation groups (default: 5)'),
-      reconcileProjects: z.boolean().optional().describe('Reconcile clusters of related cold notes into Projects/ notes by shared entity/tag overlap, LINKING (never deleting) the sources. Runs alongside the destructive tag-consolidation. Default: true'),
+      reconcileProjects: z.boolean().optional().describe('Consolidate clusters of related cold notes into Projects/ notes by shared entity/tag overlap — folds each source body into the project note and DELETES the originals. Runs alongside the tag-consolidation. Default: true'),
       reconcileColdOnly: z.boolean().optional().describe('Restrict project reconciliation to cold notes; set false to also pull in warm notes. Default: true'),
       reconcileMinClusterSize: z.number().min(2).max(20).optional().describe('Minimum notes in a cluster before a project is created/updated (default: 2)'),
     },

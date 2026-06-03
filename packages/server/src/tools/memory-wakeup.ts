@@ -15,17 +15,22 @@ export function register(server: McpServer): void {
 - L2 (optional): Filtered recall for a specific collection
 - Agent diary: Recent entries from your diary for session continuity
 
-Pass agentName to include your last diary entries — this lets you pick up where you left off.`,
+Pass agentName to include your last diary entries — this lets you pick up where you left off.
+Use preset='tiny' for a minimal (~180 token) boot, 'standard' (~900, default), or 'full' (~2000).`,
     {
       collection: z
         .string()
         .optional()
         .describe('Focus on a specific collection (e.g. "memories", "crm", "projects")'),
+      preset: z
+        .enum(['tiny', 'standard', 'full'])
+        .optional()
+        .describe('Startup size preset (overrides tokenBudget when set): tiny ≈180 tokens (L0 identity + a sliver of L1) for a minimal mempalace-style boot; standard ≈900 (default); full ≈2000.'),
       tokenBudget: z
         .number()
         .optional()
         .default(900)
-        .describe('Max tokens for L0+L1 combined (default 900)'),
+        .describe('Max tokens for L0+L1 combined (default 900). Ignored when preset is set.'),
       includeL2: z
         .boolean()
         .optional()
@@ -42,7 +47,14 @@ Pass agentName to include your last diary entries — this lets you pick up wher
     },
     wrapToolHandler('memory_wakeup', async (params) => {
       const collection = params.collection as string | undefined;
-      const tokenBudget = (params.tokenBudget as number | undefined) ?? 900;
+      const preset = params.preset as 'tiny' | 'standard' | 'full' | undefined;
+      // A preset gives a one-word startup-size knob; `tiny` lands cortexmd a
+      // sub-200-token boot floor (parity with mempalace's ~170) without changing
+      // the default budget for existing callers.
+      const PRESET_BUDGET = { tiny: 180, standard: 900, full: 2000 } as const;
+      const tokenBudget = preset
+        ? PRESET_BUDGET[preset]
+        : ((params.tokenBudget as number | undefined) ?? 900);
       const includeL2 = (params.includeL2 as boolean | undefined) ?? false;
       const category = params.category as string | undefined;
       const agentName = params.agentName as string | undefined;

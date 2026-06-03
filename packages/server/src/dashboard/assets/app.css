@@ -478,6 +478,41 @@ tbody tr:last-child td{border-bottom:none}
 .action-archive{background:var(--err-fill);color:var(--err)}
 .action-review{background:rgba(188,140,255,.15);color:var(--purple)}
 
+/* ── Graph tab — force-directed vault canvas + note side panel ── */
+.graph-layout{display:grid;grid-template-columns:minmax(0,1fr) 340px;gap:var(--r-md,10px);
+  align-items:stretch;height:calc(100vh - 190px);min-height:420px}
+.card--graph{display:flex;flex-direction:column;min-width:0;overflow:hidden}
+.card--graph-aside{overflow:auto;min-width:0}
+.graph-controls{display:flex;align-items:center;gap:.4rem;flex-wrap:wrap}
+.graph-controls .input{max-width:200px}
+.graph-controls .select{width:auto}
+.graph-stage{position:relative;flex:1;margin-top:.6rem;border:1px solid var(--border);
+  border-radius:var(--r-sm,6px);background:radial-gradient(circle at 50% 40%,#0b101a,#06080d);overflow:hidden}
+.graph-canvas{display:block;width:100%;height:100%;cursor:grab;touch-action:none}
+.graph-canvas:active{cursor:grabbing}
+.graph-loading{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
+  color:var(--text-dim);font-size:var(--fs-sm)}
+.graph-stat{position:absolute;left:.5rem;bottom:.4rem;color:var(--text-faint);
+  font:var(--fs-xs)/1.2 var(--mono);pointer-events:none;text-shadow:0 1px 2px #000}
+.graph-note{font-size:var(--fs-sm)}
+.graph-note-head{border-bottom:1px solid var(--border);padding-bottom:.5rem;margin-bottom:.5rem}
+.graph-note-title{font-weight:650;font-size:var(--fs-md);margin-bottom:.15rem}
+.graph-note-chips{margin-top:.4rem;display:flex;flex-wrap:wrap;gap:.3rem}
+.graph-note-body{line-height:1.5;color:var(--text-dim);word-break:break-word}
+.graph-note-body .md-h{font-weight:650;color:var(--text);margin:.6rem 0 .25rem}
+.graph-note-body .md-h1{font-size:var(--fs-md)}
+.graph-note-body .md-h2,.graph-note-body .md-h3,.graph-note-body .md-h4{font-size:var(--fs-sm)}
+.graph-note-body .md-p{margin:.15rem 0}
+.graph-note-body .md-sp{height:.4rem}
+.graph-note-body .md-link{color:var(--brand);cursor:pointer;text-decoration:none}
+.graph-note-body .md-link:hover{text-decoration:underline}
+.graph-note-body code{font-family:var(--mono);font-size:.95em;background:var(--line-faint,rgba(255,255,255,.05));
+  padding:.05rem .25rem;border-radius:4px}
+@media(max-width:860px){
+  .graph-layout{grid-template-columns:1fr;height:auto}
+  .card--graph{height:60vh}
+}
+
 /* Health factor bars */
 .health-factor{display:flex;align-items:center;gap:.4rem;margin-bottom:.25rem}
 .health-factor .hf-label{width:80px;text-align:right;color:var(--text-dim);font-size:var(--fs-xs);flex-shrink:0}

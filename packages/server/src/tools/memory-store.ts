@@ -8,10 +8,10 @@ import { updateGraphForNote } from '../lib/graph.js';
 import { wrapToolHandler } from '../lib/tool-wrapper.js';
 import { sanitizeContent } from '../lib/sanitize.js';
 import { findSimilarNotes } from '../lib/similar-notes.js';
+import { autoLinkEntities, selectAutoRelated, seedEntityKg } from '../lib/auto-link.js';
 import { isEmbeddingsReady, checkSemanticDuplicate } from '../lib/embeddings.js';
 import { extractPreferences, DetectedPreference } from '../lib/preference-detector.js';
 import { detectEntities, type DetectedEntity } from '../lib/entity-detector.js';
-import { registerEntity } from '../lib/entity-registry.js';
 import { logger } from '../lib/logger.js';
 import { detectCategory, MEMORY_CATEGORIES } from '../lib/categorize.js';
 import type { MemoryCategory } from '../lib/categorize.js';
@@ -49,43 +49,6 @@ function generateTitle(content: string): string {
     title = title.slice(0, 77) + '...';
   }
   return title || 'Untitled Memory';
-}
-
-/**
- * Resolve detected entities to bare `[[Name]]` wiki-links so a stored memory
- * connects into the graph instead of orphaning. We link by bare name (not a
- * resolved path): the graph resolves `[[Name]]` to the canonical note by
- * basename — the same strategy every other vault link uses — so a mention of
- * "Haply" links to the real Haply note. Unknown entities become unresolved
- * links, which are still graph edges that cluster memories and turn live once a
- * note with that name exists.
- *
- * We deliberately do NOT trust the entity registry's notePath (it can be stale
- * and point at the wrong note) nor auto-create stub notes (which would
- * duplicate existing canonical entity notes). Never throws.
- */
-function autoLinkEntities(
-  entities: Array<{ name: string; type: 'person' | 'project' | 'organization' }>,
-): string[] {
-  const links: string[] = [];
-  const seen = new Set<string>();
-  for (const e of entities) {
-    const name = e.name.trim();
-    if (!name) continue;
-    const link = `[[${name}]]`;
-    if (!seen.has(link)) {
-      seen.add(link);
-      links.push(link);
-    }
-    // Keep the registry's name/type/occurrence fresh, but don't record a
-    // notePath from here (see above).
-    try {
-      registerEntity(e.name, e.type, { tier: 'detected' });
-    } catch {
-      // Non-critical.
-    }
-  }
-  return links;
 }
 
 /**
@@ -308,13 +271,23 @@ Categories: observation, decision, insight, conversation, fact, preference, plan
       // (creating a stub under Entities/ when none exists yet).
       let highConfidence: DetectedEntity[] = [];
       try {
-        highConfidence = detectEntities(content).filter((e) => e.confidence > 0.7);
+        highConfidence = detectEntities(content).filter((e) => e.confidence > config.autoLinkMinConfidence);
       } catch {
         highConfidence = [];
       }
-      // Skip auto-linking/stub-creation for email captures — they'd spawn a
-      // stub per sender. Curated memories still get linked.
-      const entityLinks = isEmailCapture ? [] : autoLinkEntities(highConfidence);
+      // Skip auto-linking/KG-seeding for email captures — they'd spawn a node
+      // per sender. Curated memories still get linked + seeded into the graph.
+      const entityLinks = isEmailCapture || !config.autoLink ? [] : autoLinkEntities(highConfidence);
+      if (!isEmailCapture) {
+        seedEntityKg(title, highConfidence, notePath);
+      }
+
+      // Persist the (otherwise discarded) similarity signal as strippable
+      // `## Related (auto)` backlinks. Computed before the body is built so the
+      // links land in the note itself and become real graph edges; the same
+      // result is reused for the response payload below.
+      const { similarNotes, suggestion: similarSuggestion } = await findSimilarNotes(content, notePath);
+      const autoRelated = isEmailCapture ? [] : selectAutoRelated(similarNotes);
 
       // Build frontmatter
       const frontmatter: Record<string, unknown> = {
@@ -346,6 +319,11 @@ Categories: observation, decision, insight, conversation, fact, preference, plan
       if (relatedLinks.length > 0) {
         frontmatter.related = relatedLinks;
       }
+      // Similarity backlinks are kept in a SEPARATE frontmatter key (not merged
+      // into curated `related`) so they stay distinguishable and strippable.
+      if (autoRelated.length > 0) {
+        frontmatter.auto_related = autoRelated;
+      }
 
       if (context) {
         frontmatter.context = context;
@@ -360,8 +338,12 @@ Categories: observation, decision, insight, conversation, fact, preference, plan
         entityLinks.length > 0
           ? `\n\n## Entities\n${entityLinks.map((l) => `- ${l}`).join('\n')}`
           : '';
+      const autoRelatedSection =
+        autoRelated.length > 0
+          ? `\n\n## Related (auto)\n${autoRelated.map((l) => `- ${l}`).join('\n')}`
+          : '';
 
-      const body = `# ${title}\n\n${content}${relatedSection}${entitySection}\n`;
+      const body = `# ${title}\n\n${content}${relatedSection}${entitySection}${autoRelatedSection}\n`;
 
       // Capture any [[code:...]] wiki-links into frontmatter for staleness checks.
       try {
@@ -416,8 +398,8 @@ Categories: observation, decision, insight, conversation, fact, preference, plan
         }
       }
 
-      // Find similar notes for consolidation suggestions
-      const { similarNotes, suggestion: similarSuggestion } = await findSimilarNotes(content, notePath);
+      // (similarNotes / similarSuggestion were computed earlier, before the body
+      // was built, so the similarity backlinks could be embedded in the note.)
 
       // Phase 9: Extract and auto-store preferences
       let extractedPreferences: DetectedPreference[] = [];

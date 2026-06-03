@@ -6,9 +6,10 @@ import sessions from './tabs/sessions.js';
 import ratelimits from './tabs/ratelimits.js';
 import vault from './tabs/vault.js';
 import intelligence from './tabs/intelligence.js';
+import graph from './tabs/graph.js';
 import agents from './tabs/agents.js';
 import code from './tabs/code.js';
 import logs from './tabs/logs.js';
 
-[overview, sessions, ratelimits, vault, intelligence, agents, code, logs].forEach(registerTab);
+[overview, sessions, ratelimits, vault, intelligence, graph, agents, code, logs].forEach(registerTab);
 boot();

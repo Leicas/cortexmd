@@ -43,6 +43,9 @@ export const DEFAULT_COLLECTIONS: CollectionRule[] = [
   // Code projections — symbol notes mirrored from code-nav
   { name: 'code',     pathPattern: /^Code\//i,     weight: 0.8 },
 
+  // Projects — synthesis notes the dream reconciles cold memories into
+  { name: 'projects', pathPattern: /^Projects\//i, weight: 1.0 },
+
   // Archive — heavily deprioritized
   { name: 'archive',  pathPattern: /^Archive\//i,  weight: 0.5 },
 
@@ -84,6 +87,7 @@ export function classifyByFrontmatter(
     case 'memory':    return 'memories';
     case 'journal':   return 'journal';
     case 'meeting':   return 'journal';
+    case 'project':   return 'projects';
   }
 
   // Category hint for memory sub-categories (observation, decision, ...)

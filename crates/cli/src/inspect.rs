@@ -1326,7 +1326,11 @@ pub fn cmd_recall(args: RecallArgs) -> Result<()> {
         // query from the prompt, and emit a markdown block on stdout (which
         // Claude treats as additional context). All errors are swallowed —
         // a failing hook must never block the user's prompt.
-        let _ = recall_from_stdin();
+        // Thread the resolved server/key (from --server/--api-key or the
+        // MCP_URL/MCP_API_KEY env clap parsed) into the stdin pipeline so a
+        // self-hosted setup's hook targets the configured server, not just the
+        // OAuth cache.
+        let _ = recall_from_stdin(args.server.as_deref(), args.api_key.as_deref());
         return Ok(());
     }
     if args.query.trim().is_empty() {
@@ -1377,7 +1381,7 @@ pub fn cmd_store_memory(args: StoreMemoryArgs) -> Result<()> {
         // Hook mode: read PostToolUse JSON from stdin, gate on high-signal
         // Bash invocations, and store a memory silently. Exits 0 on any
         // error so the hook never blocks Claude.
-        let _ = store_from_stdin();
+        let _ = store_from_stdin(args.server.as_deref(), args.api_key.as_deref());
         return Ok(());
     }
     let mut content = args.content.clone();
@@ -1432,7 +1436,7 @@ pub fn cmd_store_memory(args: StoreMemoryArgs) -> Result<()> {
 // Code hook event from stdin and never propagate errors (a flaky server
 // must NOT block the user's prompt or a tool call).
 
-fn recall_from_stdin() -> Result<()> {
+fn recall_from_stdin(server: Option<&str>, key: Option<&str>) -> Result<()> {
     use std::io::Read;
     let mut buf = String::new();
     std::io::stdin().read_to_string(&mut buf).ok();
@@ -1460,11 +1464,13 @@ fn recall_from_stdin() -> Result<()> {
     args.format = "block".to_string();
     args.max_chars = 800;
     args.header = "📌 Relevant memory".to_string();
+    args.server = server.map(str::to_string);
+    args.api_key = key.map(str::to_string);
     args.hook = false;
     cmd_recall(args)
 }
 
-fn store_from_stdin() -> Result<()> {
+fn store_from_stdin(server: Option<&str>, key: Option<&str>) -> Result<()> {
     use std::io::Read;
     let mut buf = String::new();
     std::io::stdin().read_to_string(&mut buf).ok();
@@ -1551,6 +1557,8 @@ fn store_from_stdin() -> Result<()> {
     }
     args.source = Some("hook:PostToolUse:Bash".to_string());
     args.format = "json".to_string();
+    args.server = server.map(str::to_string);
+    args.api_key = key.map(str::to_string);
     args.hook = false;
     cmd_store_memory(args)
 }

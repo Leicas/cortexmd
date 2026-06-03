@@ -16,7 +16,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "cortexmd recall --hook",
+            "command": "cortexmd recall --hook --server ${user_config.server_url}",
             "timeout": 8
           }
         ]
@@ -40,7 +40,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "cortexmd store-memory --hook",
+            "command": "cortexmd store-memory --hook --server ${user_config.server_url}",
             "timeout": 6
           }
         ]

@@ -12,8 +12,10 @@ import { sanitizePath, sanitizeContent } from '../lib/sanitize.js';
 import { findSimilarNotes } from '../lib/similar-notes.js';
 import { detectEntities } from '../lib/entity-detector.js';
 import { registerEntity } from '../lib/entity-registry.js';
+import { autoLinkEntities, selectAutoRelated, seedEntityKg } from '../lib/auto-link.js';
 import { inferNoteCategory } from '../lib/categorize.js';
 import { captureCodeRefs } from '../lib/code-nav/refs.js';
+import { config } from '../config.js';
 
 /**
  * If the body contains `[[code:slug:relpath:name]]` wiki-links, capture them
@@ -136,6 +138,57 @@ function addEntitySuggestions(responseData: Record<string, unknown>, content: st
   }
 }
 
+/**
+ * Conservative auto-linking for notes we fully own (new notes + replace mode):
+ * inject canonical entity wiki-links and similarity backlinks into clearly
+ * marked, strippable sections (`## Entities (auto)` / `## Related (auto)`) and
+ * seed the KG. Mutates `data` (frontmatter) and returns the augmented body.
+ * Never throws. Existing-note append/section merges are intentionally NOT
+ * enriched — no surprise edits to curated notes.
+ */
+async function enrichWithAutoLinks(
+  notePath: string,
+  data: Record<string, any>,
+  body: string,
+): Promise<string> {
+  if (!config.autoLink) return body;
+  let augmented = body;
+  const title =
+    (typeof data.title === 'string' && data.title.trim()) ||
+    notePath.replace(/\.md$/, '').split('/').pop() ||
+    notePath;
+
+  // Entity wiki-links (skip any already present as a [[link]] in the body).
+  try {
+    const detected = detectEntities(body).filter((e) => e.confidence > config.autoLinkMinConfidence);
+    if (detected.length > 0) {
+      const links = autoLinkEntities(detected).filter((l) => !augmented.includes(l));
+      if (links.length > 0) {
+        augmented += `\n\n## Entities (auto)\n${links.map((l) => `- ${l}`).join('\n')}`;
+        const existing = Array.isArray(data.related) ? data.related : [];
+        data.related = [...new Set([...existing, ...links])];
+      }
+      seedEntityKg(title, detected, notePath);
+    }
+  } catch {
+    // Non-critical.
+  }
+
+  // Similarity backlinks → strippable `## Related (auto)` + `auto_related`.
+  try {
+    const { similarNotes } = await findSimilarNotes(body, notePath);
+    const autoRelated = selectAutoRelated(similarNotes).filter((l) => !augmented.includes(l));
+    if (autoRelated.length > 0) {
+      augmented += `\n\n## Related (auto)\n${autoRelated.map((l) => `- ${l}`).join('\n')}`;
+      data.auto_related = autoRelated;
+    }
+  } catch {
+    // Non-critical.
+  }
+
+  return augmented;
+}
+
 export function register(server: McpServer): void {
   server.tool(
     "notes_upsert",
@@ -163,8 +216,9 @@ Use wiki-links in content to build the knowledge graph: [[Note Name]] links to a
         const { data, body } = parseFrontmatter(noteContent);
         ensureId(data);
         ensureCategory(data, body, notePath);
-        maybeAttachCodeRefs(data, body);
-        finalContent = stringifyFrontmatter(data, body);
+        const enrichedBody = await enrichWithAutoLinks(notePath, data, body);
+        maybeAttachCodeRefs(data, enrichedBody);
+        finalContent = stringifyFrontmatter(data, enrichedBody);
         await writeNote(notePath, finalContent, ifMatch);
       } else if (mergeMode === "append") {
         let existing: string;
@@ -176,8 +230,9 @@ Use wiki-links in content to build the knowledge graph: [[Note Name]] links to a
           const { data, body } = parseFrontmatter(noteContent);
           ensureId(data);
           ensureCategory(data, body, notePath);
-          maybeAttachCodeRefs(data, body);
-          finalContent = stringifyFrontmatter(data, body);
+          const enrichedBody = await enrichWithAutoLinks(notePath, data, body);
+          maybeAttachCodeRefs(data, enrichedBody);
+          finalContent = stringifyFrontmatter(data, enrichedBody);
           await writeNote(notePath, finalContent);
           await updateLastUpdatedAndTemperature(notePath);
           const etag = computeEtag(finalContent);
@@ -213,8 +268,9 @@ Use wiki-links in content to build the knowledge graph: [[Note Name]] links to a
           const { data, body } = parseFrontmatter(noteContent);
           ensureId(data);
           ensureCategory(data, body, notePath);
-          maybeAttachCodeRefs(data, body);
-          finalContent = stringifyFrontmatter(data, body);
+          const enrichedBody = await enrichWithAutoLinks(notePath, data, body);
+          maybeAttachCodeRefs(data, enrichedBody);
+          finalContent = stringifyFrontmatter(data, enrichedBody);
           await writeNote(notePath, finalContent);
           await updateLastUpdatedAndTemperature(notePath);
           const etag = computeEtag(finalContent);
@@ -244,6 +300,20 @@ Use wiki-links in content to build the knowledge graph: [[Note Name]] links to a
       await appendJournalEntry(`Updated note: [[${notePath}]]`);
       await indexNote(notePath);
       updateGraphForNote(notePath, finalContent);
+
+      // Seed the KG from the merged content so existing-note append/section
+      // merges still grow the temporal graph (no body mutation here — that's
+      // reserved for the new-note/replace paths via enrichWithAutoLinks).
+      // kgAddTriple is an idempotent upsert, so re-seeding replace mode is safe.
+      if (config.autoLink) {
+        try {
+          const detected = detectEntities(finalContent).filter((e) => e.confidence > config.autoLinkMinConfidence);
+          const seedTitle = notePath.replace(/\.md$/, '').split('/').pop() || notePath;
+          seedEntityKg(seedTitle, detected, notePath);
+        } catch {
+          // Non-critical.
+        }
+      }
 
       const { similarNotes, suggestion } = await findSimilarNotes(finalContent, notePath);
       const responseData: Record<string, unknown> = { path: notePath, updated: true, etag };

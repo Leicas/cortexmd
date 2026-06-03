@@ -265,6 +265,26 @@ export const config = {
   // Knowledge graph
   kgEnabled: process.env.ENABLE_KG !== 'false',
 
+  // Automatic linking on store (memory_store / notes_upsert). Conservative +
+  // reversible defaults: entity links keep the historical 0.7 confidence gate;
+  // similarity backlinks use a higher score floor than the advisory
+  // `findSimilarNotes` surface and land in a clearly-marked, strippable
+  // `## Related (auto)` section + `auto_related` frontmatter (curated `related`
+  // is never overwritten). KG triples are seeded inline so the temporal graph
+  // grows on every write instead of only on manual bootstrap/backfill.
+  //   AUTO_LINK=false                 — master kill switch for all of the below
+  //   AUTO_LINK_MIN_CONFIDENCE=0.7    — entity auto-link confidence gate
+  //   AUTO_LINK_RELATED=false         — disable similarity backlinks only
+  //   AUTO_LINK_RELATED_MIN_SCORE=0.02 — fused-score floor for a backlink
+  //   AUTO_LINK_RELATED_MAX=3         — max similarity backlinks per note
+  //   AUTO_SEED_KG=false              — disable inline KG triple seeding
+  autoLink: process.env.AUTO_LINK !== 'false',
+  autoLinkMinConfidence: parseFloat(process.env.AUTO_LINK_MIN_CONFIDENCE ?? '0.7'),
+  autoLinkRelatedNotes: process.env.AUTO_LINK_RELATED !== 'false',
+  autoLinkRelatedMinScore: parseFloat(process.env.AUTO_LINK_RELATED_MIN_SCORE ?? '0.02'),
+  autoLinkRelatedMax: parseInt(process.env.AUTO_LINK_RELATED_MAX ?? '3', 10),
+  autoSeedKg: process.env.AUTO_SEED_KG !== 'false',
+
   // Memory engine v2: contradiction detection on memory_store. Toggleable for
   // tests/benchmarks. Default true; embeds the new body + same-entity candidates
   // and surfaces any with cosine ≥ 0.85 and zero shared content tokens.

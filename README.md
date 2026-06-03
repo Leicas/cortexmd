@@ -4,6 +4,30 @@
 
 **cortexmd** is a long-term memory and code-navigation brain for AI agents, exposed over the [Model Context Protocol (MCP)](https://modelcontextprotocol.io). It indexes your code and notes, stores agent memories with a heat/decay lifecycle, runs hybrid (lexical + semantic) search, and serves cheap code-navigation tools (symbol search, call graph, change-impact) so agents stop burning tokens on whole-file reads.
 
+![cortexmd dashboard — Overview](./docs/screenshots/overview.png)
+
+## Try it in 60 seconds (live dashboard)
+
+The richest way to see cortexmd is the **server (shared-memory) mode**: one HTTP
+server that every AI tool connects to, with a live operations dashboard. When you
+want a single brain shared across Claude Code, Cursor, and Codex, this is the way
+— memory written by one tool is instantly recalled by the others.
+
+```sh
+./demo/run.sh
+```
+
+This builds the server, starts it on `http://localhost:7777`, and seeds it with
+realistic data by driving the MCP tools exactly like a real agent would. Then
+open **http://localhost:7777/dashboard** (password: `demo`). See
+[`demo/README.md`](./demo/README.md) for details, knobs, and how to point your
+own AI tools at the running server.
+
+| Knowledge graph & memory health | Code-nav token savings | Shared sessions |
+|---|---|---|
+| [![Intelligence](./docs/screenshots/intelligence.png)](./docs/screenshots/intelligence.png) | [![Code](./docs/screenshots/code.png)](./docs/screenshots/code.png) | [![Sessions](./docs/screenshots/sessions.png)](./docs/screenshots/sessions.png) |
+| [![Vault & Memory](./docs/screenshots/vault.png)](./docs/screenshots/vault.png) | [![Graph](./docs/screenshots/graph.png)](./docs/screenshots/graph.png) | [![Agents](./docs/screenshots/agents.png)](./docs/screenshots/agents.png) |
+
 ## Two deployment modes (co-equal)
 
 1. **local-stdio** — runs on your machine, talks MCP over stdio, reads your vault(s) directly from disk. No sync, no Docker, no auth, no network. This is the recommended default for individual use.

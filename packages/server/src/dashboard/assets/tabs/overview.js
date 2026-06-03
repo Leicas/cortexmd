@@ -79,9 +79,10 @@ function renderStatusStrip(ctx, d) {
   else if (llm.available) setPill(ctx, 'stLlm', 'ok', 'Local LLM up');
   else setPill(ctx, 'stLlm', 'bad', 'Local LLM down');
 
-  // Embeddings — ready/loading.
+  // Embeddings — off (disabled) / loading (enabled, not ready) / ready.
   var emb = d.embeddingStats || {};
-  setPill(ctx, 'stEmb', emb.ready ? 'ok' : 'warn', emb.ready ? 'Embeddings ready' : 'Embeddings loading');
+  if (emb.enabled === false) setPill(ctx, 'stEmb', 'muted', 'Embeddings off');
+  else setPill(ctx, 'stEmb', emb.ready ? 'ok' : 'warn', emb.ready ? 'Embeddings ready' : 'Embeddings loading');
 
   // Search index — clean/errors.
   var ih = d.indexHealth || {};

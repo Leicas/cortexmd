@@ -13,6 +13,7 @@ target/
 
 # ---- Runtime data / indexes ----
 data/
+demo/.runtime/
 *.hnsw
 *.sqlite
 *.sqlite-shm

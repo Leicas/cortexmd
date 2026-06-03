@@ -22,6 +22,11 @@ import {
   type ROIDemotionCandidate,
   type PromotionCandidate,
 } from './memory-lifecycle.js';
+import {
+  clusterColdNotes,
+  reconcileClusterIntoProject,
+  type ProjectReconciliation,
+} from './project-reconcile.js';
 import { logger } from './logger.js';
 import { config } from '../config.js';
 
@@ -130,6 +135,13 @@ export interface DreamReport {
   /** Observations promoted to canonical facts (≥5 hits in 30 days). */
   promotions: Array<PromotionCandidate & { applied: boolean }>;
 
+  /**
+   * Cold notes reconciled into project notes by shared entity/tag overlap and
+   * LINKED (never deleted). Empty when reconcileProjects=false. In dryRun these
+   * are the would-be reconciliations (nothing written).
+   */
+  projectReconciliations: ProjectReconciliation[];
+
   /** Always present — even when the LLM was skipped — so consumers get a uniform shape. */
   llm: DreamLlmBlock;
 
@@ -170,6 +182,17 @@ export interface DreamOptions {
    * that carries a heat_score), so they ignore this flag.
    */
   scope?: 'memories' | 'vault';
+
+  /**
+   * Reconcile clusters of related cold notes into project notes (link-and-keep,
+   * never delete). Runs alongside the existing destructive tag-consolidation
+   * path. Default: true.
+   */
+  reconcileProjects?: boolean;
+  /** Restrict reconciliation to cold notes only (default true; false also pulls warm). */
+  reconcileColdOnly?: boolean;
+  /** Minimum cluster size before a project is created/updated (default 2). */
+  reconcileMinClusterSize?: number;
 }
 
 /**
@@ -519,6 +542,9 @@ export async function runDreamCycle(options: DreamOptions = {}): Promise<DreamRe
     maxConnections = 10,
     maxConsolidations = 5,
     scope = 'memories',
+    reconcileProjects = true,
+    reconcileColdOnly = true,
+    reconcileMinClusterSize = 2,
   } = options;
 
   const startTime = Date.now();
@@ -638,6 +664,32 @@ export async function runDreamCycle(options: DreamOptions = {}): Promise<DreamRe
     logger.warn('Dream cycle: consolidation detection failed', { error: String(err) });
   }
 
+  // 6.6. Project reconciliation — cluster related cold notes by shared
+  // entity/tag overlap and LINK them into a project note (never delete).
+  // Additive to the destructive tag-consolidation above. Respects dryRun.
+  let projectReconciliations: ProjectReconciliation[] = [];
+  if (reconcileProjects) {
+    try {
+      const clusters = clusterColdNotes({
+        includeWarm: !reconcileColdOnly,
+        minClusterSize: reconcileMinClusterSize,
+      });
+      for (const cluster of clusters) {
+        try {
+          const result = await reconcileClusterIntoProject(cluster, dryRun);
+          if (result) projectReconciliations.push(result);
+        } catch (err) {
+          logger.warn('Dream cycle: project reconciliation failed', {
+            cluster: cluster.suggestedTitle,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
+    } catch (err) {
+      logger.warn('Dream cycle: cold-note clustering failed', { error: String(err) });
+    }
+  }
+
   // 6.5. ROI demotion + auto-promotion (token-savior parity)
   let roiDemotions: ROIDemotionCandidate[] = [];
   try {
@@ -690,6 +742,7 @@ export async function runDreamCycle(options: DreamOptions = {}): Promise<DreamRe
     autoConsolidations,
     roiDemotions,
     promotions,
+    projectReconciliations,
     llm,
     dryRun,
     health,
@@ -898,6 +951,16 @@ function generateNarrative(report: DreamReport): string {
 
   if (report.connectionSuggestions.length > 0) {
     parts.push(`${report.connectionSuggestions.length} potential connections discovered.`);
+  }
+
+  if (report.projectReconciliations.length > 0) {
+    const created = report.projectReconciliations.filter((r) => r.created).length;
+    const linked = report.projectReconciliations.reduce((n, r) => n + r.linkedPaths.length, 0);
+    parts.push(
+      `Reconciled ${linked} cold ${linked === 1 ? 'memory' : 'memories'} into ` +
+      `${report.projectReconciliations.length} project${report.projectReconciliations.length === 1 ? '' : 's'}` +
+      `${created > 0 ? ` (${created} new)` : ''}.`,
+    );
   }
 
   if (report.consolidationGroups.length > 0) {

@@ -19,6 +19,9 @@ export function register(server: McpServer): void {
       maxOrphans: z.number().min(1).max(50).optional().describe('Maximum orphan memories to report (default: 20)'),
       maxConnections: z.number().min(1).max(30).optional().describe('Maximum connection suggestions (default: 10)'),
       maxConsolidations: z.number().min(1).max(20).optional().describe('Maximum consolidation groups (default: 5)'),
+      reconcileProjects: z.boolean().optional().describe('Reconcile clusters of related cold notes into Projects/ notes by shared entity/tag overlap, LINKING (never deleting) the sources. Runs alongside the destructive tag-consolidation. Default: true'),
+      reconcileColdOnly: z.boolean().optional().describe('Restrict project reconciliation to cold notes; set false to also pull in warm notes. Default: true'),
+      reconcileMinClusterSize: z.number().min(2).max(20).optional().describe('Minimum notes in a cluster before a project is created/updated (default: 2)'),
     },
     wrapToolHandler('memory_dream', async (params) => {
       const report = await runDreamCycle({
@@ -32,6 +35,9 @@ export function register(server: McpServer): void {
         maxOrphans: params.maxOrphans as number | undefined,
         maxConnections: params.maxConnections as number | undefined,
         maxConsolidations: params.maxConsolidations as number | undefined,
+        reconcileProjects: params.reconcileProjects as boolean | undefined,
+        reconcileColdOnly: params.reconcileColdOnly as boolean | undefined,
+        reconcileMinClusterSize: params.reconcileMinClusterSize as number | undefined,
       });
 
       // Log the dream cycle to the journal (skip in dryRun)

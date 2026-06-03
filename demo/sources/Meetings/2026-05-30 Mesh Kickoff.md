@@ -1,17 +1,17 @@
 ---
-title: "Eng Staff"
+title: "Mesh Kickoff"
 tags: ["meeting"]
 created: "2026-06-01"
 last_accessed: "2026-06-03"
 access_count: 5
 ---
 
-# Eng Staff
+# Mesh Kickoff
 
 Attendees & topics:
 
 - [[Alan Turing]]
 - [[Margaret Hamilton]]
-- [[Helios Search]]
-- [[Memory Lifecycle]]
 - [[Agent Mesh]]
+- [[Shared Memory]]
+- [[One Writer Brain Vault]]

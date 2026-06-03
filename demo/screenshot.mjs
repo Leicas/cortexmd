@@ -53,15 +53,16 @@ async function main() {
     if (await btn.count() === 0) { console.log(`(skip ${tab} — no tab button)`); continue; }
     await btn.click();
     // Graph needs the force sim to settle; everything else just needs a paint.
-    await page.waitForTimeout(tab === 'graph' ? 3500 : 1200);
-    // On the Graph tab, fit the view and select a hub node so the side panel
-    // shows real note content instead of the empty state.
+    await page.waitForTimeout(tab === 'graph' ? 4000 : 1200);
+    // On the Graph tab: reheat for a wider spread, fit the whole graph to the
+    // canvas, then click a node to load its note (a plain canvas click loads the
+    // side panel without the highlight that would clutter labels).
     if (tab === 'graph') {
-      await page.locator('#graphFit').click().catch(() => {});
-      const search = page.locator('#graphSearch');
-      await search.fill('Helios Search');
-      await search.press('Enter');
-      await page.waitForTimeout(2000);
+      // Reheat for a wider spread, then fit the whole graph to the canvas. No
+      // node is selected, so only well-connected hubs are labelled — a clean,
+      // readable map rather than an overlapping cluster.
+      await page.locator('#graphReheat').click().catch(() => {});
+      await page.waitForTimeout(4000);
       await page.locator('#graphFit').click().catch(() => {});
       await page.waitForTimeout(1500);
     }

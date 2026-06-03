@@ -1,16 +1,19 @@
 ---
-title: "ADR: Single-Writer Brain Vault"
-tags: ["decision", "architecture", "adr"]
+title: "ADR: One Writer Brain Vault"
+tags: ["decision", "adr"]
 status: "accepted"
-created: "2026-06-01"
-last_accessed: "2026-06-01"
-access_count: 12
+created: "2026-05-20"
+last_accessed: "2026-06-03"
+access_count: 11
 ---
 
-# ADR: Single-Writer Brain Vault
+# ADR: One Writer Brain Vault
 
-**Status:** Accepted · **Owner:** [[CRM/People/Alan Turing.md]]
+**Status:** Accepted · **Owner:** [[Alan Turing]]
 
-The MCP server is the *sole writer*. Source vaults are mounted read-only and
-only ever indexed. This removes bidirectional-sync clobber hazards and is the
-foundation for [[Projects/Agent Mesh.md]] sharing one memory across tools.
+The server is the sole writer; sources are read-only.
+
+## References
+- [[Agent Mesh]]
+- [[Single-Writer Vault]]
+- [[Shared Memory]]

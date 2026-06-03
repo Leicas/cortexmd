@@ -1,18 +1,22 @@
 ---
 title: "Agent Mesh"
-tags: ["project", "agents", "planning"]
+tags: ["project", "planning"]
 status: "planning"
-created: "2026-06-01"
-last_accessed: "2026-06-01"
-access_count: 5
+created: "2026-04-12"
+last_accessed: "2026-06-03"
+access_count: 18
 ---
 
 # Agent Mesh
 
-Shared-memory layer so multiple AI agents (Claude Code, Cursor, Codex) read and
-write the same brain. Built on the MCP server. See [[Decisions/One Writer Brain Vault.md]].
+Shared-memory layer so multiple AI agents share one brain.
 
-## Owner
-- [[CRM/People/Alan Turing.md]] (sponsor)
-
-Blocked on [[Projects/Memory Lifecycle.md]] stabilizing the write path.
+## Owners & links
+- [[Alan Turing]]
+- [[Margaret Hamilton]]
+- [[Model Context Protocol]]
+- [[Shared Memory]]
+- [[Single-Writer Vault]]
+- [[One Writer Brain Vault]]
+- [[Memory Lifecycle]]
+- [[Mesh Kickoff]]

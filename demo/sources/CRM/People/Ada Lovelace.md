@@ -1,17 +1,21 @@
 ---
 title: "Ada Lovelace"
-tags: ["person", "engineering"]
+tags: ["person"]
 role: "Staff Engineer"
 created: "2026-04-12"
 last_accessed: "2026-06-03"
-access_count: 14
+access_count: 9
 ---
 
 # Ada Lovelace
 
-Staff engineer, owns the retrieval stack. Drove the move to hybrid search on
-[[Projects/Helios Search.md]]. Pairs often with [[CRM/People/Grace Hopper.md]].
+Staff Engineer. Owns retrieval. Drove hybrid search.
 
-- Focus: ranking, embeddings, evaluation
-- Reports to [[CRM/People/Alan Turing.md]]
-- Current: [[Projects/Helios Search.md]], [[Meetings/2026-06-01 Search Sync.md]]
+## Connections
+- [[Helios Search]]
+- [[Hybrid Retrieval]]
+- [[Reciprocal Rank Fusion]]
+- [[Adopt Hybrid Retrieval]]
+- [[Grace Hopper]]
+- [[Alan Turing]]
+- [[Search Sync]]

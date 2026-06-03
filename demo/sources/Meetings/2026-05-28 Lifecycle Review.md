@@ -1,17 +1,17 @@
 ---
-title: "Eng Staff"
+title: "Lifecycle Review"
 tags: ["meeting"]
 created: "2026-06-01"
 last_accessed: "2026-06-03"
 access_count: 5
 ---
 
-# Eng Staff
+# Lifecycle Review
 
 Attendees & topics:
 
-- [[Alan Turing]]
-- [[Margaret Hamilton]]
-- [[Helios Search]]
+- [[Grace Hopper]]
+- [[Barbara Liskov]]
 - [[Memory Lifecycle]]
-- [[Agent Mesh]]
+- [[Heat Decay]]
+- [[Heat Decay Half-Life]]

@@ -1,18 +1,21 @@
 ---
 title: "ADR: Adopt Hybrid Retrieval"
-tags: ["decision", "search", "adr"]
+tags: ["decision", "adr"]
 status: "accepted"
-created: "2026-04-12"
+created: "2026-05-20"
 last_accessed: "2026-06-03"
-access_count: 16
+access_count: 11
 ---
 
 # ADR: Adopt Hybrid Retrieval
 
-**Status:** Accepted · **Owner:** [[CRM/People/Ada Lovelace.md]]
+**Status:** Accepted · **Owner:** [[Ada Lovelace]]
 
-Combine BM25 (MiniSearch) with vector similarity, fused via Reciprocal Rank
-Fusion. Pure semantic missed exact-symbol queries; pure lexical missed
-paraphrases. Hybrid won every slice of the eval set.
+Fuse BM25 + vector search via RRF; hybrid won every eval slice.
 
-Applies to [[Projects/Helios Search.md]]. Superseded the BM25-only baseline.
+## References
+- [[Helios Search]]
+- [[Hybrid Retrieval]]
+- [[BM25]]
+- [[Vector Search]]
+- [[Reciprocal Rank Fusion]]

@@ -1,16 +1,19 @@
 ---
 title: "ADR: Rerank Top-50 Only"
-tags: ["decision", "search", "adr", "cost"]
+tags: ["decision", "adr"]
 status: "accepted"
-created: "2026-06-01"
-last_accessed: "2026-06-01"
-access_count: 8
+created: "2026-05-20"
+last_accessed: "2026-06-03"
+access_count: 11
 ---
 
 # ADR: Rerank Top-50 Only
 
-**Status:** Accepted · **Owner:** [[CRM/People/Katherine Johnson.md]]
+**Status:** Accepted · **Owner:** [[Katherine Johnson]]
 
-Cap LLM reranking at the top 50 fused candidates. Beyond 50, recall gains were
-inside the noise floor but latency and token cost grew linearly. Keeps
-[[Projects/Helios Search.md]] p95 under 400ms.
+Cap reranking at top-50 fused candidates to hold p95 under 400ms.
+
+## References
+- [[Helios Search]]
+- [[Eval Harness]]
+- [[Reranking]]

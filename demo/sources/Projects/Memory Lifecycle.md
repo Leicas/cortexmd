@@ -1,6 +1,6 @@
 ---
 title: "Memory Lifecycle"
-tags: ["project", "memory", "active"]
+tags: ["project", "active"]
 status: "active"
 created: "2026-04-12"
 last_accessed: "2026-06-03"
@@ -9,13 +9,15 @@ access_count: 18
 
 # Memory Lifecycle
 
-Heat/decay model that ages memories from hot → warm → cold and auto-archives
-the cold tail. Feeds ranking in [[Projects/Helios Search.md]].
+Heat/decay model aging memories hot → warm → cold.
 
-## Owner
-- [[CRM/People/Grace Hopper.md]]
-
-## Decisions
-- [[Decisions/Heat Decay Half-Life.md]]
-
-The nightly "dream" pass consolidates clusters and proposes links.
+## Owners & links
+- [[Grace Hopper]]
+- [[Barbara Liskov]]
+- [[Heat Decay]]
+- [[Memory Temperature]]
+- [[Auto-Archival]]
+- [[Dream Cycle]]
+- [[Heat Decay Half-Life]]
+- [[Helios Search]]
+- [[Lifecycle Review]]

@@ -8,4 +8,4 @@ access_count: 0
 
 # Scratch
 
-Unsorted: try cross-encoder reranker? compare to current top-50 cap.
+Idea: try a cross-encoder [[Reranking]] model? Compare to the top-50 cap.

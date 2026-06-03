@@ -1,19 +1,18 @@
 ---
-title: "Alan Turing"
+title: "Margaret Hamilton"
 tags: ["person"]
-role: "VP Engineering"
+role: "Engineering Manager"
 created: "2026-04-12"
 last_accessed: "2026-06-03"
 access_count: 9
 ---
 
-# Alan Turing
+# Margaret Hamilton
 
-VP Engineering. Sets roadmap across all projects.
+Engineering Manager. Reliability + on-call.
 
 ## Connections
-- [[Helios Search]]
 - [[Memory Lifecycle]]
 - [[Agent Mesh]]
 - [[Eng Staff]]
-- [[One Writer Brain Vault]]
+- [[Alan Turing]]

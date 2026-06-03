@@ -1,16 +1,21 @@
 ---
 title: "Grace Hopper"
-tags: ["person", "platform"]
+tags: ["person"]
 role: "Principal Engineer"
 created: "2026-04-12"
 last_accessed: "2026-06-03"
-access_count: 11
+access_count: 9
 ---
 
 # Grace Hopper
 
-Principal engineer on platform + infra. Owns the [[Projects/Memory Lifecycle.md]]
-decay/heat model and the deploy pipeline. Mentors [[CRM/People/Katherine Johnson.md]].
+Principal Engineer. Owns the memory lifecycle + deploy pipeline.
 
-- Focus: storage, lifecycle, reliability
-- Reports to [[CRM/People/Alan Turing.md]]
+## Connections
+- [[Memory Lifecycle]]
+- [[Heat Decay]]
+- [[Auto-Archival]]
+- [[Heat Decay Half-Life]]
+- [[Katherine Johnson]]
+- [[Alan Turing]]
+- [[Lifecycle Review]]

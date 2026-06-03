@@ -6,6 +6,27 @@
 
 ![cortexmd dashboard — Overview](./docs/screenshots/overview.png)
 
+## Why cortexmd
+
+**The agent's memory is a real vault you can open, read, and edit.** Everything
+cortexmd writes — memories, decisions, journal, agent diaries, knowledge-graph
+notes — is plain Markdown with `[[wikilinks]]` and YAML frontmatter. So the same
+brain your AI uses is a first-class [Obsidian](https://obsidian.md) vault: open
+it, browse it, fix a fact, follow a link. No opaque database, no lock-in — if you
+walked away tomorrow, you'd still have a tidy folder of notes.
+
+**You can *see* how everything connects.** Because the notes are wiki-linked,
+the relationships render as a graph — in Obsidian's graph view, and in
+cortexmd's own dashboard (the Graph tab, below). People ↔ projects ↔ decisions ↔
+concepts become a map you can actually navigate instead of a flat pile of files.
+
+**The agent gets smarter between sessions.** Every session writes back what it
+learned — decisions made, things observed, how the codebase fits together — and
+recalls it next time. Context compounds instead of resetting at each new chat,
+and a heat/decay lifecycle keeps what matters hot while the rest cools and
+archives itself. Run it in server mode and that one growing brain is shared
+across all your AI tools (Claude Code, Cursor, Codex), so they teach each other.
+
 ## Try it in 60 seconds (live dashboard)
 
 The richest way to see cortexmd is the **server (shared-memory) mode**: one HTTP

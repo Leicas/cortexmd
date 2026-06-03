@@ -54,9 +54,8 @@ async function main() {
     await btn.click();
     // Graph needs the force sim to settle; everything else just needs a paint.
     await page.waitForTimeout(tab === 'graph' ? 4000 : 1200);
-    // On the Graph tab: reheat for a wider spread, fit the whole graph to the
-    // canvas, then click a node to load its note (a plain canvas click loads the
-    // side panel without the highlight that would clutter labels).
+    // The Graph tab produces two shots: a clean full map, then a node-selected
+    // view (see below).
     if (tab === 'graph') {
       // Reheat for a wider spread, then fit the whole graph to the canvas. No
       // node is selected, so only well-connected hubs are labelled — a clean,
@@ -65,6 +64,19 @@ async function main() {
       await page.waitForTimeout(4000);
       await page.locator('#graphFit').click().catch(() => {});
       await page.waitForTimeout(1500);
+      await page.screenshot({ path: join(OUT_DIR, 'graph.png'), fullPage: true });
+      console.log(`✓ graph → ${join(OUT_DIR, 'graph.png')}`);
+
+      // Second shot: select a note. Its content loads in the side panel and its
+      // neighbourhood lights up while the rest of the graph dims — the
+      // click-a-node-to-read view. 'Agent Mesh' is the shared-memory subgraph.
+      const search = page.locator('#graphSearch');
+      await search.fill('Agent Mesh');
+      await search.press('Enter');
+      await page.waitForTimeout(1500);
+      await page.screenshot({ path: join(OUT_DIR, 'graph-selected.png'), fullPage: true });
+      console.log(`✓ graph-selected → ${join(OUT_DIR, 'graph-selected.png')}`);
+      continue; // graph.png already written above
     }
     // On the Agents tab, pick an agent so the diary feed renders instead of an
     // empty state.

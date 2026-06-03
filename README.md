@@ -28,6 +28,11 @@ own AI tools at the running server.
 | [![Intelligence](./docs/screenshots/intelligence.png)](./docs/screenshots/intelligence.png) | [![Code](./docs/screenshots/code.png)](./docs/screenshots/code.png) | [![Sessions](./docs/screenshots/sessions.png)](./docs/screenshots/sessions.png) |
 | [![Vault & Memory](./docs/screenshots/vault.png)](./docs/screenshots/vault.png) | [![Graph](./docs/screenshots/graph.png)](./docs/screenshots/graph.png) | [![Agents](./docs/screenshots/agents.png)](./docs/screenshots/agents.png) |
 
+Click any node in the graph to read the note and light up its neighbourhood —
+here, the shared-memory subgraph around `Agent Mesh`:
+
+[![Vault graph with a note selected](./docs/screenshots/graph-selected.png)](./docs/screenshots/graph-selected.png)
+
 ## Two deployment modes (co-equal)
 
 1. **local-stdio** — runs on your machine, talks MCP over stdio, reads your vault(s) directly from disk. No sync, no Docker, no auth, no network. This is the recommended default for individual use.

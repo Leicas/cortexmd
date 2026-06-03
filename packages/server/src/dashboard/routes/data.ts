@@ -7,6 +7,11 @@ import type { Router, Request, Response } from 'express';
 import { listAgents as listAgentDefs, listTeams, listSkills } from '../../lib/agents.js';
 import { readAgentDiary } from '../../lib/journal.js';
 import { getDreamHistory, getLlmStatus } from '../model/state.js';
+import { getGraphSnapshot } from '../../lib/graph.js';
+import { readNote } from '../../lib/vault.js';
+import { parseFrontmatter } from '../../lib/frontmatter.js';
+import { extractWikilinks } from '../../lib/markdown.js';
+import { sanitizePath } from '../../lib/sanitize.js';
 import { config } from '../../config.js';
 import { logger } from '../../lib/logger.js';
 
@@ -95,6 +100,39 @@ export function registerDataRoutes(router: Router): void {
     try {
       const skills = await listSkills();
       res.json({ skills, total: skills.length });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  // Full vault link graph (node + edge set) for the Graph canvas tab. One-shot
+  // fetch on tab open — NOT pushed over SSE (a full graph is too large to send
+  // every 2s). `limit` caps the rendered subgraph to the most-connected nodes.
+  router.get('/dashboard/api/graph', async (req: Request, res: Response) => {
+    try {
+      const raw = parseInt(String(req.query.limit ?? '800'), 10);
+      const limit = Number.isFinite(raw) ? Math.min(Math.max(raw, 50), 5000) : 800;
+      const snapshot = await getGraphSnapshot(limit);
+      res.json(snapshot);
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  // One note's content + parsed frontmatter + outgoing links — fetched when a
+  // graph node is clicked. Mirrors the notes_get shape; sanitizePath guards
+  // against traversal.
+  router.get('/dashboard/api/note', async (req: Request, res: Response) => {
+    try {
+      const notePath = sanitizePath(String(req.query.path ?? ''));
+      const { content, etag } = await readNote(notePath);
+      const { data: frontmatter } = parseFrontmatter(content);
+      const linksOut = extractWikilinks(content);
+      const title =
+        (typeof frontmatter.title === 'string' && frontmatter.title) ||
+        notePath.split('/').pop()?.replace(/\.md$/, '') ||
+        notePath;
+      res.json({ path: notePath, title, content, frontmatter, linksOut, etag });
     } catch (err) {
       res.status(500).json({ error: String(err) });
     }

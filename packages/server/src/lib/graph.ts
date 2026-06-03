@@ -401,6 +401,80 @@ export function getOutgoingLinkCounts(): Map<string, number> | null {
   return counts;
 }
 
+export interface GraphSnapshotNode {
+  id: string;
+  label: string;
+  group: string;
+  deg: number;
+  inDeg: number;
+  outDeg: number;
+}
+
+export interface GraphSnapshot {
+  nodes: GraphSnapshotNode[];
+  edges: Array<{ source: string; target: string }>;
+  totalNodes: number;
+  totalEdges: number;
+  truncated: boolean;
+}
+
+/**
+ * Serialize the cached link graph into a node+edge set for the dashboard graph
+ * canvas. Builds the cache on first call (reuses the startup-built cache after
+ * that). When the vault has more notes than `limit`, returns the `limit`
+ * most-connected nodes (by total degree) and only the edges among them, with
+ * `truncated=true` and honest totals — so the canvas stays fast without a
+ * Barnes-Hut optimization and nothing is silently dropped.
+ */
+export async function getGraphSnapshot(limit = 800): Promise<GraphSnapshot> {
+  if (!cachedGraph) await buildAndCacheGraph();
+  const graph = cachedGraph!;
+
+  const inDeg = new Map<string, number>();
+  const outDeg = new Map<string, number>();
+  for (const node of graph.keys()) {
+    inDeg.set(node, 0);
+    outDeg.set(node, 0);
+  }
+  let totalEdges = 0;
+  for (const [source, targets] of graph) {
+    outDeg.set(source, targets.size);
+    for (const t of targets) {
+      inDeg.set(t, (inDeg.get(t) ?? 0) + 1);
+      totalEdges++;
+    }
+  }
+
+  const allNodes = [...graph.keys()];
+  const totalNodes = allNodes.length;
+  const degOf = (n: string): number => (inDeg.get(n) ?? 0) + (outDeg.get(n) ?? 0);
+
+  const truncated = totalNodes > limit;
+  const selected = truncated
+    ? [...allNodes].sort((a, b) => degOf(b) - degOf(a)).slice(0, limit)
+    : allNodes;
+  const keep = new Set(selected);
+
+  const nodes: GraphSnapshotNode[] = selected.map((id) => ({
+    id,
+    label: id.replace(/\.md$/, '').split('/').pop() || id,
+    group: classifyPath(id),
+    deg: degOf(id),
+    inDeg: inDeg.get(id) ?? 0,
+    outDeg: outDeg.get(id) ?? 0,
+  }));
+
+  const edges: Array<{ source: string; target: string }> = [];
+  for (const [source, targets] of graph) {
+    if (!keep.has(source)) continue;
+    for (const t of targets) {
+      if (keep.has(t)) edges.push({ source, target: t });
+    }
+  }
+
+  return { nodes, edges, totalNodes, totalEdges, truncated };
+}
+
 /**
  * BFS traversal from a node up to a given depth, returning nodes and edges.
  */

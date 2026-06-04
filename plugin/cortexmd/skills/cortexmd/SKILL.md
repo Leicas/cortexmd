@@ -20,6 +20,25 @@ plus a persistent memory + knowledge graph. Prefer them.
 Read/Grep are the fallback — only when the symbol is missing from the index or you
 need literal bytes (comments, non-source content).
 
+## Freshness — the index is live; don't fall back to Read because it "might be stale"
+
+The code index is **kept live**, so out-of-date results are not a reason to abandon
+code-nav and read whole files:
+
+- The **PreToolUse hook** incrementally re-indexes changed files (mtime-filtered) on
+  each tool call, so edits you just made are picked up automatically.
+- If you still suspect the index is behind (e.g. files changed outside this session),
+  **re-index it — don't read the files**:
+  - run `cortexmd index <repo-path>` (or `cortexmd scan <dev-root>`), or
+  - call `code_index_repo(repo)` over MCP.
+  Both are **cheap, content-hash incremental** re-indexes — they only re-parse files
+  whose contents actually changed, then you re-query.
+- `code_check_staleness` reports which notes' `code_refs` have drifted; treat any drift
+  as "re-index and re-query", not "read the source by hand".
+
+Reaching for Read/Grep because the index *might* be stale defeats the point. Refresh it
+(it's live and cheap) and stay on code-nav.
+
 ## Memory & knowledge graph
 
 - `memory_wakeup(agentName, preset)` — boot context (`preset: tiny|standard|full`)

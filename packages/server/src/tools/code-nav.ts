@@ -575,7 +575,7 @@ export function registerCodeRepoDrop(server: McpServer): void {
 export function registerCodeIndexRepo(server: McpServer): void {
   server.tool(
     'code_index_repo',
-    'Index source files in a registered repo into the per-machine code symbol DB. Skips files whose content hash is unchanged unless force=true.',
+    'Refresh the code index for a registered repo (live re-index). Cheap and content-hash incremental — re-parses only files whose contents changed (pass force=true to re-parse all). Call this to bring the index up to date when results look stale instead of reading source files by hand.',
     {
       repo: z.string().describe('Repo slug (must be registered via code_repo_register)'),
       force: z.boolean().optional().default(false).describe('Re-parse all files even if unchanged'),
@@ -1902,12 +1902,22 @@ export function registerCodeCheckStaleness(server: McpServer): void {
         }
       }
 
+      // Drift is self-healing: the index is content-hash incremental and the
+      // CLI hook re-syncs on each tool call. Tell the agent to refresh and
+      // re-query rather than fall back to reading whole files by hand.
+      const remedy = drifted.length > 0
+        ? 'Drift detected — the index is live and cheap to refresh. Re-index with '
+          + '`cortexmd index <repo-path>` or code_index_repo(repo) (content-hash '
+          + 'incremental, re-parses only changed files), then re-query. Do NOT fall '
+          + 'back to reading the source files by hand.'
+        : undefined;
+
       return {
         _detail: `staleness scanned=${scanned} drifted=${drifted.length}${truncated ? ' (truncated)' : ''}`,
         content: [
           {
             type: 'text',
-            text: JSON.stringify({ scanned, drifted, truncated }),
+            text: JSON.stringify({ scanned, drifted, truncated, ...(remedy ? { remedy } : {}) }),
           },
         ],
       };

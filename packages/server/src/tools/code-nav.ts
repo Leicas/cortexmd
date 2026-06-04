@@ -1787,12 +1787,23 @@ export function registerCodeFileOutline(server: McpServer): void {
         parentId: r.parent_id,
       }));
 
+      const payload: { repo: string; path: string; symbols: typeof symbols; hint?: string } = {
+        repo: slug, path: filePath, symbols,
+      };
+      if (symbols.length === 0 && !config.noHints) {
+        payload.hint =
+          `No indexed symbols for "${filePath}" in ${slug}. The file may have changed ` +
+          'since the last index or not be indexed yet — refresh with `cortexmd index ' +
+          '<repo-path>` or code_index_repo(repo) (cheap, content-hash incremental) and ' +
+          'retry, rather than reading the file by hand.';
+      }
+
       return {
         _detail: `${slug}/${filePath} → ${symbols.length} symbols`,
         content: [
           {
             type: 'text',
-            text: JSON.stringify({ repo: slug, path: filePath, symbols }),
+            text: JSON.stringify(payload),
           },
         ],
       };

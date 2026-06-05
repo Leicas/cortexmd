@@ -14,9 +14,11 @@ interface SingletonEntry {
 
 /**
  * Normalize a tag value for comparison (strip leading #, lowercase, trim).
+ * Coerces to string first: YAML parses bare tags like `2026` as numbers, which
+ * have no `.replace`, so an un-coerced value would throw mid-scan.
  */
-function normalizeTag(tag: string): string {
-  return tag.replace(/^#+/, '').trim().toLowerCase();
+function normalizeTag(tag: unknown): string {
+  return String(tag).replace(/^#+/, '').trim().toLowerCase();
 }
 
 export function register(server: McpServer): void {

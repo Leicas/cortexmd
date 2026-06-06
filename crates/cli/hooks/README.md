@@ -16,12 +16,13 @@ on failure: a broken hook can never block the session.
 | File | Event | What it does |
 |---|---|---|
 | `code_nav_hint_hook.mjs` | SessionStart | In a git repo containing source files, nudges the agent toward the `code_*` MCP tools over Read/Grep; auto-indexes the repo in the background if it is not yet registered. |
+| `wakeup_directive_hook.mjs` | SessionStart | Emits a directive telling the agent its FIRST action is to call `memory_wakeup` with the machine-scoped diary agentName (`Claude Code (<host>)`). Diaries are per-machine, so each machine reads/writes its own `Ops/Agent Diaries/Claude Code (<host>)/` directory. |
 | `code_nav_pretool_hook.mjs` | PreToolUse (Read/Grep/Glob) | Per-call advisory: if the target is in an indexed repo, suggests the cheaper `code_*` equivalent. Awareness-only — never blocks, never prompts. |
 | `userprompt_hook.mjs` | UserPromptSubmit | Recalls memory relevant to the prompt and captures "remember that / never / always" trigger phrases. Strips `<private>…</private>` before anything is stored. |
 | `pretooluse_hook.mjs` | PreToolUse | Scoped memory injection before Read/Edit/Bash (have I touched this file / hit this failure before?). |
 | `posttooluse_hook.mjs` | PostToolUse (Bash) | Deterministic capture of high-signal commands (systemctl, crontab, chmod/chown, docker compose, git commit) as observations. |
-| `diary_stop_hook.mjs` | Stop | Every Nth stop attempt, blocks and asks the agent to append a short recap via `agent_diary_append(silent=true)`. |
-| `precompact_diary_hook.mjs` | PreCompact | Always blocks before compaction so the agent writes a diary snapshot the next session can wake up from. |
+| `diary_stop_hook.mjs` | Stop | Every Nth stop attempt, blocks and asks the agent to append a short recap via `agent_diary_append(silent=true)` under the machine-scoped agentName (`Claude Code (<host>)`). |
+| `precompact_diary_hook.mjs` | PreCompact | Always blocks before compaction so the agent writes a diary snapshot (machine-scoped agentName) the next session can wake up from. |
 | `stop-hook.sh` | Stop | Bash alternative to the diary stop hook: counts transcript turns and asks for a `memory_store` save every Nth turn. Needs `python3`/`python` on PATH. |
 | `precompact-hook.sh` | PreCompact | Bash alternative to the diary precompact hook. |
 | `_mcp_rest.mjs` | — | Shared helper (spawns `cortexmd`, caches the repo list, formats memory blocks). Not a hook itself. |
@@ -30,6 +31,13 @@ The Node hooks use only Node built-ins, so they work on Windows without Git
 Bash. The two `.sh` hooks need a POSIX shell + `python3`/`python` and are an
 opt-in alternative to the Node diary hooks (do not enable both for the same
 event).
+
+Diaries are **per-machine**: the diary hooks derive the agentName from the host
+(`Claude Code (<hostname>)`), so each machine reads/writes its own directory
+under `Ops/Agent Diaries/Claude Code (<host>)/`. `wakeup_directive_hook.mjs`
+bakes the same machine-scoped name into its SessionStart directive so the agent
+calls `memory_wakeup` with the matching agentName and recovers that machine's
+own recap.
 
 ## Configuration
 
@@ -42,6 +50,7 @@ event).
 | `CORTEXMD_MEMORY_DISABLE` | — | Suppress memory-injection blocks. |
 | `CORTEXMD_CODE_NAV_HINT_DISABLE` | — | Disable just the code-nav hooks. |
 | `CORTEXMD_CODE_NAV_AUTOINDEX_DISABLE` | — | Disable the SessionStart background auto-index. |
+| `CORTEXMD_WAKEUP_DISABLE` | — | Disable just the `wakeup_directive_hook.mjs` SessionStart directive. |
 | `DIARY_STOP_EVERY` | `5` | `diary_stop_hook.mjs` fires every Nth Stop attempt. |
 | `SAVE_HOOK_EVERY` | `15` | `stop-hook.sh` fires every Nth human turn. |
 

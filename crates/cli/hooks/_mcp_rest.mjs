@@ -32,7 +32,7 @@
 import { spawnSync, spawn } from 'node:child_process';
 import { mkdirSync, appendFileSync, statSync, renameSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { homedir } from 'node:os';
+import { homedir, hostname } from 'node:os';
 import { createHash } from 'node:crypto';
 
 const TIMEOUT_MS = Number.parseInt(process.env.CORTEXMD_HOOK_TIMEOUT_MS ?? '4000', 10) || 4000;
@@ -46,6 +46,22 @@ function envFlag(name) {
 export const HOOK_DISABLED = envFlag('CORTEXMD_HOOKS_DISABLE');
 export const HOOK_MINIMAL = envFlag('CORTEXMD_HOOK_MINIMAL');
 export const MEMORY_DISABLED = envFlag('CORTEXMD_MEMORY_DISABLE');
+
+// Machine-scoped diary agent name: `Claude Code (<hostname>)`, so each machine
+// gets its own directory under `Ops/Agent Diaries/`. The host segment is
+// sanitized the same way the server sanitizes a diary agentName (strip path
+// separators and `..`). Falls back to plain `Claude Code` if the hostname is
+// empty or os.hostname() throws.
+export function diaryAgentName() {
+  try {
+    const host = (hostname() ?? '')
+      .replace(/[/\\]/g, '')
+      .replace(/\.\./g, '')
+      .trim();
+    if (host) return `Claude Code (${host})`;
+  } catch { /* fall through to default */ }
+  return 'Claude Code';
+}
 
 const STATE_DIR = process.env.XDG_STATE_HOME ?? join(homedir(), '.local', 'state');
 export const ERROR_LOG = join(STATE_DIR, 'cortexmd', 'hook-errors.log');

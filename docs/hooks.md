@@ -5,6 +5,11 @@ cortexmd ships a small set of agent-session hooks that turn the MCP tools into
 commands are captured after they run, a code-nav directive is injected when you
 open a code repo, and the agent writes a diary entry before it stops or compacts.
 
+Diaries are **per-machine**: the SessionStart wakeup directive and the diary
+write hooks derive the agentName from the host (`Claude Code (<hostname>)`), so
+each machine reads/writes its own directory under
+`Ops/Agent Diaries/Claude Code (<host>)/`.
+
 Hooks are **convenience automation, not a requirement**. The MCP tools
 (`memory_recall`, `memory_store`, `agent_diary_append`, `code_symbol_search`, …)
 work in any MCP client with no hooks at all. Hooks just make the agent reach for
@@ -23,10 +28,11 @@ sections below give best-effort wiring and call out where it is version-dependen
 |---|---|---|
 | Memory recall | UserPromptSubmit | Tokenizes the prompt, recalls the top matching memories/notes, and injects them as context. Also captures "remember that / never / always" trigger phrases as preferences. Strips `<private>…</private>` before anything is stored. |
 | Code-nav hint | SessionStart | If the cwd is a git repo with source files, injects a directive to prefer the `code_*` MCP tools over Read/Grep, and background-indexes the repo if it is not registered yet. |
+| Wakeup directive | SessionStart | Injects a directive telling the agent its FIRST action is to call `memory_wakeup` with the machine-scoped diary agentName (`Claude Code (<host>)`). Diaries are per-machine, so each machine reads/writes its own `Ops/Agent Diaries/Claude Code (<host>)/`. |
 | Code-nav advisory | PreToolUse (Read/Grep/Glob) | If the target file/pattern is inside an indexed repo, injects a one-shot suggestion to use the cheaper `code_*` equivalent. Awareness-only: never blocks, never prompts. |
 | High-signal capture | PostToolUse (Bash) | Deterministic regex over the command. Captures `systemctl`, `crontab`, `chmod`/`chown`, `docker compose`, and `git commit -m` as observations, anchored to the repo. |
-| Diary auto-write (Stop) | Stop | Every Nth stop attempt, blocks once and asks the agent to append a short session recap via `agent_diary_append(silent=true)`. |
-| Diary auto-write (PreCompact) | PreCompact | Always blocks before compaction so the agent snapshots the conversation into the diary — `memory_wakeup` reads it to bootstrap the next session. |
+| Diary auto-write (Stop) | Stop | Every Nth stop attempt, blocks once and asks the agent to append a short session recap via `agent_diary_append(silent=true)` under the machine-scoped agentName (`Claude Code (<host>)`). |
+| Diary auto-write (PreCompact) | PreCompact | Always blocks before compaction so the agent snapshots the conversation into the diary (machine-scoped agentName) — `memory_wakeup` reads it to bootstrap the next session. |
 | HUD status line | SessionStart | Ensures the HUD-line daemon is alive so the in-session statusline shows server-side savings/latency. (`cortexmd hud-line`.) |
 | Bash code-nav rewrite | PreToolUse (Bash) | Rewrites `grep`/`cat`/`head`/`tail` on indexed repos to the code-nav CLI equivalent. (`cortexmd rewrite`.) |
 
@@ -56,6 +62,7 @@ URL is `http://localhost:3000`.
 | `CORTEXMD_HOOK_TIMEOUT_MS` | `4000` | Per-call subprocess timeout. |
 | `CORTEXMD_CODE_NAV_HINT_DISABLE` | — | Disable just the code-nav hooks. |
 | `CORTEXMD_CODE_NAV_AUTOINDEX_DISABLE` | — | Keep the hint but skip background auto-indexing. |
+| `CORTEXMD_WAKEUP_DISABLE` | — | Disable just the SessionStart wakeup directive (`wakeup_directive_hook.mjs`). |
 | `DIARY_STOP_EVERY` | `5` | Diary Stop hook fires every Nth stop attempt. |
 | `SAVE_HOOK_EVERY` | `15` | Bash `stop-hook.sh` fires every Nth human turn. |
 
@@ -85,6 +92,7 @@ What it does:
    |---|---|---|
    | `SessionStart` | — | `cortexmd hud-line --ensure-daemon` |
    | `SessionStart` | — | `node <…>/code_nav_hint_hook.mjs` |
+   | `SessionStart` | — | `node <…>/wakeup_directive_hook.mjs` |
    | `UserPromptSubmit` | — | `cortexmd recall --hook` |
    | `UserPromptSubmit` | — | `node <…>/userprompt_hook.mjs` |
    | `PreToolUse` | `Bash` | `cortexmd rewrite --hook` |

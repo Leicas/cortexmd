@@ -130,6 +130,7 @@ const HOOK_SCRIPTS: &[HookScript] = &[
     HookScript { name: "pretooluse_hook.mjs", contents: include_str!("../hooks/pretooluse_hook.mjs") },
     HookScript { name: "posttooluse_hook.mjs", contents: include_str!("../hooks/posttooluse_hook.mjs") },
     HookScript { name: "code_nav_hint_hook.mjs", contents: include_str!("../hooks/code_nav_hint_hook.mjs") },
+    HookScript { name: "wakeup_directive_hook.mjs", contents: include_str!("../hooks/wakeup_directive_hook.mjs") },
     HookScript { name: "code_nav_pretool_hook.mjs", contents: include_str!("../hooks/code_nav_pretool_hook.mjs") },
     HookScript { name: "diary_stop_hook.mjs", contents: include_str!("../hooks/diary_stop_hook.mjs") },
     HookScript { name: "precompact_diary_hook.mjs", contents: include_str!("../hooks/precompact_diary_hook.mjs") },
@@ -171,6 +172,13 @@ const SCRIPT_HOOKS: &[ScriptHookSpec] = &[
         script: "code_nav_hint_hook.mjs",
         timeout: 6,
         status_message: Some("cortexmd code-nav hint..."),
+    },
+    ScriptHookSpec {
+        event: "SessionStart",
+        matcher: None,
+        script: "wakeup_directive_hook.mjs",
+        timeout: 6,
+        status_message: None,
     },
     ScriptHookSpec {
         event: "PreToolUse",

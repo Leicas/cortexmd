@@ -107,6 +107,53 @@ oauthRouter.get('/.well-known/oauth-authorization-server', (_req: Request, res: 
 
 // ── Dynamic Client Registration (RFC 7591) ──────────────────────────────────
 
+export interface CreateOAuthClientInput {
+  redirect_uris: string[];
+  client_name?: string;
+  grant_types?: string[];
+  response_types?: string[];
+  token_endpoint_auth_method?: string;
+}
+
+/**
+ * Register a new OAuth client and persist it. Shared by the public RFC 7591
+ * `/register` endpoint and the authenticated dashboard helper. Throws if the
+ * client store can't be persisted (e.g. unwritable DATA_DIR) — callers map that
+ * to their own error shape. The new client (including its secret) is returned.
+ */
+export function createOAuthClient(input: CreateOAuthClientInput): OAuthClient {
+  const client: OAuthClient = {
+    client_id: crypto.randomUUID(),
+    client_secret: crypto.randomBytes(32).toString('hex'),
+    redirect_uris: input.redirect_uris,
+    client_name: input.client_name || 'MCP Client',
+    // Default to advertising refresh_token too — clients like n8n rely on the
+    // refresh_token grant to avoid re-running the browser flow every 30 days.
+    grant_types: input.grant_types || ['authorization_code', 'refresh_token'],
+    response_types: input.response_types || ['code'],
+    token_endpoint_auth_method: input.token_endpoint_auth_method || 'client_secret_post',
+    registeredAt: Date.now(),
+  };
+  clients.set(client.client_id, client);
+  try {
+    saveClients(config.dataDir, clients);
+  } catch (err) {
+    // Roll back the in-memory add so a failed persist doesn't leave a client
+    // that vanishes on next restart. Caller logs + surfaces the error.
+    clients.delete(client.client_id);
+    throw err;
+  }
+  logger.info('OAuth client registered', { clientId: client.client_id, clientName: client.client_name });
+  return client;
+}
+
+/** Delete a registered OAuth client. Returns true if it existed. */
+export function deleteOAuthClient(clientId: string): boolean {
+  const existed = clients.delete(clientId);
+  if (existed) saveClients(config.dataDir, clients);
+  return existed;
+}
+
 oauthRouter.post('/register', (req: Request, res: Response) => {
   // Rate limit: 10 registrations per hour per IP
   const forwarded = req.headers['x-forwarded-for'];
@@ -124,28 +171,13 @@ oauthRouter.post('/register', (req: Request, res: Response) => {
     return;
   }
 
-  const clientId = crypto.randomUUID();
-  const clientSecret = crypto.randomBytes(32).toString('hex');
-
-  const client: OAuthClient = {
-    client_id: clientId,
-    client_secret: clientSecret,
-    redirect_uris,
-    client_name: client_name || 'MCP Client',
-    grant_types: grant_types || ['authorization_code'],
-    response_types: response_types || ['code'],
-    token_endpoint_auth_method: token_endpoint_auth_method || 'client_secret_post',
-    registeredAt: Date.now(),
-  };
-
-  clients.set(clientId, client);
+  let client: OAuthClient;
   try {
-    saveClients(config.dataDir, clients);
+    client = createOAuthClient({ redirect_uris, client_name, grant_types, response_types, token_endpoint_auth_method });
   } catch (err) {
     // Most commonly an unwritable DATA_DIR (volume not mounted, or owned by a
     // different uid than the container's `node` user). Surface the real cause
     // in the logs and return a spec-compliant error rather than a bare 500.
-    clients.delete(clientId);
     logger.error('OAuth client registration failed to persist', {
       error: err instanceof Error ? err.message : String(err),
       dataDir: config.dataDir,
@@ -156,13 +188,12 @@ oauthRouter.post('/register', (req: Request, res: Response) => {
     });
     return;
   }
-  logger.info('OAuth client registered', { clientId, clientName: client.client_name });
 
   res.status(201).json({
-    client_id: clientId,
-    client_secret: clientSecret,
-    client_id_issued_at: Math.floor(Date.now() / 1000),
-    redirect_uris,
+    client_id: client.client_id,
+    client_secret: client.client_secret,
+    client_id_issued_at: Math.floor(client.registeredAt / 1000),
+    redirect_uris: client.redirect_uris,
     client_name: client.client_name,
     grant_types: client.grant_types,
     response_types: client.response_types,

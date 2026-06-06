@@ -14,8 +14,26 @@ import { extractWikilinks } from '../../lib/markdown.js';
 import { sanitizePath } from '../../lib/sanitize.js';
 import { config } from '../../config.js';
 import { logger } from '../../lib/logger.js';
+import { getOAuthClients } from '../../oauth.js';
 
 export function registerDataRoutes(router: Router): void {
+  // Registered OAuth clients (secrets stripped) + the endpoint values an OAuth2
+  // client (n8n's "Generic OAuth2 API" credential) needs. Auth-gated like every
+  // /dashboard/* route. Secrets are NEVER returned here — only once, at create.
+  router.get('/dashboard/api/oauth/clients', (_req: Request, res: Response) => {
+    const base = config.publicUrl.replace(/\/+$/, '');
+    res.json({
+      clients: getOAuthClients(),
+      endpoints: {
+        issuer: base,
+        authorizationUrl: `${base}/authorize`,
+        tokenUrl: `${base}/token`,
+        registrationUrl: `${base}/register`,
+        scope: 'mcp:tools',
+      },
+    });
+  });
+
   router.get('/dashboard/api/dream/history', (_req: Request, res: Response) => {
     res.json({
       history: getDreamHistory().map(r => ({

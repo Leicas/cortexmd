@@ -15,8 +15,50 @@ import { runBenchmark, saveAsGroundTruth } from '../../lib/benchmark.js';
 import { runMigration } from '../../lib/migration.js';
 import { isDreamRunning, setDreamRunning, dismissSuggestion } from '../model/state.js';
 import { runDashboardDream } from '../model/dream.js';
+import { createOAuthClient, deleteOAuthClient } from '../../oauth.js';
 
 export function registerActionRoutes(router: Router): void {
+  // Create an OAuth client from the dashboard (auth-gated). Unlike the public
+  // /register endpoint there is no per-IP rate limit — the operator is already
+  // authenticated. Returns the client_secret ONCE; it is never retrievable again.
+  router.post('/dashboard/api/oauth/clients/create', (req: Request, res: Response) => {
+    const body = (req.body ?? {}) as { client_name?: string; redirect_uris?: string[] };
+    const uris = Array.isArray(body.redirect_uris)
+      ? body.redirect_uris.map((u) => String(u).trim()).filter(Boolean)
+      : [];
+    if (uris.length === 0) {
+      res.status(400).json({ error: 'At least one redirect URI is required (paste the OAuth Redirect URL n8n shows you).' });
+      return;
+    }
+    try {
+      const client = createOAuthClient({
+        client_name: (body.client_name || 'n8n').slice(0, 100),
+        redirect_uris: uris,
+        grant_types: ['authorization_code', 'refresh_token'],
+        token_endpoint_auth_method: 'client_secret_post',
+      });
+      res.json({
+        ok: true,
+        client_id: client.client_id,
+        client_secret: client.client_secret,
+        client_name: client.client_name,
+        redirect_uris: client.redirect_uris,
+      });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  router.post('/dashboard/api/oauth/clients/delete', (req: Request, res: Response) => {
+    const { client_id } = (req.body ?? {}) as { client_id?: string };
+    if (!client_id) {
+      res.status(400).json({ error: 'client_id is required' });
+      return;
+    }
+    const existed = deleteOAuthClient(client_id);
+    res.json({ ok: true, existed });
+  });
+
   router.post('/dashboard/api/rate-limit/reset', (req: Request, res: Response) => {
     const { key } = req.body as { key?: string };
     if (!key) {

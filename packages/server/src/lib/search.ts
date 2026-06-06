@@ -51,6 +51,10 @@ interface DocMeta {
   last_accessed?: string;
   archived?: boolean;
   collection: string;
+  // Carried so memory_recall can score/filter without re-reading the file:
+  related?: string[];
+  validity_alpha?: number;
+  validity_beta?: number;
 }
 
 export interface IndexHealthEntry {
@@ -229,6 +233,9 @@ export async function rebuildIndex(): Promise<void> {
           last_accessed: typeof data.last_accessed === 'string' ? data.last_accessed : undefined,
           archived: typeof data.archived === 'boolean' ? data.archived : undefined,
           collection: classifyPath(relPath),
+          related: Array.isArray(data.related) ? data.related as string[] : undefined,
+          validity_alpha: typeof data.validity_alpha === 'number' ? data.validity_alpha : undefined,
+          validity_beta: typeof data.validity_beta === 'number' ? data.validity_beta : undefined,
         });
 
         miniSearch.add({
@@ -384,6 +391,9 @@ export async function indexNote(filePath: string): Promise<void> {
     last_accessed: typeof data.last_accessed === 'string' ? data.last_accessed : undefined,
     archived: typeof data.archived === 'boolean' ? data.archived : undefined,
     collection: classifyPath(filePath),
+    related: Array.isArray(data.related) ? data.related as string[] : undefined,
+    validity_alpha: typeof data.validity_alpha === 'number' ? data.validity_alpha : undefined,
+    validity_beta: typeof data.validity_beta === 'number' ? data.validity_beta : undefined,
   });
 
   // Add to MiniSearch

@@ -177,6 +177,32 @@ export async function readAgentDiary(
 }
 
 /**
+ * Cheap variant of {@link listAgents}: returns only agent names by grouping
+ * diary filenames, with NO per-file content reads. Used by the wakeup hot
+ * path, which only needs names for awareness — reading every diary of every
+ * agent just to count entries (as listAgents does) is wasted work there.
+ */
+export async function listAgentNames(): Promise<string[]> {
+  const baseDir = 'Ops/Agent Diaries';
+
+  let files: string[];
+  try {
+    files = await listFiles(baseDir, '*/*.md');
+  } catch {
+    return [];
+  }
+
+  const names = new Set<string>();
+  for (const file of files) {
+    const relative = file.replace(/^Ops\/Agent Diaries\//, '');
+    const slash = relative.indexOf('/');
+    if (slash === -1) continue;
+    names.add(relative.slice(0, slash));
+  }
+  return [...names];
+}
+
+/**
  * List all agents that have diary files, with metadata.
  */
 export async function listAgents(): Promise<

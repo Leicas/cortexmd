@@ -112,6 +112,19 @@ export async function initEmbeddings(): Promise<void> {
     });
     logger.info('Embedding model loaded');
 
+    // Warm the inference path now (at boot) rather than on the first user
+    // recall. The initial forward pass JIT-compiles/allocates and can take
+    // seconds — a prime suspect for slow first-recall latency. Best-effort.
+    try {
+      const warmStart = Date.now();
+      await embedText('warmup');
+      logger.info('Embedding model warmed', { ms: Date.now() - warmStart });
+    } catch (warmErr) {
+      logger.debug('Embedding warmup failed (non-fatal)', {
+        error: warmErr instanceof Error ? warmErr.message : String(warmErr),
+      });
+    }
+
     // Ensure data directory exists
     mkdirSync(config.embeddingsDataDir, { recursive: true });
 
@@ -232,11 +245,32 @@ export async function buildFullIndex(
   logger.info('Full embedding index built', { processed, errors, total: docs.size });
 }
 
-export async function embedText(text: string): Promise<number[]> {
+// Small LRU cache for QUERY embeddings (opt-in via opts.cache). Recall/wakeup
+// re-embed the same or similar short queries repeatedly; a cache hit removes a
+// full local transformer forward pass (~100-600ms) from the hot path. Document
+// embedding (buildFullIndex) stays uncached — every doc is unique, so caching
+// there would only thrash. Bounded so memory stays flat.
+const QUERY_EMBED_CACHE_MAX = 256;
+const queryEmbedCache = new Map<string, number[]>();
+
+export async function embedText(
+  text: string,
+  opts?: { cache?: boolean },
+): Promise<number[]> {
   if (!embeddingPipeline) throw new Error('Embedding pipeline not initialized');
 
   // Truncate to ~256 tokens (~1024 chars)
   const truncated = text.slice(0, 1024);
+
+  if (opts?.cache) {
+    const hit = queryEmbedCache.get(truncated);
+    if (hit) {
+      // Refresh recency: re-insert moves the key to the end of the Map.
+      queryEmbedCache.delete(truncated);
+      queryEmbedCache.set(truncated, hit);
+      return hit;
+    }
+  }
 
   const start = Date.now();
   const output = await embeddingPipeline(truncated, {
@@ -249,7 +283,18 @@ export async function embedText(text: string): Promise<number[]> {
   totalEmbedCount++;
 
   // hnswlib-node requires a plain number[], not Float32Array
-  return Array.from(output.data as Float32Array);
+  const vec = Array.from(output.data as Float32Array);
+
+  if (opts?.cache) {
+    queryEmbedCache.set(truncated, vec);
+    if (queryEmbedCache.size > QUERY_EMBED_CACHE_MAX) {
+      // Evict least-recently-used (oldest insertion order).
+      const oldest = queryEmbedCache.keys().next().value;
+      if (oldest !== undefined) queryEmbedCache.delete(oldest);
+    }
+  }
+
+  return vec;
 }
 
 export async function embedAndIndex(docPath: string, text: string): Promise<void> {
@@ -299,7 +344,7 @@ export async function searchSemantic(
 ): Promise<Array<{ path: string; score: number }>> {
   if (!ready || !index || pathToId.size === 0) return [];
 
-  const queryEmbedding = await embedText(query);
+  const queryEmbedding = await embedText(query, { cache: true });
 
   const numNeighbors = Math.min(limit, pathToId.size);
   const result = index.searchKnn(queryEmbedding, numNeighbors);

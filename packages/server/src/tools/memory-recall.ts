@@ -1,6 +1,6 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
-import { hybridSearch } from '../lib/search.js';
+import { hybridSearch, getDocMeta } from '../lib/search.js';
 import { readNote, writeNote } from '../lib/vault.js';
 import { parseFrontmatter, stringifyFrontmatter } from '../lib/frontmatter.js';
 import { wrapToolHandler } from '../lib/tool-wrapper.js';
@@ -52,6 +52,66 @@ const IMPORTANCE_BOOST: Record<string, number> = {
 };
 
 const IMPORTANCE_ORDER = ['low', 'medium', 'high', 'critical'];
+
+// ── MMR diversity (avoid near-duplicate recalls) ──────────────────────────
+// Cheap lexical similarity on title+snippet tokens — no embedding round-trip.
+// The vault accumulates near-identical memories (e.g. repeated "X failed
+// pipeline" / "down payment overdue" observations); MMR keeps the most
+// relevant of each cluster instead of spending the result budget on dupes.
+function tokenSet(text: string): Set<string> {
+  const out = new Set<string>();
+  for (const tok of text.toLowerCase().split(/[^a-z0-9]+/)) {
+    if (tok.length >= 3) out.add(tok);
+  }
+  return out;
+}
+
+function jaccard(a: Set<string>, b: Set<string>): number {
+  if (a.size === 0 || b.size === 0) return 0;
+  let inter = 0;
+  for (const t of a) if (b.has(t)) inter++;
+  return inter / (a.size + b.size - inter);
+}
+
+/**
+ * Maximal Marginal Relevance selection. `items` must be pre-sorted by score
+ * descending. Picks `limit` results balancing relevance (λ) against novelty
+ * vs. already-selected items (1−λ). λ=0.7 keeps relevance dominant.
+ */
+function mmrSelect<T extends { title: string; snippet: string; score: number }>(
+  items: T[],
+  limit: number,
+  lambda = 0.7,
+): T[] {
+  if (items.length <= limit) return items;
+  const maxScore = items[0].score || 1;
+  const toks = new Map<T, Set<string>>();
+  const tokensFor = (r: T): Set<string> => {
+    let t = toks.get(r);
+    if (!t) { t = tokenSet(`${r.title} ${r.snippet}`); toks.set(r, t); }
+    return t;
+  };
+
+  const selected: T[] = [];
+  const remaining = [...items];
+  while (selected.length < limit && remaining.length > 0) {
+    let bestIdx = 0;
+    let bestVal = -Infinity;
+    for (let i = 0; i < remaining.length; i++) {
+      const cand = remaining[i];
+      let maxSim = 0;
+      for (const s of selected) {
+        const sim = jaccard(tokensFor(cand), tokensFor(s));
+        if (sim > maxSim) maxSim = sim;
+      }
+      const relNorm = cand.score / maxScore;
+      const mmr = lambda * relNorm - (1 - lambda) * maxSim;
+      if (mmr > bestVal) { bestVal = mmr; bestIdx = i; }
+    }
+    selected.push(remaining.splice(bestIdx, 1)[0]);
+  }
+  return selected;
+}
 
 export function register(server: McpServer): void {
   server.tool(
@@ -171,111 +231,131 @@ export function register(server: McpServer): void {
 
       const scored: ScoredResult[] = [];
 
+      // Score/filter entirely from the in-memory docMeta index. The fields
+      // recall needs (type, category, temperature, heat_score, importance,
+      // last_accessed, related, validity counters, body) are all cached at
+      // index time — so the common path does ZERO disk reads. Full content is
+      // fetched from disk only for the final survivors when includeContent.
+      const docMeta = getDocMeta();
+
       for (const result of searchResults) {
-        try {
-          const { content } = await readNote(result.path);
-          const { data, body } = parseFrontmatter(content);
+        const meta = docMeta.get(result.path);
+        if (!meta) continue;
 
-          // Filter: must be a memory type
-          if (data.type !== 'memory') continue;
+        // Filter: must be a memory type
+        if (meta.type !== 'memory') continue;
 
-          const noteCategory = data.category as string || 'observation';
-          const noteTemperature = data.temperature as string || 'warm';
-          const noteImportance = data.importance as string || 'medium';
+        const noteCategory = meta.category || 'observation';
+        const noteTemperature = meta.temperature || 'warm';
+        const noteImportance = meta.importance || 'medium';
 
-          // Filter by categories
-          if (categories && categories.length > 0 && !categories.includes(noteCategory)) {
-            continue;
-          }
-
-          // Filter by temperature
-          if (temperature !== 'any' && noteTemperature !== temperature) {
-            continue;
-          }
-
-          // Filter by minImportance
-          if (minImportanceIdx >= 0) {
-            const noteImportanceIdx = IMPORTANCE_ORDER.indexOf(noteImportance);
-            if (noteImportanceIdx < minImportanceIdx) continue;
-          }
-
-          // Bayesian validity: filter quarantined, penalize stale.
-          let validityPenalty = 1.0;
-          if (config.memoryValidity) {
-            const v = computeValidity(data);
-            if (v.quarantined) continue;
-            if (v.stale) validityPenalty = VALIDITY_STALE_RANK_PENALTY;
-          }
-
-          // Compute final score
-          const tempBoost = TEMPERATURE_BOOST[noteTemperature] ?? 1.0;
-          const impBoost = IMPORTANCE_BOOST[noteImportance] ?? 1.0;
-
-          // Temporal decay: smooth recency boost based on category half-life
-          let recencyBoost = 1.0;
-          const lastAccessedStr = data.last_accessed as string | undefined;
-          if (lastAccessedStr) {
-            const lastAccessedTime = new Date(lastAccessedStr).getTime();
-            if (!isNaN(lastAccessedTime)) {
-              const daysSinceLastAccess = (Date.now() - lastAccessedTime) / (1000 * 60 * 60 * 24);
-              const halfLifeDays = CATEGORY_HALF_LIFE_DAYS[noteCategory] ?? DEFAULT_HALF_LIFE_DAYS;
-              recencyBoost = 1 / (1 + daysSinceLastAccess / halfLifeDays);
-            }
-          }
-
-          let relBoost = 1.0;
-          if (relatedSet) {
-            const noteRelated = Array.isArray(data.related) ? data.related as string[] : [];
-            // Check if any related wikilink references a path in relatedTo
-            const hasRelation = noteRelated.some((r: string) => {
-              // related stored as "[[path]]", strip brackets
-              const stripped = r.replace(/^\[\[/, '').replace(/\]\]$/, '');
-              return relatedSet.has(stripped);
-            });
-            if (hasRelation) relBoost = 2.0;
-          }
-
-          // Context boost: reward notes containing keywords from contextSnippet
-          let contextBoost = 1.0;
-          if (contextKeywords.length > 0) {
-            const bodyLower = body.toLowerCase();
-            let matchCount = 0;
-            for (const kw of contextKeywords) {
-              if (bodyLower.includes(kw)) matchCount++;
-            }
-            if (matchCount > 0) {
-              contextBoost = Math.min(1.0 + 0.1 * matchCount, 1.5);
-            }
-          }
-
-          const finalScore = result.score * tempBoost * impBoost * relBoost * recencyBoost * contextBoost * validityPenalty;
-
-          const entry: ScoredResult = {
-            path: result.path,
-            title: data.title as string || result.title,
-            category: noteCategory,
-            temperature: noteTemperature,
-            importance: noteImportance,
-            score: finalScore,
-            lexicalScore: result.lexicalScore,
-            semanticScore: result.semanticScore,
-            fusedScore: result.fusedScore,
-            snippet: body.slice(0, 200),
-          };
-
-          if (includeContent) {
-            entry.content = content;
-          }
-
-          scored.push(entry);
-        } catch {
-          // skip unreadable notes
+        // Filter by categories
+        if (categories && categories.length > 0 && !categories.includes(noteCategory)) {
+          continue;
         }
+
+        // Filter by temperature
+        if (temperature !== 'any' && noteTemperature !== temperature) {
+          continue;
+        }
+
+        // Filter by minImportance
+        if (minImportanceIdx >= 0) {
+          const noteImportanceIdx = IMPORTANCE_ORDER.indexOf(noteImportance);
+          if (noteImportanceIdx < minImportanceIdx) continue;
+        }
+
+        // Bayesian validity: filter quarantined, penalize stale.
+        let validityPenalty = 1.0;
+        if (config.memoryValidity) {
+          const v = computeValidity({
+            validity_alpha: meta.validity_alpha,
+            validity_beta: meta.validity_beta,
+          });
+          if (v.quarantined) continue;
+          if (v.stale) validityPenalty = VALIDITY_STALE_RANK_PENALTY;
+        }
+
+        // Heat boost: use the granular numeric heat_score (0-16) when present,
+        // mapped onto the same 0.5..1.5 band the coarse temperature bucket used
+        // (0 → 0.5, 16 → 1.5); fall back to the bucket label when absent.
+        const heatScore = typeof meta.heat_score === 'number' ? meta.heat_score : undefined;
+        const tempBoost = heatScore !== undefined
+          ? 0.5 + Math.min(Math.max(heatScore, 0), 16) / 16
+          : (TEMPERATURE_BOOST[noteTemperature] ?? 1.0);
+        const impBoost = IMPORTANCE_BOOST[noteImportance] ?? 1.0;
+
+        // Temporal decay: smooth recency boost based on category half-life
+        let recencyBoost = 1.0;
+        const lastAccessedStr = meta.last_accessed;
+        if (lastAccessedStr) {
+          const lastAccessedTime = new Date(lastAccessedStr).getTime();
+          if (!isNaN(lastAccessedTime)) {
+            const daysSinceLastAccess = (Date.now() - lastAccessedTime) / (1000 * 60 * 60 * 24);
+            const halfLifeDays = CATEGORY_HALF_LIFE_DAYS[noteCategory] ?? DEFAULT_HALF_LIFE_DAYS;
+            recencyBoost = 1 / (1 + daysSinceLastAccess / halfLifeDays);
+          }
+        }
+
+        let relBoost = 1.0;
+        if (relatedSet) {
+          const noteRelated = Array.isArray(meta.related) ? meta.related : [];
+          // Check if any related wikilink references a path in relatedTo
+          const hasRelation = noteRelated.some((r: string) => {
+            // related stored as "[[path]]", strip brackets
+            const stripped = r.replace(/^\[\[/, '').replace(/\]\]$/, '');
+            return relatedSet.has(stripped);
+          });
+          if (hasRelation) relBoost = 2.0;
+        }
+
+        // Context boost: reward notes containing keywords from contextSnippet
+        const body = meta.content ?? '';
+        let contextBoost = 1.0;
+        if (contextKeywords.length > 0) {
+          const bodyLower = body.toLowerCase();
+          let matchCount = 0;
+          for (const kw of contextKeywords) {
+            if (bodyLower.includes(kw)) matchCount++;
+          }
+          if (matchCount > 0) {
+            contextBoost = Math.min(1.0 + 0.1 * matchCount, 1.5);
+          }
+        }
+
+        const finalScore = result.score * tempBoost * impBoost * relBoost * recencyBoost * contextBoost * validityPenalty;
+
+        scored.push({
+          path: result.path,
+          title: meta.title || result.title,
+          category: noteCategory,
+          temperature: noteTemperature,
+          importance: noteImportance,
+          score: finalScore,
+          lexicalScore: result.lexicalScore,
+          semanticScore: result.semanticScore,
+          fusedScore: result.fusedScore,
+          snippet: body.slice(0, 200),
+        });
       }
 
-      // Sort by score descending, take top limit
+      // Sort by score descending, then MMR-select the top `limit` for diversity
       scored.sort((a, b) => b.score - a.score);
-      let results = scored.slice(0, limit);
+      let results = mmrSelect(scored, limit);
+
+      // Fetch full content from disk only for the final survivors, in parallel,
+      // and only when the caller asked for it (the expensive path).
+      if (includeContent && results.length > 0) {
+        await Promise.all(results.map(async (r) => {
+          try {
+            const { content } = await readNote(r.path);
+            r.content = content;
+          } catch {
+            // leave content undefined for unreadable notes
+          }
+        }));
+      }
+
       const searchDurationMs = Date.now() - searchStart;
       recordSearchQuery(query, results.length, searchDurationMs);
       recordSearchScoreBreakdown(query, results);

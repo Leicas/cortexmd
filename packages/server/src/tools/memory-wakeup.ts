@@ -4,7 +4,7 @@ import { wrapToolHandler } from '../lib/tool-wrapper.js';
 import { wakeUp, filteredRecall } from '../lib/memory-stack.js';
 import type { MemoryLayer } from '../lib/memory-stack.js';
 import { getCollectionNames } from '../lib/collections.js';
-import { readAgentDiary, listAgents } from '../lib/journal.js';
+import { readAgentDiary, listAgentNames } from '../lib/journal.js';
 
 export function register(server: McpServer): void {
   server.tool(
@@ -118,11 +118,12 @@ Use preset='tiny' for a minimal (~180 token) boot, 'standard' (~900, default), o
         }
       }
 
-      // List all known agents for awareness
+      // List all known agents for awareness. Names only — listAgentNames
+      // groups diary filenames without reading every file's contents (the old
+      // listAgents() read every diary of every agent just to count entries).
       let knownAgents: string[] = [];
       try {
-        const agents = await listAgents();
-        knownAgents = agents.map(a => a.name);
+        knownAgents = await listAgentNames();
       } catch {
         // optional
       }
@@ -143,12 +144,21 @@ Use preset='tiny' for a minimal (~180 token) boot, 'standard' (~900, default), o
       const summary = parts.join('\n\n---\n\n');
       const detailStr = `wakeup${collection ? ' col=' + collection : ''}${agentName ? ' agent=' + agentName : ''} -> ${layers.length} layers, ~${totalTokens} tokens`;
 
+      // Emit the markdown only. Previously the same payload was ALSO appended
+      // as a pretty-printed JSON blob, ~doubling the token cost of every
+      // wakeup for no agent-facing benefit. collections + knownAgents (the
+      // only fields not already in the markdown) are preserved as a compact
+      // one-line footer instead.
+      const footer = `_~${totalTokens} tokens · collections: ${collections.join(', ')}`
+        + (knownAgents.length ? ` · known agents: ${knownAgents.join(', ')}` : '')
+        + `_`;
+
       return {
         _detail: detailStr,
         content: [
           {
             type: 'text',
-            text: `${summary}\n\n---\n\n${JSON.stringify({ layers, totalTokens, collections, knownAgents }, null, 2)}`,
+            text: `${summary}\n\n---\n\n${footer}`,
           },
         ],
       };

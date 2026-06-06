@@ -13,6 +13,9 @@
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { diaryAgentName } from './_mcp_rest.mjs';
+
+const agent = diaryAgentName();
 
 const INTERVAL = Math.max(1, Number.parseInt(process.env.DIARY_STOP_EVERY ?? '5', 10) || 5);
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -70,7 +73,7 @@ try {
 if (counter % INTERVAL !== 0) passthrough();
 
 block(
-  'Before stopping: call mcp__cortexmd__agent_diary_append with agentName="Claude Code", ' +
+  `Before stopping: call mcp__cortexmd__agent_diary_append with agentName="${agent}", ` +
     'silent=true, source="hook:Stop", and a 2-3 sentence recap of this session ' +
     '(key decisions, open threads, file paths touched). Include [[wiki-links]] if relevant.',
 );

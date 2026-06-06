@@ -5,6 +5,10 @@
 // detect stop_hook_active so we don't recurse inside our own block. Uses
 // Node built-ins only.
 
+import { diaryAgentName } from './_mcp_rest.mjs';
+
+const agent = diaryAgentName();
+
 const passthrough = () => {
   process.stdout.write('{}\n');
   process.exit(0);
@@ -36,7 +40,7 @@ try {
 if (stopHookActive) passthrough();
 
 block(
-  'Before compacting: call mcp__cortexmd__agent_diary_append with agentName="Claude Code", ' +
+  `Before compacting: call mcp__cortexmd__agent_diary_append with agentName="${agent}", ` +
     'silent=true, source="hook:PreCompact", and a paragraph summarizing the key context, ' +
     'decisions, and open work from this conversation. This will be used by memory_wakeup ' +
     'to bootstrap the next session.',

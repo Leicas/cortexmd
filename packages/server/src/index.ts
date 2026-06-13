@@ -273,7 +273,7 @@ const allRegistrations = [
 function createServer(): McpServer {
   const server = new McpServer({
     name: 'cortexmd',
-    version: '1.0.0',
+    version: config.appVersion,
   });
 
   for (const register of allRegistrations) {
@@ -482,7 +482,8 @@ app.get('/health', (_req, res) => {
   const metrics = getMetrics();
   res.json({
     status: 'ok',
-    version: '1.0.0',
+    version: config.appVersion,
+    commit: config.gitSha,
     uptime: metrics.uptime,
     activeSessions: sessions.size,
     indexedNotes: getIndexedNoteCount(),

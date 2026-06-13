@@ -37,6 +37,14 @@ ENV NODE_ENV=production \
     API_PORT=3000 \
     DATA_DIR=/app/data
 
+# Release version + commit, injected at build time by CI (release.yml). Default
+# to "dev"/"unknown" for local builds. Surfaced via /health and the MCP server
+# identity so the deployed build is verifiable without shelling into the box.
+ARG APP_VERSION=dev
+ARG GIT_SHA=unknown
+ENV APP_VERSION=$APP_VERSION \
+    GIT_SHA=$GIT_SHA
+
 # Production deps need the toolchain to rebuild native addons, then it is
 # purged to keep the runtime image small. git stays for git-backed source
 # vaults (git+https:// transport); see docs/transports.md.

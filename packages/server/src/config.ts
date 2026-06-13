@@ -244,6 +244,12 @@ export const config = {
   // Persistent data directory (JWT secret, OAuth clients, etc.)
   dataDir: process.env.DATA_DIR ?? '/app/data',
 
+  // Build identity, injected by CI at image build time (see Dockerfile +
+  // release.yml). 'dev' locally. Surfaced via /health so the deployed release
+  // is verifiable without inspecting the container.
+  appVersion: process.env.APP_VERSION ?? 'dev',
+  gitSha: process.env.GIT_SHA ?? 'unknown',
+
   // Source-vault refresh (git-pull transport). How often a
   // GitPullVault source is re-pulled (fast-forward only) so re-indexing sees
   // upstream changes. Default 5 minutes; set to 0 to disable periodic refresh.

@@ -1,6 +1,7 @@
 import { config } from '../config.js';
 import { logger } from './logger.js';
 import { mkdirSync, existsSync, writeFileSync, readFileSync, renameSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import path from 'node:path';
 
 // Dynamic imports to avoid hard failures if deps are missing
@@ -12,8 +13,16 @@ let embeddingPipeline: any = null;
 let index: any = null;
 const pathToId = new Map<string, number>();
 const idToPath = new Map<number, string>();
+// Content hash per indexed path — lets boot detect which notes actually
+// changed so we only re-embed the delta instead of the whole vault. Persisted
+// alongside the id-map. Hash is over the exact text we feed the model (see
+// embedTextFor) so a change past the embed-truncation point never re-embeds.
+const pathToHash = new Map<string, string>();
 let nextId = 0;
 let ready = false;
+// True when initEmbeddings successfully loaded a persisted index from disk.
+// Boot uses this to choose an incremental sync over a full rebuild.
+let loadedPersistedIndex = false;
 
 // Stats
 let totalEmbedTime = 0;
@@ -32,6 +41,49 @@ function schedulePersist(): void {
 
 export function isEmbeddingsReady(): boolean {
   return ready;
+}
+
+/**
+ * True when a persisted HNSW index was loaded from disk at init. Boot reads
+ * this to decide between an incremental sync (cheap — only the delta) and a
+ * full rebuild (cold start / corrupt index).
+ */
+export function wasPersistedIndexLoaded(): boolean {
+  return loadedPersistedIndex;
+}
+
+/**
+ * The exact text we embed for a doc. Single source of truth so buildFullIndex,
+ * the incremental sync, and the change-hash never drift apart. Mirrors the
+ * truncation embedText applies (~256 tokens / 1024 chars).
+ */
+function embedTextFor(doc: { title: string; content: string }): string {
+  return (doc.title + ' ' + doc.content.slice(0, 1024)).trim();
+}
+
+/** Stable content hash of the embed text — used to detect changed notes. */
+function docHash(text: string): string {
+  return createHash('sha1').update(text).digest('hex');
+}
+
+/**
+ * Ensure the HNSW index can hold at least `target` points. hnswlib allocates a
+ * fixed capacity up front and throws on addPoint once full; markDeleted points
+ * still occupy slots, so an index that has seen many updates can fill well
+ * before the logical size warrants it. Grow with headroom when needed.
+ */
+function ensureCapacity(target: number): void {
+  if (!index || typeof index.getMaxElements !== 'function') return;
+  try {
+    const max = index.getMaxElements();
+    if (target > max) {
+      const grown = Math.max(target, Math.ceil(max * 1.5));
+      index.resizeIndex(grown);
+      logger.info('Resized HNSW index', { from: max, to: grown });
+    }
+  } catch (err) {
+    logger.warn('HNSW resize failed', { error: err instanceof Error ? err.message : String(err) });
+  }
 }
 
 export function getEmbeddingStats(): {
@@ -145,10 +197,22 @@ export async function initEmbeddings(): Promise<void> {
           pathToId.set(p, id as number);
           idToPath.set(id as number, p);
         }
+        // Restore content hashes (absent in indexes persisted before this
+        // existed — leaving them empty just means those notes re-embed once on
+        // the next boot, then the hashes are written back).
+        if (mapData.pathToHash) {
+          for (const [p, h] of Object.entries(mapData.pathToHash)) {
+            pathToHash.set(p, h as string);
+          }
+        }
         nextId = mapData.nextId || 0;
 
         ready = true;
-        logger.info('Loaded persisted embedding index', { size: pathToId.size });
+        loadedPersistedIndex = true;
+        logger.info('Loaded persisted embedding index', {
+          size: pathToId.size,
+          hashed: pathToHash.size,
+        });
         return;
       } catch (err) {
         logger.warn('Failed to load persisted embedding index, will rebuild', {
@@ -186,6 +250,7 @@ export async function buildFullIndex(
   // Reset state
   pathToId.clear();
   idToPath.clear();
+  pathToHash.clear();
   nextId = 0;
 
   // Recreate index with appropriate capacity
@@ -213,7 +278,7 @@ export async function buildFullIndex(
 
     for (const [docPath, doc] of batch) {
       try {
-        const text = (doc.title + ' ' + doc.content.slice(0, 1024)).trim();
+        const text = embedTextFor(doc);
         if (!text) continue;
 
         const embedding = await embedText(text);
@@ -222,6 +287,7 @@ export async function buildFullIndex(
         index.addPoint(embedding, id);
         pathToId.set(docPath, id);
         idToPath.set(id, docPath);
+        pathToHash.set(docPath, docHash(text));
         processed++;
       } catch (err) {
         errors++;
@@ -243,6 +309,90 @@ export async function buildFullIndex(
 
   persistIndex();
   logger.info('Full embedding index built', { processed, errors, total: docs.size });
+}
+
+/**
+ * Incrementally reconcile the loaded (persisted) index against the current
+ * doc set — the cheap boot path. Only notes that are new or whose content hash
+ * changed get re-embedded; notes that vanished from the vault are dropped.
+ * Unchanged notes (the overwhelming majority on a normal restart) cost nothing.
+ *
+ * This is what makes a restart fast: instead of ~4k transformer forward passes,
+ * we run as many as the vault actually changed since the last persist.
+ *
+ * Falls back to a full build only when there is no usable persisted index
+ * (handled by the caller via wasPersistedIndexLoaded()).
+ */
+export async function syncIndexIncremental(
+  docs: ReadonlyMap<string, { title: string; content: string }>,
+): Promise<{ added: number; updated: number; removed: number; unchanged: number }> {
+  if (!ready || !embeddingPipeline || !index) {
+    return { added: 0, updated: 0, removed: 0, unchanged: 0 };
+  }
+
+  const t0 = Date.now();
+  let added = 0;
+  let updated = 0;
+  let removed = 0;
+  let unchanged = 0;
+
+  // 1. Drop vectors for notes that no longer exist in the vault.
+  for (const p of [...pathToId.keys()]) {
+    if (!docs.has(p)) {
+      const id = pathToId.get(p);
+      if (id !== undefined) {
+        try { index.markDelete(id); } catch { /* already gone */ }
+        idToPath.delete(id);
+      }
+      pathToId.delete(p);
+      pathToHash.delete(p);
+      removed++;
+    }
+  }
+
+  // 2. Add new notes and re-embed changed ones; skip unchanged.
+  let i = 0;
+  for (const [docPath, doc] of docs) {
+    const text = embedTextFor(doc);
+    if (!text) continue;
+
+    const h = docHash(text);
+    const existingId = pathToId.get(docPath);
+    if (existingId !== undefined && pathToHash.get(docPath) === h) {
+      unchanged++;
+    } else {
+      try {
+        const embedding = await embedText(text);
+        if (existingId !== undefined) {
+          try { index.markDelete(existingId); } catch { /* ignore */ }
+          idToPath.delete(existingId);
+        }
+        const id = nextId++;
+        ensureCapacity(nextId);
+        index.addPoint(embedding, id);
+        pathToId.set(docPath, id);
+        idToPath.set(id, docPath);
+        pathToHash.set(docPath, h);
+        if (existingId !== undefined) updated++; else added++;
+      } catch (err) {
+        logger.warn('Incremental embed failed', { path: docPath, error: String(err) });
+      }
+    }
+
+    // Yield to the event loop periodically so the sync never blocks request
+    // handling (the whole point of not doing a full rebuild).
+    if (++i % 50 === 0) {
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+  }
+
+  if (added > 0 || updated > 0 || removed > 0) {
+    persistIndex();
+  }
+  logger.info('Embedding index synced incrementally', {
+    added, updated, removed, unchanged, ms: Date.now() - t0,
+  });
+  return { added, updated, removed, unchanged };
 }
 
 // Small LRU cache for QUERY embeddings (opt-in via opts.cache). Recall/wakeup
@@ -315,9 +465,11 @@ export async function embedAndIndex(docPath: string, text: string): Promise<void
   }
 
   const id = nextId++;
+  ensureCapacity(nextId);
   index.addPoint(embedding, id);
   pathToId.set(docPath, id);
   idToPath.set(id, docPath);
+  pathToHash.set(docPath, docHash(text.slice(0, 1024)));
 
   schedulePersist();
 }
@@ -334,6 +486,7 @@ export function removeFromVectorIndex(docPath: string): void {
     }
     pathToId.delete(docPath);
     idToPath.delete(id);
+    pathToHash.delete(docPath);
     schedulePersist();
   }
 }
@@ -589,6 +742,7 @@ export function persistIndex(): void {
     index.writeIndexSync(tmpIndex);
     writeFileSync(tmpMap, JSON.stringify({
       pathToId: Object.fromEntries(pathToId),
+      pathToHash: Object.fromEntries(pathToHash),
       nextId,
     }));
 

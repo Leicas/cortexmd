@@ -15,6 +15,40 @@ import { lstat } from 'node:fs/promises';
 export const AUTO_CONSOLIDATE_MIN_GROUP_SIZE = 5;
 export const AUTO_CONSOLIDATE_MIN_SHARED_TAGS = 3;
 
+/**
+ * Machine-exhaust filter for consolidation. These notes are auto-generated
+ * logs (agent diaries, cron/hook auto-saves, observation chatter) — folding
+ * them into a consolidated summary produces tag-soup, not signal, and they
+ * dominate the vault so excluding them also keeps the candidate scan bounded.
+ */
+const CONSOLIDATE_EXCLUDE_CATEGORIES = new Set(['observation', 'conversation']);
+const CONSOLIDATE_EXCLUDE_COLLECTIONS = new Set(['journal']);
+const CONSOLIDATE_EXCLUDE_TAGS = new Set([
+  'temperature-refresh', 'dream-cycle', 'auto-save', 'hook', 'email-recap', 'cron-run',
+]);
+const AGENT_DIARY_PATH = /agent[ -]diar(?:y|ies)/i;
+
+/** Safety backstop: cap the consolidation candidate set so a runaway vault
+ * state can never stall a scheduled/boot run, even past the exclusion above. */
+const MAX_CONSOLIDATE_CANDIDATES = 4000;
+
+/** Cap on disk reads in the ROI-demotion scan (advisory output — a bounded
+ * subset is fine and keeps the pass from hammering disk on a large vault). */
+const MAX_ROI_READS = 1500;
+
+function isConsolidationExhaust(
+  filePath: string,
+  meta: { category?: string; collection?: string; tags: string[] },
+): boolean {
+  if (meta.category && CONSOLIDATE_EXCLUDE_CATEGORIES.has(meta.category)) return true;
+  if (meta.collection && CONSOLIDATE_EXCLUDE_COLLECTIONS.has(meta.collection)) return true;
+  if (AGENT_DIARY_PATH.test(filePath)) return true;
+  for (const t of meta.tags) {
+    if (CONSOLIDATE_EXCLUDE_TAGS.has(t)) return true;
+  }
+  return false;
+}
+
 // Category-specific decay rate multipliers.
 // Multiplier scales the base decay amount: <1 means slower decay, >1 means faster.
 // Calibrated so canonical knowledge (facts/preferences) effectively never decays,
@@ -143,9 +177,9 @@ export async function decayMemories(): Promise<{ decayed: number }> {
 export async function findConsolidationCandidates(): Promise<
   Array<{ paths: string[]; commonTags: string[]; suggestedTitle: string }>
 > {
-  const coldNotes: Array<{ path: string; tags: string[] }> = [];
-
-  // Use indexed metadata to filter candidates — no disk reads needed
+  // Tags by candidate path. Use indexed metadata only — no disk reads. Cold,
+  // tagged, non-exhaust notes only (see isConsolidationExhaust).
+  const tagsByPath = new Map<string, string[]>();
   const dm = getDocMeta();
   for (const [filePath, meta] of dm) {
     if (meta.temperature !== 'cold') continue;
@@ -153,12 +187,18 @@ export async function findConsolidationCandidates(): Promise<
     // Note: docMeta doesn't store 'status', so we skip that check here.
     // The consolidation logic in the tool already checks this on the actual file.
     if (meta.tags.length < 2) continue;
+    if (isConsolidationExhaust(filePath, meta)) continue;
 
-    coldNotes.push({ path: filePath, tags: meta.tags });
+    tagsByPath.set(filePath, meta.tags);
+    if (tagsByPath.size >= MAX_CONSOLIDATE_CANDIDATES) {
+      logger.warn('Consolidation candidate set hit cap — scanning a subset', {
+        cap: MAX_CONSOLIDATE_CANDIDATES,
+      });
+      break;
+    }
   }
 
-  // Group by overlapping tags (notes sharing 2+ tags form a cluster)
-  // Use a union-find approach: for each pair sharing 2+ tags, merge them
+  // Union-find over candidates.
   const parent = new Map<string, string>();
   function find(x: string): string {
     if (!parent.has(x)) parent.set(x, x);
@@ -172,28 +212,33 @@ export async function findConsolidationCandidates(): Promise<
     const rb = find(b);
     if (ra !== rb) parent.set(ra, rb);
   }
+  for (const p of tagsByPath.keys()) find(p);
 
-  // Initialize all notes
-  for (const note of coldNotes) {
-    find(note.path);
-  }
-
-  // Merge notes that share 2+ tags
-  for (let i = 0; i < coldNotes.length; i++) {
-    for (let j = i + 1; j < coldNotes.length; j++) {
-      const shared = coldNotes[i].tags.filter((t) => coldNotes[j].tags.includes(t));
-      if (shared.length >= 2) {
-        union(coldNotes[i].path, coldNotes[j].path);
+  // Cluster by shared tags via a tag-PAIR inverted index. Two notes belong in
+  // the same cluster iff they share ≥2 tags, which is exactly iff they share at
+  // least one (tagA, tagB) pair. Bucketing notes by pair and unioning each new
+  // note with the bucket's first member yields the same connected components as
+  // the old O(N²) pairwise scan, but at ~O(N · tags²) — no longer a quadratic
+  // event-loop block on a large cold set.
+  const pairRep = new Map<string, string>(); // pairKey -> representative path
+  for (const [p, tags] of tagsByPath) {
+    const uniq = [...new Set(tags)].sort();
+    for (let i = 0; i < uniq.length; i++) {
+      for (let j = i + 1; j < uniq.length; j++) {
+        const key = uniq[i] + '|||' + uniq[j];
+        const rep = pairRep.get(key);
+        if (rep === undefined) pairRep.set(key, p);
+        else union(rep, p);
       }
     }
   }
 
   // Collect clusters
   const clusters = new Map<string, string[]>();
-  for (const note of coldNotes) {
-    const root = find(note.path);
+  for (const p of tagsByPath.keys()) {
+    const root = find(p);
     if (!clusters.has(root)) clusters.set(root, []);
-    clusters.get(root)!.push(note.path);
+    clusters.get(root)!.push(p);
   }
 
   // Build results for clusters of 3+
@@ -201,14 +246,11 @@ export async function findConsolidationCandidates(): Promise<
   for (const [, paths] of clusters) {
     if (paths.length < 3) continue;
 
-    // Find tags common to all notes in the cluster
-    const notesInCluster = coldNotes.filter((n) => paths.includes(n.path));
-    const tagSets = notesInCluster.map((n) => new Set(n.tags));
-
-    // Find tags present in at least 2 notes
+    // Find tags present in at least 2 notes of the cluster (O(1) tag lookup
+    // via tagsByPath — no array filter/includes over the whole candidate set).
     const tagCounts = new Map<string, number>();
-    for (const note of notesInCluster) {
-      for (const tag of note.tags) {
+    for (const p of paths) {
+      for (const tag of tagsByPath.get(p) ?? []) {
         tagCounts.set(tag, (tagCounts.get(tag) ?? 0) + 1);
       }
     }
@@ -417,6 +459,11 @@ export async function findROIDemotionCandidates(opts: {
   const out: ROIDemotionCandidate[] = [];
   const dm = getDocMeta();
 
+  // This pass reads each stale memory from disk (one readNote + parse per
+  // note). On a large vault that is a lot of synchronous-ish I/O, so we cap the
+  // number of reads and yield to the event loop periodically — the result is
+  // advisory (a review list), so scanning a bounded subset is acceptable.
+  let reads = 0;
   for (const [filePath, meta] of dm) {
     if (meta.type !== 'memory') continue;
     if (meta.archived === true) continue;
@@ -427,8 +474,15 @@ export async function findROIDemotionCandidates(opts: {
     const days = (Date.now() - t) / (1000 * 60 * 60 * 24);
     if (days < minDays) continue;
 
+    if (reads >= MAX_ROI_READS) {
+      logger.warn('ROI demotion scan hit read cap — scanning a subset', { cap: MAX_ROI_READS });
+      break;
+    }
+
     try {
       const { content } = await readNote(filePath);
+      reads++;
+      if (reads % 50 === 0) await new Promise((resolve) => setImmediate(resolve));
       const { data, body } = parseFrontmatter(content);
       const r = computeROI(data, body);
       if (r.roi < 0) {

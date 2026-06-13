@@ -10,7 +10,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
 
-import { initEmbeddings, persistIndex as persistEmbeddingIndex, isEmbeddingsReady, buildFullIndex } from './lib/embeddings.js';
+import { initEmbeddings, persistIndex as persistEmbeddingIndex, isEmbeddingsReady, buildFullIndex, syncIndexIncremental, wasPersistedIndexLoaded } from './lib/embeddings.js';
 import { config } from './config.js';
 import { apiKeyMiddleware, dashboardAuthMiddleware, SESSION_COOKIE_NAME } from './auth.js';
 import { mintDashboardSession } from './oauth.js';
@@ -2279,9 +2279,16 @@ async function main(): Promise<void> {
         docTexts.set(p, { title: meta.title, content: meta.content });
       }
       try {
-        await buildFullIndex(docTexts);
+        // Fast path: a persisted index loaded from disk, so only reconcile the
+        // delta (new/changed/deleted notes) instead of re-embedding the whole
+        // vault. A full rebuild is the cold-start / corrupt-index fallback.
+        if (wasPersistedIndexLoaded()) {
+          await syncIndexIncremental(docTexts);
+        } else {
+          await buildFullIndex(docTexts);
+        }
       } catch (err) {
-        logger.error('buildFullIndex crashed', {
+        logger.error('Embedding index build crashed', {
           error: err instanceof Error ? err.message : String(err),
           stack: err instanceof Error ? err.stack : undefined,
         });

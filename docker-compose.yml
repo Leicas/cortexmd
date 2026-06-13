@@ -12,6 +12,9 @@
 #
 #   BRAIN_VAULT=./data/brain          # writable; the ONLY dir the server writes
 #   SOURCE_VAULTS=./data/notes        # read-only sources, comma-separated
+#   STATE_DIR=./data/state            # server state (OAuth clients, JWT secret,
+#                                     # SQLite, HNSW); bind-mounted so it
+#                                     # survives `docker compose down -v`
 #   API_PORT=3000
 #   # API_KEY=                        # auto-generated + printed if unset
 #   # DASHBOARD_PASSWORD=             # auto-generated + printed if unset
@@ -65,8 +68,16 @@ services:
       # and list them (comma-separated) in SOURCE_VAULTS_CONTAINER.
       #   ${SOURCE_VAULTS}=./data/notes
       - "${SOURCE_VAULTS:-./data/notes}:/app/sources:ro"
-      # Persistent server state: SQLite cache, HNSW index, model + source cache.
-      - cortexmd-data:/app/data
+      # Persistent server state: OAuth client registry (oauth-clients.json) +
+      # JWT signing secret (jwt-secret.json), SQLite cache, HNSW index, model +
+      # source cache. This is a host BIND MOUNT, not a named volume, on purpose:
+      # a named volume is removed by `docker compose down -v` / `docker volume
+      # prune` / a compose project rename — and when /app/data is wiped, the
+      # JWT secret regenerates (all OAuth refresh tokens → invalid_grant) and
+      # the dynamic client registration is lost (/authorize → invalid_client),
+      # silently breaking every OAuth client (n8n email pipeline). A bind mount
+      # to a stable host path cannot be wiped that way; it survives redeploys.
+      - "${STATE_DIR:-./data/state}:/app/data"
     restart: unless-stopped
     stop_grace_period: 15s
     logging:
@@ -84,6 +95,3 @@ services:
       timeout: 10s
       retries: 3
       start_period: 20s
-
-volumes:
-  cortexmd-data:

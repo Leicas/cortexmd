@@ -149,6 +149,14 @@ export interface DreamReport {
   /** True if this run was a dry run (no mutations applied). */
   dryRun: boolean;
 
+  /**
+   * True if the cycle hit its overall time budget and skipped one or more of
+   * the expensive optional passes (connections, consolidation, reconciliation,
+   * ROI/promotion). A safety backstop so a pathological vault state can never
+   * hang the server in the dream — individual passes are also capped.
+   */
+  budgetExceeded?: boolean;
+
   health: {
     orphanRatio: number;
     avgHeatScore: number;
@@ -194,7 +202,17 @@ export interface DreamOptions {
   reconcileColdOnly?: boolean;
   /** Minimum cluster size before a project is created/updated (default 2). */
   reconcileMinClusterSize?: number;
+
+  /**
+   * Overall wall-clock budget for the cycle (ms). Once exceeded, the remaining
+   * expensive optional passes are skipped and report.budgetExceeded is set.
+   * Backstop only — individual passes are independently capped. Default 120s.
+   */
+  budgetMs?: number;
 }
+
+/** Default overall dream-cycle time budget (see DreamOptions.budgetMs). */
+const DREAM_DEFAULT_BUDGET_MS = 120_000;
 
 /**
  * Shared helper for dream-engine scoping. Returns true if a note's collection
@@ -437,6 +455,19 @@ export function findOrphanMemories(scope: 'memories' | 'vault' = 'memories'): Or
 
 // ── 4. suggestConnections ──────────────────────────────────────────────
 
+/**
+ * Tags that appear on more than this many notes are skipped as pair anchors:
+ * a tag shared by hundreds of notes (e.g. a project-wide tag) makes that
+ * bucket O(n²) on its own and is not a meaningful "connection" signal anyway.
+ * Pairs whose shared tags include a rarer tag are still found via that tag's
+ * (smaller) bucket, so we only drop the all-generic-tag pairs.
+ */
+const SUGGEST_MAX_TAG_BUCKET = 80;
+
+/** Overall safety budget on pair comparisons so this can never become an
+ * event-loop-blocking O(N²) sweep on a large, densely-tagged vault. */
+const SUGGEST_MAX_COMPARISONS = 1_000_000;
+
 export function suggestConnections(limit: number): ConnectionSuggestion[] {
   const dm = getDocMeta();
 
@@ -471,12 +502,23 @@ export function suggestConnections(limit: number): ConnectionSuggestion[] {
   const suggestions: ConnectionSuggestion[] = [];
 
   // Iterate through tag pairs via the inverted index for efficiency
+  let comparisons = 0;
   const tagEntries = [...tagIndex.entries()];
+  outer:
   for (let ti = 0; ti < tagEntries.length; ti++) {
     const [, noteIndicesA] = tagEntries[ti];
+    // Skip overly-common tags — their bucket alone is O(n²) and the pairs they
+    // anchor are low-signal (and recoverable via rarer shared tags).
+    if (noteIndicesA.length > SUGGEST_MAX_TAG_BUCKET) continue;
     for (const idxA of noteIndicesA) {
       for (const idxB of noteIndicesA) {
         if (idxB <= idxA) continue;
+        if (++comparisons > SUGGEST_MAX_COMPARISONS) {
+          logger.warn('suggestConnections hit comparison budget — returning partial set', {
+            budget: SUGGEST_MAX_COMPARISONS,
+          });
+          break outer;
+        }
         const pairKey = `${idxA}:${idxB}`;
         if (seen.has(pairKey)) continue;
 
@@ -546,11 +588,25 @@ export async function runDreamCycle(options: DreamOptions = {}): Promise<DreamRe
     reconcileProjects = true,
     reconcileColdOnly = true,
     reconcileMinClusterSize = 2,
+    budgetMs = DREAM_DEFAULT_BUDGET_MS,
   } = options;
 
   const startTime = Date.now();
+  const deadline = startTime + budgetMs;
+  let budgetExceeded = false;
+  // Returns true once past the budget; logs the skipped phase the first time.
+  const overBudget = (phase: string): boolean => {
+    if (Date.now() <= deadline) return false;
+    if (!budgetExceeded) {
+      logger.warn('Dream cycle over time budget — skipping remaining expensive passes', {
+        budgetMs, firstSkipped: phase,
+      });
+    }
+    budgetExceeded = true;
+    return true;
+  };
   logger.info('Dream cycle starting', {
-    daysBack, autoDecay, autoArchive, autoConsolidate, dryRun, scope,
+    daysBack, autoDecay, autoArchive, autoConsolidate, dryRun, scope, budgetMs,
   });
 
   // 1. Activity analysis
@@ -596,16 +652,19 @@ export async function runDreamCycle(options: DreamOptions = {}): Promise<DreamRe
 
   // 5. Connection suggestions
   let connectionSuggestions: ConnectionSuggestion[] = [];
-  try {
-    connectionSuggestions = suggestConnections(maxConnections);
-  } catch (err) {
-    logger.warn('Dream cycle: connection suggestions failed', { error: String(err) });
+  if (!overBudget('connections')) {
+    try {
+      connectionSuggestions = suggestConnections(maxConnections);
+    } catch (err) {
+      logger.warn('Dream cycle: connection suggestions failed', { error: String(err) });
+    }
   }
 
   // 6. Consolidation candidates + optional auto-apply
   let consolidationGroups: ConsolidationGroup[] = [];
   const autoConsolidations: DreamReport['autoConsolidations'] = [];
-  try {
+  if (!overBudget('consolidation')) {
+   try {
     const raw = await findConsolidationCandidates();
     const dm = getDocMeta();
     consolidationGroups = raw.slice(0, maxConsolidations).map((group) => {
@@ -661,15 +720,16 @@ export async function runDreamCycle(options: DreamOptions = {}): Promise<DreamRe
         }
       }
     }
-  } catch (err) {
-    logger.warn('Dream cycle: consolidation detection failed', { error: String(err) });
+   } catch (err) {
+     logger.warn('Dream cycle: consolidation detection failed', { error: String(err) });
+   }
   }
 
   // 6.6. Project reconciliation — cluster related cold notes by shared
   // entity/tag overlap and LINK them into a project note (never delete).
   // Additive to the destructive tag-consolidation above. Respects dryRun.
   let projectReconciliations: ProjectReconciliation[] = [];
-  if (reconcileProjects) {
+  if (reconcileProjects && !overBudget('reconciliation')) {
     try {
       const clusters = clusterColdNotes({
         includeWarm: !reconcileColdOnly,
@@ -693,24 +753,28 @@ export async function runDreamCycle(options: DreamOptions = {}): Promise<DreamRe
 
   // 6.5. ROI demotion + auto-promotion (token-savior parity)
   let roiDemotions: ROIDemotionCandidate[] = [];
-  try {
-    roiDemotions = (await findROIDemotionCandidates({ minDaysSinceAccess: 30 })).slice(0, 50);
-  } catch (err) {
-    logger.warn('Dream cycle: ROI demotion scan failed', { error: String(err) });
+  if (!overBudget('roi-demotion')) {
+    try {
+      roiDemotions = (await findROIDemotionCandidates({ minDaysSinceAccess: 30 })).slice(0, 50);
+    } catch (err) {
+      logger.warn('Dream cycle: ROI demotion scan failed', { error: String(err) });
+    }
   }
 
   let promotions: Array<PromotionCandidate & { applied: boolean }> = [];
-  try {
-    const candidates = await findAutoPromoteCandidates();
-    for (const c of candidates) {
-      let applied = false;
-      if (!dryRun) {
-        applied = await applyPromotion(c);
+  if (!overBudget('promotion')) {
+    try {
+      const candidates = await findAutoPromoteCandidates();
+      for (const c of candidates) {
+        let applied = false;
+        if (!dryRun) {
+          applied = await applyPromotion(c);
+        }
+        promotions.push({ ...c, applied });
       }
-      promotions.push({ ...c, applied });
+    } catch (err) {
+      logger.warn('Dream cycle: auto-promotion failed', { error: String(err) });
     }
-  } catch (err) {
-    logger.warn('Dream cycle: auto-promotion failed', { error: String(err) });
   }
 
   // 7. Health metrics
@@ -746,6 +810,7 @@ export async function runDreamCycle(options: DreamOptions = {}): Promise<DreamRe
     projectReconciliations,
     llm,
     dryRun,
+    budgetExceeded,
     health,
     narrative: '', // filled below
   };
@@ -988,6 +1053,10 @@ function generateNarrative(report: DreamReport): string {
 
   if (report.dryRun) {
     parts.push('(Dry run — no vault mutations applied.)');
+  }
+
+  if (report.budgetExceeded) {
+    parts.push('(Time budget exceeded — some expensive passes were skipped this run.)');
   }
 
   if (report.llm.ran) {

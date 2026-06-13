@@ -21,6 +21,7 @@ import { parseFrontmatter, stringifyFrontmatter } from './frontmatter.js';
 import { detectEntities } from './entity-detector.js';
 import { updateGraphForNote } from './graph.js';
 import { recordConsolidation } from './metrics.js';
+import { isProtectedFromConsolidation } from './memory-lifecycle.js';
 import { logger } from './logger.js';
 
 export interface ColdCluster {
@@ -84,6 +85,10 @@ export function clusterColdNotes(opts: ReconcileOptions = {}): ColdCluster[] {
     if (meta.archived === true) continue;
     // Never re-consolidate project notes (or anything under Projects/).
     if (meta.collection === 'projects' || meta.type === 'project' || /^Projects\//i.test(path)) continue;
+    // Never consume high-value structured notes — CRM entities, canonical
+    // knowledge, important notes. They cluster easily by shared entity but
+    // folding them into a project destroys real information.
+    if (isProtectedFromConsolidation(path, meta)) continue;
     const temp = meta.temperature;
     const eligible = opts.includeWarm ? (temp === 'cold' || temp === 'warm') : temp === 'cold';
     if (!eligible) continue;
@@ -179,16 +184,26 @@ function stripLeadingTitle(body: string): string {
 }
 
 /**
- * Consolidate one cold cluster into a project note, then DELETE the originals.
- * Create/update Projects/<slug>.md (type:'project'), fold each source's FULL
- * body into a "## Consolidated memories" section (so deletion is lossless),
- * record `consolidated_from`, then remove the source notes from disk + index.
- * Returns null on hard failure or when there is nothing new to fold. Respects
+ * Tie one cold cluster together via a project note.
+ *
+ * DEFAULT (non-destructive, `destructive=false`): create/update
+ * Projects/<slug>.md and add a "## Related memories" section that LINKS to each
+ * source via wikilink — the originals are left exactly where they are. This is
+ * the safe default: the dream improves connectivity without ever deleting a
+ * user's notes (a CRM entity, a canonical fact, etc. stays put).
+ *
+ * OPT-IN (`destructive=true`): the legacy behavior — fold each source's FULL
+ * body into a "## Consolidated memories" section (lossless) and then DELETE the
+ * originals, making the project note their durable home. Only reachable when a
+ * caller explicitly asks for it.
+ *
+ * Returns null on hard failure or when there is nothing new to add. Respects
  * dryRun (computes the plan, writes/deletes nothing).
  */
 export async function reconcileClusterIntoProject(
   cluster: ColdCluster,
   dryRun = false,
+  destructive = false,
 ): Promise<ProjectReconciliation | null> {
   const slug = slugify(cluster.suggestedTitle) || 'project';
   const projectPath = `Projects/${slug}.md`;
@@ -255,21 +270,35 @@ export async function reconcileClusterIntoProject(
   projData.consolidated_from = [...consolidatedFrom];
   if (mergedRelated.size > 0) projData.related = [...mergedRelated];
 
-  // Fold each source's FULL body in (lossless), under a dated subsection.
-  // Skip sources already folded in (idempotent on the project body).
-  const newEntries = sources.filter((s) => !projBody.includes(`<!-- src:${s.path} -->`));
+  // Marker differs by mode so a note linked non-destructively isn't later
+  // mistaken for one whose body was folded in (and vice-versa).
+  const marker = destructive ? 'src' : 'link';
+  const newEntries = sources.filter((s) => !projBody.includes(`<!-- ${marker}:${s.path} -->`));
   if (newEntries.length === 0 && !created) return null;
 
   if (newEntries.length > 0) {
-    const blocks = newEntries.map((s) => {
-      const content = stripLeadingTitle(s.body);
-      return `<!-- src:${s.path} -->\n### ${s.title}\n_was ${s.path}_\n\n${content || '(no body)'}\n`;
-    });
-    const header = '## Consolidated memories';
-    if (projBody.includes(header)) {
-      projBody = projBody.replace(header, `${header}\n\n${blocks.join('\n')}`);
+    if (destructive) {
+      // Fold each source's FULL body in (lossless) before the originals are
+      // deleted below.
+      const blocks = newEntries.map((s) => {
+        const content = stripLeadingTitle(s.body);
+        return `<!-- src:${s.path} -->\n### ${s.title}\n_was ${s.path}_\n\n${content || '(no body)'}\n`;
+      });
+      const header = '## Consolidated memories';
+      if (projBody.includes(header)) {
+        projBody = projBody.replace(header, `${header}\n\n${blocks.join('\n')}`);
+      } else {
+        projBody = `${projBody.replace(/\s*$/, '')}\n\n${header}\n\n${blocks.join('\n')}`;
+      }
     } else {
-      projBody = `${projBody.replace(/\s*$/, '')}\n\n${header}\n\n${blocks.join('\n')}`;
+      // Non-destructive: link to each source; the originals stay put.
+      const lines = newEntries.map((s) => `- [[${s.title}]] <!-- link:${s.path} -->`);
+      const header = '## Related memories';
+      if (projBody.includes(header)) {
+        projBody = projBody.replace(header, `${header}\n${lines.join('\n')}`);
+      } else {
+        projBody = `${projBody.replace(/\s*$/, '')}\n\n${header}\n${lines.join('\n')}\n`;
+      }
     }
   }
 
@@ -295,22 +324,27 @@ export async function reconcileClusterIntoProject(
     return null;
   }
 
-  // Delete the originals only after the project note is safely written.
+  // Delete the originals ONLY in destructive mode, and only after the project
+  // note (with their full folded bodies) is safely written.
   const deleted: string[] = [];
-  for (const s of newEntries) {
-    try {
-      await deleteNote(s.path);
-      removeFromIndex(s.path);
-      deleted.push(s.path);
-    } catch (err) {
-      logger.warn('reconcileClusterIntoProject: source delete failed', {
-        path: s.path, error: err instanceof Error ? err.message : String(err),
-      });
+  if (destructive) {
+    for (const s of newEntries) {
+      try {
+        await deleteNote(s.path);
+        removeFromIndex(s.path);
+        deleted.push(s.path);
+      } catch (err) {
+        logger.warn('reconcileClusterIntoProject: source delete failed', {
+          path: s.path, error: err instanceof Error ? err.message : String(err),
+        });
+      }
     }
   }
 
   recordConsolidation(deleted.length);
-  logger.info('Project reconciliation applied', { projectPath, created, deleted: deleted.length });
+  logger.info('Project reconciliation applied', {
+    projectPath, created, linked: newEntries.length, deleted: deleted.length, destructive,
+  });
   return {
     projectPath, created,
     sourcePaths: sources.map((s) => s.path),

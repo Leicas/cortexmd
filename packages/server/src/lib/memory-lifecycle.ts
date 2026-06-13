@@ -49,6 +49,31 @@ function isConsolidationExhaust(
   return false;
 }
 
+/**
+ * High-value notes the dream must NEVER fold away or delete. Distinct from
+ * machine-exhaust (which is low-value noise we skip for signal reasons): these
+ * are durable, structured records — CRM entities, canonical knowledge,
+ * important notes — where auto-consolidation destroys real information (e.g. a
+ * CRM person's note swallowed into an unrelated project because they share an
+ * entity mention). Applied to BOTH the tag-consolidation candidate scan and the
+ * entity-based project reconciliation clusterer.
+ */
+const PROTECTED_CATEGORIES = new Set(['fact', 'preference', 'decision', 'entity']);
+const CRM_PATH = /(?:^|\/)\d*\s*CRM\//i;       // "05 CRM/...", "CRM/..."
+const ENTITIES_PATH = /(?:^|\/)Entities\//i;    // CRM entity notes live under Entities/
+
+export function isProtectedFromConsolidation(
+  path: string,
+  meta: { type?: string; collection?: string; category?: string; importance?: string },
+): boolean {
+  if (meta.type === 'project' || meta.collection === 'projects') return true;
+  if (meta.type === 'entity') return true;
+  if (meta.category && PROTECTED_CATEGORIES.has(meta.category)) return true;
+  if (meta.importance === 'high' || meta.importance === 'critical') return true;
+  if (CRM_PATH.test(path) || ENTITIES_PATH.test(path)) return true;
+  return false;
+}
+
 // Category-specific decay rate multipliers.
 // Multiplier scales the base decay amount: <1 means slower decay, >1 means faster.
 // Calibrated so canonical knowledge (facts/preferences) effectively never decays,
@@ -188,6 +213,7 @@ export async function findConsolidationCandidates(): Promise<
     // The consolidation logic in the tool already checks this on the actual file.
     if (meta.tags.length < 2) continue;
     if (isConsolidationExhaust(filePath, meta)) continue;
+    if (isProtectedFromConsolidation(filePath, meta)) continue;
 
     tagsByPath.set(filePath, meta.tags);
     if (tagsByPath.size >= MAX_CONSOLIDATE_CANDIDATES) {

@@ -172,7 +172,14 @@ export interface DreamOptions {
   daysBack?: number;
   autoDecay?: boolean;
   autoArchive?: boolean;
-  /** Auto-apply high-confidence consolidation groups (≥5 notes, ≥3 shared tags). Default: true. */
+  /**
+   * Auto-apply high-confidence consolidation groups (≥5 notes, ≥3 shared tags)
+   * by MERGING them into one note and DELETING the originals. Default: false —
+   * this is destructive, so the dream only surfaces groups as suggestions
+   * unless a caller explicitly opts in. (Protected notes — CRM/entities/
+   * canonical/important — are never candidates regardless; see
+   * isProtectedFromConsolidation.)
+   */
   autoConsolidate?: boolean;
   /** If true, return the plan without performing any vault mutations. Default: false. */
   dryRun?: boolean;
@@ -577,7 +584,7 @@ export async function runDreamCycle(options: DreamOptions = {}): Promise<DreamRe
     daysBack = 7,
     autoDecay = true,
     autoArchive = true,        // P2.a: default changed from false → true
-    autoConsolidate = true,    // P2.b: default on
+    autoConsolidate = false,   // destructive (merge+delete) — opt-in only
     dryRun = false,            // P2.a: when true, no mutations are applied
     runLlm,                    // P2.c: undefined → auto-detect from config
     maxThemes = 5,

@@ -128,8 +128,18 @@ export function registerDataRoutes(router: Router): void {
   // every 2s). `limit` caps the rendered subgraph to the most-connected nodes.
   router.get('/dashboard/api/graph', async (req: Request, res: Response) => {
     try {
-      const raw = parseInt(String(req.query.limit ?? '800'), 10);
-      const limit = Number.isFinite(raw) ? Math.min(Math.max(raw, 50), 5000) : 800;
+      // limit<=0 (or "all") → render the whole graph, no cap. Positive values
+      // keep a sane floor; no hard ceiling so a large vault can be shown in full.
+      const rawStr = String(req.query.limit ?? '800');
+      const raw = parseInt(rawStr, 10);
+      let limit: number;
+      if (rawStr === 'all' || (Number.isFinite(raw) && raw <= 0)) {
+        limit = 0; // 0 = all nodes
+      } else if (Number.isFinite(raw)) {
+        limit = Math.max(raw, 50);
+      } else {
+        limit = 800;
+      }
       const snapshot = await getGraphSnapshot(limit);
       res.json(snapshot);
     } catch (err) {

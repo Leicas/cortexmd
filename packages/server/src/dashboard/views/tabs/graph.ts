@@ -16,6 +16,7 @@ export function renderGraphTab(): string {
         `<option value="800" selected>800 nodes</option>` +
         `<option value="1500">1500 nodes</option>` +
         `<option value="3000">3000 nodes</option>` +
+        `<option value="0">All nodes</option>` +
       `</select>` +
       `<button id="graphFit" type="button" class="btn btn--sm">Fit</button>` +
       `<button id="graphReheat" type="button" class="btn btn--sm">Reheat</button>` +

@@ -449,7 +449,9 @@ export async function getGraphSnapshot(limit = 800): Promise<GraphSnapshot> {
   const totalNodes = allNodes.length;
   const degOf = (n: string): number => (inDeg.get(n) ?? 0) + (outDeg.get(n) ?? 0);
 
-  const truncated = totalNodes > limit;
+  // limit <= 0 (or non-finite) means "no cap — return every node".
+  const noLimit = !Number.isFinite(limit) || limit <= 0;
+  const truncated = !noLimit && totalNodes > limit;
   const selected = truncated
     ? [...allNodes].sort((a, b) => degOf(b) - degOf(a)).slice(0, limit)
     : allNodes;

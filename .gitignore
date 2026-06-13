@@ -35,3 +35,6 @@ desktop.ini
 # ---- Editors ----
 .vscode/
 .idea/
+
+# local restore audit log — never commit (contains private vault paths)
+dream-restore-manifest.txt

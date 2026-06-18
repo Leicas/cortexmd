@@ -1154,7 +1154,106 @@ fn fetch_hud_stats(server: &str, api_key: &str) -> Result<Value> {
         .with_context(|| format!("parse JSON from {}", url))
 }
 
-pub fn cmd_hud_line(args: HudLineArgs) -> Result<()> {
+// ── proxy-indexing consumer ──────────────────────────────────────────────────
+
+/// A proxy-index request claimed from the server for this machine.
+struct ClaimedIndexRequest {
+    abs_path: String,
+    slug: Option<String>,
+    reason: Option<String>,
+}
+
+/// Claim this machine's pending proxy-index requests via the REST mirror of the
+/// `code_index_requests_poll` MCP tool. The returned requests are already
+/// flipped to 'claimed' server-side (and abandoned claims are reclaimed after a
+/// grace window), so the caller is free to fulfill them.
+fn claim_index_requests(
+    server: &str,
+    key: &str,
+    machine_id: &str,
+    limit: u32,
+) -> Result<Vec<ClaimedIndexRequest>> {
+    let payload = serde_json::json!({ "machine_id": machine_id, "limit": limit });
+    let resp = post_json_simple(server, "/api/code-index-requests", key, &payload)?;
+    let arr = resp
+        .get("requests")
+        .and_then(|r| r.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let mut out = Vec::with_capacity(arr.len());
+    for v in arr {
+        let abs_path = match v.get("absPath").and_then(|s| s.as_str()) {
+            Some(p) if !p.is_empty() => p.to_string(),
+            _ => continue,
+        };
+        out.push(ClaimedIndexRequest {
+            abs_path,
+            slug: v.get("slug").and_then(|s| s.as_str()).map(str::to_string),
+            reason: v.get("reason").and_then(|s| s.as_str()).map(str::to_string),
+        });
+    }
+    Ok(out)
+}
+
+/// Poll for and fulfill this machine's pending proxy-index requests. Each
+/// request triggers a full re-index of the owning checkout via `index_fn`
+/// (`run_index`); the server applies it content-hash incrementally and clears
+/// the request on a successful push. Best-effort and self-isolating: a
+/// missing/non-git path or a failed re-index is logged and skipped so one bad
+/// entry can't stall the rest (a skipped claim is reclaimed by the server after
+/// the grace window). Returns the number of repos actually re-indexed.
+fn poll_and_fulfill_index_requests(
+    server: &str,
+    key: &str,
+    machine_id: &str,
+    index_fn: &impl Fn(IndexArgs) -> Result<()>,
+) -> Result<usize> {
+    let requests = claim_index_requests(server, key, machine_id, 20)?;
+    if requests.is_empty() {
+        return Ok(0);
+    }
+    let mut fulfilled = 0usize;
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for req in requests {
+        if !seen.insert(req.abs_path.clone()) {
+            continue; // dedup repeated paths within a single batch
+        }
+        let path = PathBuf::from(&req.abs_path);
+        if !path.exists() {
+            eprintln!("[hud-line] proxy-index: skip missing path {}", req.abs_path);
+            continue;
+        }
+        if !path.join(".git").exists() {
+            eprintln!("[hud-line] proxy-index: skip non-git path {}", req.abs_path);
+            continue;
+        }
+        eprintln!(
+            "[hud-line] proxy-index: re-indexing {} (reason: {})",
+            req.abs_path,
+            req.reason.as_deref().unwrap_or("stale query"),
+        );
+        let args = IndexArgs {
+            repo_path: Some(path),
+            slug: req.slug.clone(),
+            server: Some(server.to_string()),
+            api_key: Some(key.to_string()),
+            machine_id: Some(machine_id.to_string()),
+            full_replace: true,
+            dry_run: false,
+            verbose: false,
+        };
+        match index_fn(args) {
+            Ok(()) => fulfilled += 1,
+            Err(e) => eprintln!(
+                "[hud-line] proxy-index: re-index of {} failed: {}",
+                req.abs_path, e
+            ),
+        }
+    }
+    Ok(fulfilled)
+}
+
+pub fn cmd_hud_line(args: HudLineArgs, index_fn: impl Fn(IndexArgs) -> Result<()>) -> Result<()> {
     // Idempotent launcher mode: spawn-if-not-running and exit. Stale window
     // is 2.5× the polling interval so a slow tick doesn't trigger a respawn.
     if args.ensure_daemon {
@@ -1178,21 +1277,29 @@ pub fn cmd_hud_line(args: HudLineArgs) -> Result<()> {
         return Ok(());
     }
 
+    // The HUD line is optional: when claude-hud isn't installed we still run the
+    // daemon, because it doubles as the proxy-indexing consumer — the only
+    // long-lived client process that can fulfill the server's re-index requests.
     let hud_config = match probe_claude_hud_config(args.hud_config.as_deref()) {
-        Some(p) => p,
+        Some(p) => {
+            eprintln!("[hud-line] using hud config: {}", p.display());
+            Some(p)
+        }
         None => {
             eprintln!(
-                "[hud-line] claude-hud config.json not found at the standard locations.\n\
-                 Install it via `/claude-hud:setup` first, or pass --hud-config <path>."
+                "[hud-line] claude-hud config.json not found — HUD line disabled; \
+                 running for proxy-index polling only."
             );
-            // No-op rather than fail, per Slice 12 spec.
-            return Ok(());
+            None
         }
     };
-    eprintln!("[hud-line] using hud config: {}", hud_config.display());
 
     let (server, key, _source) = resolve_or_bail(args.server.as_deref(), args.api_key.as_deref())?;
-    eprintln!("[hud-line] polling {} every {}s", server, args.interval);
+    let machine_id = detect_machine_id();
+    eprintln!(
+        "[hud-line] polling {} every {}s (machine_id: {})",
+        server, args.interval, machine_id
+    );
 
     // Stamp heartbeat at startup so a session-start firing before the first
     // poll completes sees the daemon as alive and skips respawning.
@@ -1204,24 +1311,35 @@ pub fn cmd_hud_line(args: HudLineArgs) -> Result<()> {
     let interval = std::time::Duration::from_secs(args.interval.max(1));
 
     loop {
-        match fetch_hud_stats(&server, &key) {
-            Ok(stats) => {
-                let line = render_hud_line(&stats, args.max_len);
-                if line != last_line {
-                    if let Err(e) = write_custom_line(&hud_config, &line) {
-                        eprintln!("[hud-line] write failed: {}", e);
-                    } else {
-                        last_line = line.clone();
+        if let Some(cfg) = &hud_config {
+            match fetch_hud_stats(&server, &key) {
+                Ok(stats) => {
+                    let line = render_hud_line(&stats, args.max_len);
+                    if line != last_line {
+                        if let Err(e) = write_custom_line(cfg, &line) {
+                            eprintln!("[hud-line] write failed: {}", e);
+                        } else {
+                            last_line = line.clone();
+                        }
+                    }
+                    if args.print {
+                        println!("{}", line);
                     }
                 }
-                if args.print {
-                    println!("{}", line);
+                Err(e) => {
+                    eprintln!("[hud-line] fetch failed: {}", e);
                 }
             }
-            Err(e) => {
-                eprintln!("[hud-line] fetch failed: {}", e);
-            }
         }
+
+        // Proxy-indexing consumer: fulfill any re-index requests the server
+        // enqueued for this machine when a code-nav query came up stale/empty.
+        match poll_and_fulfill_index_requests(&server, &key, &machine_id, &index_fn) {
+            Ok(n) if n > 0 => eprintln!("[hud-line] proxy-index: re-indexed {} repo(s)", n),
+            Ok(_) => {}
+            Err(e) => eprintln!("[hud-line] proxy-index poll failed: {}", e),
+        }
+
         // Touch heartbeat unconditionally — it signals "process alive", not
         // "fetch succeeded". A long server outage shouldn't trigger a duplicate
         // daemon on the next session-start.

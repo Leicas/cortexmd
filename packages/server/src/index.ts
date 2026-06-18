@@ -153,6 +153,7 @@ import {
   registerCodeRepoDrop,
   registerCodeProjectSymbol,
   registerCodeCheckStaleness,
+  registerCodeIndexRequestsPoll,
   registerCodeChangeImpact,
   registerCodeCallChain,
   registerCodeFullContext,
@@ -253,6 +254,7 @@ const allRegistrations = [
   // Wave 2 — projection + staleness
   registerCodeProjectSymbol,
   registerCodeCheckStaleness,
+  registerCodeIndexRequestsPoll,
   // Wave 3 — change-impact + call-chain (forward direction)
   registerCodeChangeImpact,
   registerCodeCallChain,
@@ -971,6 +973,48 @@ app.post('/api/code-repo-list', apiKeyMiddleware, async (_req: Request, res: Res
 // ── Code-nav REST endpoints (parity with the MCP tools, callable from the
 //    Rust indexer / hooks without spinning an MCP session). All API-key auth.
 //    Logic mirrors the MCP-tool implementations in src/tools/code-nav.ts.
+
+// Proxy-indexing poll: the owning machine's hud-line daemon claims its pending
+// re-index requests here each tick (REST mirror of `code_index_requests_poll`,
+// so the daemon needn't open an MCP session). Claiming mutates state, hence POST.
+app.post('/api/code-index-requests', apiKeyMiddleware, async (req: Request, res: Response) => {
+  try {
+    const { getCodeDb } = await import('./lib/code-nav/db.js');
+    const { claimPendingRequests } = await import('./lib/code-nav/index-requests.js');
+    const body = req.body as { machine_id?: string; limit?: number };
+    const machineId = (body.machine_id ?? '').toString().trim();
+    if (!machineId) {
+      res.status(400).json({ error: 'machine_id is required' });
+      return;
+    }
+    const limit = Math.max(1, Math.min(100, Math.floor(body.limit ?? 20)));
+    const db = getCodeDb();
+    const claimed = claimPendingRequests(machineId, limit, Date.now());
+    const slugById = new Map<string, string>();
+    const requests = claimed.map((r) => {
+      let slug = slugById.get(r.repo_id);
+      if (slug === undefined) {
+        const row = db.prepare(`SELECT slug FROM repos WHERE id=?`).get(r.repo_id) as
+          | { slug: string }
+          | undefined;
+        slug = row?.slug ?? r.repo_id;
+        slugById.set(r.repo_id, slug);
+      }
+      return {
+        id: r.id,
+        repoId: r.repo_id,
+        slug,
+        absPath: r.abs_path,
+        reason: r.reason,
+        requestedAt: r.requested_at,
+      };
+    });
+    res.json({ machineId, requests });
+  } catch (err: any) {
+    logger.error('api/code-index-requests failed', { error: err.message });
+    res.status(500).json({ error: err.message });
+  }
+});
 
 app.post('/api/code-symbol-search', apiKeyMiddleware, async (req: Request, res: Response) => {
   try {

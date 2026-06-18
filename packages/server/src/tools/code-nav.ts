@@ -21,6 +21,12 @@ import type BetterSqlite3 from 'better-sqlite3';
 import { parseFile, normalizeNewlines, sha1Hex } from '../lib/code-nav/parser.js';
 import type { ParseResult } from '../lib/code-nav/parser.js';
 import { writeVaultRegistry } from '../lib/code-nav/registry.js';
+import {
+  enqueueIndexRequestsForRepo,
+  getRepoLocality,
+  completeIndexRequests,
+  claimPendingRequests,
+} from '../lib/code-nav/index-requests.js';
 import { projectSymbolById } from '../lib/code-nav/projection.js';
 import { getCodeNavStats } from '../lib/code-nav/stats.js';
 import { config } from '../config.js';
@@ -34,6 +40,63 @@ const SLUG_RE = /^[a-z0-9][a-z0-9_-]*$/i;
 
 // In-process per-repo lock to prevent concurrent re-index of the same repo.
 const indexLocks = new Set<string>();
+
+/** Coarse human-readable age for a millisecond delta (used in staleness hints). */
+function humanizeAgeMs(ms: number): string {
+  const s = Math.max(0, Math.floor(ms / 1000));
+  if (s < 90) return `${s}s ago`;
+  const m = Math.floor(s / 60);
+  if (m < 90) return `${m}m ago`;
+  const h = Math.floor(m / 60);
+  if (h < 36) return `${h}h ago`;
+  return `${Math.floor(h / 24)}d ago`;
+}
+
+/**
+ * Build a machine-aware staleness diagnostic for a repo that turned up
+ * empty/stale, and (when the repo is indexed from another machine) enqueue a
+ * proxy re-index for the owning machine(s). The owning machine's hud-line daemon
+ * fulfills the request and pushes fresh symbols back, so the agent can retry
+ * instead of being silently misled by a stale/empty result.
+ *
+ * Returns a human-readable `hint` plus the machines a re-index was requested
+ * from (empty when the repo is local to this server, or nowhere indexed).
+ */
+function diagnoseAndRequestReindex(
+  repoId: string,
+  repoSlug: string,
+  context: string,
+): { hint: string; reindexRequested: string[] } {
+  const nowMs = Date.now();
+  const serverMachine = getMachineId();
+  const locality = getRepoLocality(repoId);
+  const remote = locality.filter((l) => l.machineId !== serverMachine);
+
+  const lastIndexedAt = locality.find((l) => l.lastIndexedAt != null)?.lastIndexedAt ?? null;
+  const freshness = lastIndexedAt ? `last indexed ${humanizeAgeMs(nowMs - lastIndexedAt)}` : 'never indexed';
+
+  if (remote.length === 0) {
+    // Indexed only on this server's machine (or nowhere) — a local re-index fixes it.
+    return {
+      hint:
+        `${context} The index for "${repoSlug}" (${freshness}) is local to this server's machine. ` +
+        'If the working tree changed, refresh with `code_index_repo` or `cortexmd index <repo-path>`, then re-query.',
+      reindexRequested: [],
+    };
+  }
+
+  const { enqueued, alreadyPending } = enqueueIndexRequestsForRepo(repoId, context, nowMs);
+  const owners = [...new Set(remote.map((l) => l.machineId))];
+  const requested = [...new Set([...enqueued, ...alreadyPending])];
+  return {
+    hint:
+      `${context} "${repoSlug}" is indexed from machine ${owners.join(', ')} (${freshness}), ` +
+      `not this server (${serverMachine}) — new or locally-modified files won't appear until that machine re-indexes. ` +
+      `A re-index has been requested from ${requested.join(', ')}; retry this query shortly. ` +
+      'To force it now, run `cortexmd index <repo-path>` on that machine.',
+    reindexRequested: requested,
+  };
+}
 
 const MAX_BODY_LINES = 200;
 
@@ -969,6 +1032,18 @@ export function registerCodeIngestRepo(server: McpServer): void {
         // 6. Mirror to vault registry.
         await writeVaultRegistry();
 
+        // 7. Close the proxy-indexing loop: fresh symbols just arrived from this
+        //    machine, so any outstanding re-index request for (repo, machine) is
+        //    fulfilled. Clearing here makes stale/empty diagnostics self-heal.
+        const clearedRequests = completeIndexRequests(repoId, machineId, now);
+        if (clearedRequests > 0) {
+          logger.info('Cleared proxy-index requests on ingest', {
+            repoId,
+            machineId,
+            cleared: clearedRequests,
+          });
+        }
+
         const total = (db
           .prepare(`SELECT COUNT(*) as c FROM files WHERE repo_id=?`)
           .get(repoId) as { c: number }).c;
@@ -1448,6 +1523,7 @@ export function registerCodeSymbolSearch(server: McpServer): void {
 
       const filters: string[] = [];
       const args: any[] = [ftsQuery];
+      let repoFilterId: string | null = null;
       if (kind) {
         filters.push('s.kind = ?');
         args.push(kind);
@@ -1455,6 +1531,7 @@ export function registerCodeSymbolSearch(server: McpServer): void {
       if (repoSlug) {
         const repo = resolveRepoBySlug(repoSlug);
         if (!repo) throw new Error(`Unknown repo slug: ${repoSlug}`);
+        repoFilterId = repo.id;
         filters.push('s.repo_id = ?');
         args.push(repo.id);
       }
@@ -1494,14 +1571,28 @@ export function registerCodeSymbolSearch(server: McpServer): void {
         score: -(r.bm as number),
       }));
 
-      const payload: { results: typeof results; hint?: string } = { results };
+      const payload: { results: typeof results; hint?: string; reindexRequested?: string[] } = {
+        results,
+      };
       if (results.length === 0 && !config.noHints) {
-        const repoLabel = repoSlug ? `repo ${repoSlug}` : 'any registered repo';
-        payload.hint =
-          `No results for query "${rawQuery}" in ${repoLabel}. ` +
-          'If the repo lives on this machine but hasn\'t been indexed yet, ' +
-          'run `cortexmd index <repo-path>` to populate the index. ' +
-          'See https://github.com/Leicas/cortexmd for installation.';
+        if (repoFilterId && repoSlug) {
+          // Repo is known — give a machine-aware diagnostic and, if it's indexed
+          // from another machine, enqueue a proxy re-index there.
+          const diag = diagnoseAndRequestReindex(
+            repoFilterId,
+            repoSlug,
+            `No results for "${rawQuery}".`,
+          );
+          payload.hint = diag.hint;
+          if (diag.reindexRequested.length > 0) payload.reindexRequested = diag.reindexRequested;
+        } else {
+          payload.hint =
+            `No results for query "${rawQuery}" in any registered repo. ` +
+            'If the repo lives on this machine but hasn\'t been indexed yet, ' +
+            'run `cortexmd index <repo-path>` to populate the index. ' +
+            'Pass `repo: <slug>` to get machine-aware staleness diagnostics and ' +
+            'auto-requested re-indexing. See https://github.com/Leicas/cortexmd.';
+        }
       }
 
       return {
@@ -1931,6 +2022,54 @@ export function registerCodeCheckStaleness(server: McpServer): void {
             text: JSON.stringify({ scanned, drifted, truncated, ...(remedy ? { remedy } : {}) }),
           },
         ],
+      };
+    }),
+  );
+}
+
+// ─────────────────────── code_index_requests_poll ───────────────────────────
+//
+// The owning-machine side of proxy indexing. The server enqueues re-index
+// requests when a code-nav query comes up stale/empty against a repo whose
+// checkout lives on another machine; that machine's long-lived hud-line daemon
+// polls here each tick, claims its pending requests, re-indexes each abs_path,
+// and pushes fresh symbols back through code_ingest_repo (which clears them).
+
+export function registerCodeIndexRequestsPoll(server: McpServer): void {
+  server.tool(
+    'code_index_requests_poll',
+    'Claim pending proxy-index requests for a machine. The owning machine\'s hud-line daemon calls this each tick to fetch re-index work that was enqueued when code-nav queries came up stale/empty against a repo checked out on that machine. Returns (and marks `claimed`) up to `limit` requests as `{requests:[{id, repoId, slug, absPath, reason, requestedAt}]}`. The daemon re-indexes each absPath and pushes via `code_ingest_repo`, which clears the request.',
+    {
+      machine_id: z.string().min(1),
+      limit: z.number().int().positive().max(100).optional().default(20),
+    },
+    wrapToolHandler('code_index_requests_poll', async (params) => {
+      const machineId = params.machine_id as string;
+      const limit = (params.limit as number | undefined) ?? 20;
+      const db = getCodeDb();
+      const claimed = claimPendingRequests(machineId, limit, Date.now());
+      const slugById = new Map<string, string>();
+      const requests = claimed.map((r) => {
+        let slug = slugById.get(r.repo_id);
+        if (slug === undefined) {
+          const row = db.prepare(`SELECT slug FROM repos WHERE id=?`).get(r.repo_id) as
+            | { slug: string }
+            | undefined;
+          slug = row?.slug ?? r.repo_id;
+          slugById.set(r.repo_id, slug);
+        }
+        return {
+          id: r.id,
+          repoId: r.repo_id,
+          slug,
+          absPath: r.abs_path,
+          reason: r.reason,
+          requestedAt: r.requested_at,
+        };
+      });
+      return {
+        _detail: `poll machine=${machineId} → ${requests.length} claimed`,
+        content: [{ type: 'text', text: JSON.stringify({ machineId, requests }) }],
       };
     }),
   );

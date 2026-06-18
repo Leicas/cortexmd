@@ -143,6 +143,34 @@ export function getCodeDb(): BetterSqlite3.Database {
     );
     CREATE INDEX IF NOT EXISTS idx_symbol_changes_repo_at
       ON symbol_changes(repo_id, captured_at DESC);
+
+    -- Proxy-indexing work queue. When a code-nav query resolves to a repo whose
+    -- only indexed checkout lives on a DIFFERENT machine than this server (the
+    -- common remote/containerized case), the query handler enqueues a request
+    -- here for the owning machine. The owning machine's long-lived hud-line
+    -- daemon polls these (via code_index_requests_poll / GET
+    -- /api/code-index-requests), re-indexes the checkout, and pushes fresh
+    -- symbols back through code_ingest_repo — which marks the request 'done'.
+    -- This closes the loop so stale/empty results self-heal instead of silently
+    -- misleading the agent. Dedup is enforced by a partial unique index so a
+    -- repo+machine has at most one outstanding (pending|claimed) request.
+    CREATE TABLE IF NOT EXISTS index_requests (
+      id            INTEGER PRIMARY KEY AUTOINCREMENT,
+      repo_id       TEXT NOT NULL,
+      machine_id    TEXT NOT NULL,
+      abs_path      TEXT NOT NULL,
+      reason        TEXT,
+      status        TEXT NOT NULL DEFAULT 'pending',
+      requested_at  INTEGER NOT NULL,
+      claimed_at    INTEGER,
+      completed_at  INTEGER,
+      FOREIGN KEY (repo_id) REFERENCES repos(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_index_requests_machine_status
+      ON index_requests(machine_id, status);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_index_requests_outstanding
+      ON index_requests(repo_id, machine_id)
+      WHERE status IN ('pending', 'claimed');
   `);
 
   // Guarded ALTER for package_name (cross-repo workspace resolution without fs).

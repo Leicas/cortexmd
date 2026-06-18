@@ -70,7 +70,7 @@ fn dispatch(cli: Cli) -> Result<()> {
         Some(Command::Discover(args)) => inspect::cmd_discover(args),
         Some(Command::Scan(args)) => inspect::cmd_scan(args, run_index),
         Some(Command::Gain(args)) => inspect::cmd_gain(args),
-        Some(Command::HudLine(args)) => inspect::cmd_hud_line(args),
+        Some(Command::HudLine(args)) => inspect::cmd_hud_line(args, run_index),
         Some(Command::Recall(args)) => inspect::cmd_recall(args),
         Some(Command::StoreMemory(args)) => inspect::cmd_store_memory(args),
         Some(Command::RepoList(args)) => inspect::cmd_repo_list(args),

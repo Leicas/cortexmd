@@ -39,6 +39,16 @@ code-nav and read whole files:
 Reaching for Read/Grep because the index *might* be stale defeats the point. Refresh it
 (it's live and cheap) and stay on code-nav.
 
+### Remote server / "indexed on another machine"
+
+When the server is remote (e.g. containerized) and the source checkout lives on a
+different machine, an empty `code_symbol_search(query, repo: <slug>)` returns a
+**machine-aware hint** naming the machine that owns the index and how stale it is,
+and **auto-requests a re-index** from that machine (`reindexRequested: [...]`). That
+machine's `hud-line` daemon fulfills the request in the background and pushes fresh
+symbols, so the fix is to **retry the query shortly** — not to fall back to Read/Grep.
+To force it immediately, run `cortexmd index <repo-path>` on the owning machine.
+
 ## Memory & knowledge graph
 
 - `memory_wakeup(agentName, preset)` — boot context (`preset: tiny|standard|full`)

@@ -1,6 +1,8 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { hybridSearch, getDocMeta } from '../lib/search.js';
+import { getInboundLinkCounts } from '../lib/graph.js';
+import { centralityBoost } from '../lib/recall-signals.js';
 import { readNote, writeNote } from '../lib/vault.js';
 import { parseFrontmatter, stringifyFrontmatter } from '../lib/frontmatter.js';
 import { wrapToolHandler } from '../lib/tool-wrapper.js';
@@ -238,6 +240,11 @@ export function register(server: McpServer): void {
       // fetched from disk only for the final survivors when includeContent.
       const docMeta = getDocMeta();
 
+      // Graph-centrality signal: inbound [[wikilink]] counts from the cached
+      // link graph (null until the graph is built — then the boost is a no-op).
+      // Computed once per recall, not per result.
+      const inboundCounts = config.recallCentralityWeight > 0 ? getInboundLinkCounts() : null;
+
       for (const result of searchResults) {
         const meta = docMeta.get(result.path);
         if (!meta) continue;
@@ -323,7 +330,12 @@ export function register(server: McpServer): void {
           }
         }
 
-        const finalScore = result.score * tempBoost * impBoost * relBoost * recencyBoost * contextBoost * validityPenalty;
+        // Graph-centrality boost: well-connected notes outrank equal orphans.
+        const centBoost = inboundCounts
+          ? centralityBoost(inboundCounts.get(result.path), config.recallCentralityWeight)
+          : 1.0;
+
+        const finalScore = result.score * tempBoost * impBoost * relBoost * recencyBoost * contextBoost * validityPenalty * centBoost;
 
         scored.push({
           path: result.path,

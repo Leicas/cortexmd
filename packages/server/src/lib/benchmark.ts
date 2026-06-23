@@ -414,6 +414,61 @@ export async function runQualityBenchmark(
   };
 }
 
+// ── Rescue@k (contradiction-resilience metric) ───────────────────────────
+//
+// LongMemEval/iai-pme-style "Rescue@k": after a fact is contradicted by a
+// newer memory, does the *current* (superseding) fact still rank in the top-k
+// while the superseded one is demoted? A naive vector store fails this — the
+// stale fact keeps its high cosine score. cortexmd's contradiction→Bayesian-
+// validity pipeline (memory_store bumps the older note's β; memory_recall
+// quarantines/penalizes by validity) is what should make this pass.
+//
+// `computeRescueAtK` is a pure scorer over an already-ranked result list, so it
+// can be driven both by a live end-to-end run and by a deterministic unit test
+// of the ranking pipeline.
+
+export interface RescueCase {
+  /** Path of the current/superseding memory that SHOULD rank well. */
+  currentPath: string;
+  /** Path of the superseded memory that SHOULD be demoted/excluded. */
+  supersededPath: string;
+  /** Ranked recall result paths (best-first) after contradiction. */
+  ranked: string[];
+}
+
+export interface RescueResult {
+  /** Fraction of cases where the current fact ranks within top-k. */
+  rescueAtK: number;
+  /** Fraction of cases where the superseded fact was demoted below the current one (or dropped). */
+  supersededDemoted: number;
+  cases: number;
+}
+
+/**
+ * Score a set of rescue cases. A case "rescues" when the current fact is in the
+ * top-k. It additionally counts as "demoted" when the superseded fact ranks
+ * strictly below the current one (or is absent from the results entirely —
+ * e.g. quarantined).
+ */
+export function computeRescueAtK(cases: RescueCase[], k = 10): RescueResult {
+  if (cases.length === 0) return { rescueAtK: 0, supersededDemoted: 0, cases: 0 };
+  let rescued = 0;
+  let demoted = 0;
+  for (const c of cases) {
+    const curIdx = c.ranked.indexOf(c.currentPath);
+    const supIdx = c.ranked.indexOf(c.supersededPath);
+    if (curIdx >= 0 && curIdx < k) rescued++;
+    // Superseded is demoted if dropped (supIdx < 0) or ranked below current.
+    if (curIdx >= 0 && (supIdx < 0 || supIdx > curIdx)) demoted++;
+  }
+  const n = cases.length;
+  return {
+    rescueAtK: Math.round((rescued / n) * 10000) / 10000,
+    supersededDemoted: Math.round((demoted / n) * 10000) / 10000,
+    cases: n,
+  };
+}
+
 /**
  * Save current benchmark results as ground truth.
  * Takes the top-K retrieved paths from each query and writes them

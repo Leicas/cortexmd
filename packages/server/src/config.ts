@@ -301,6 +301,12 @@ export const config = {
   // filters in memory_recall.
   memoryValidity: process.env.MEMORY_VALIDITY !== 'false',
 
+  // Graph-centrality recall signal. memory_recall multiplies each result by
+  // (1 + weight × normalizedInboundLinks), so a well-connected note (many
+  // inbound [[wikilinks]]) ranks above an otherwise-equal orphan. Conservative
+  // default; set RECALL_CENTRALITY_WEIGHT=0 to disable (ranking unchanged).
+  recallCentralityWeight: parseFloat(process.env.RECALL_CENTRALITY_WEIGHT ?? '0.15'),
+
   // Tool profile: tiny | nav | core | lean | full. Trims the registered tool
   // surface so reduced clients pay fewer manifest tokens. Tools outside the
   // profile remain registered (and discoverable via `tool_search`) but are

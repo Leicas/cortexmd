@@ -68,6 +68,8 @@ export interface RecallSignalBreakdown {
   stale: boolean;
   /** True when the memory is linked to a relatedTo anchor. */
   related: boolean;
+  /** Co-recall spreading-activation boost fraction (e.g. 0.12 = +12%), if any. */
+  coRecall?: number;
   /** One-line "why this surfaced" rationale. */
   reason: string;
 }

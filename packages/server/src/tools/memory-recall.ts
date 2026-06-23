@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { hybridSearch, getDocMeta } from '../lib/search.js';
 import { getInboundLinkCounts } from '../lib/graph.js';
 import { centralityBoost, explainRecall, type RecallSignalBreakdown } from '../lib/recall-signals.js';
+import { coRecallBoosts, recordCoRecall } from '../lib/co-recall.js';
 import { readNote, writeNote } from '../lib/vault.js';
 import { parseFrontmatter, stringifyFrontmatter } from '../lib/frontmatter.js';
 import { wrapToolHandler } from '../lib/tool-wrapper.js';
@@ -375,8 +376,26 @@ export function register(server: McpServer): void {
         });
       }
 
-      // Sort by score descending, then MMR-select the top `limit` for diversity
+      // Sort by base score, then apply co-recall spreading activation: the
+      // top seeds activate their learned associates (memories historically
+      // recalled alongside them), boosting coherent candidates before the
+      // diversity pass. Then MMR-select the top `limit`.
       scored.sort((a, b) => b.score - a.score);
+      const seeds = scored.slice(0, 5).map((s) => s.path);
+      const coBoosts = coRecallBoosts(seeds);
+      if (coBoosts.size > 0) {
+        for (const s of scored) {
+          const boost = coBoosts.get(s.path);
+          if (boost && boost > 1) {
+            s.score *= boost;
+            if (s.signals) {
+              s.signals.coRecall = Math.round((boost - 1) * 1000) / 1000;
+              s.signals.reason += '; co-recalled with top matches';
+            }
+          }
+        }
+        scored.sort((a, b) => b.score - a.score);
+      }
       let results = mmrSelect(scored, limit);
 
       // Fetch full content from disk only for the final survivors, in parallel,
@@ -427,6 +446,12 @@ export function register(server: McpServer): void {
         }
         results = budgetResults;
       }
+
+      // Hebbian co-recall: the memories returned together strengthen their
+      // mutual association, so future recalls of any one can surface the
+      // others via spreading activation. Best-effort, persisted in the brain
+      // data dir (never mutates user notes).
+      recordCoRecall(results.map((r) => r.path));
 
       // Task 2: Fire-and-forget access tracking for top results.
       // Also bumps Bayesian validity α (memory was useful) when enabled.

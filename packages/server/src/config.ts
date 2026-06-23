@@ -307,6 +307,16 @@ export const config = {
   // default; set RECALL_CENTRALITY_WEIGHT=0 to disable (ranking unchanged).
   recallCentralityWeight: parseFloat(process.env.RECALL_CENTRALITY_WEIGHT ?? '0.15'),
 
+  // Co-recall associative memory (Hebbian / HippoRAG-style). memory_recall
+  // accumulates a decaying association graph from which memories are recalled
+  // together, then boosts candidates strongly associated with the current top
+  // results (spreading activation: boost = 1 + weight × associationStrength).
+  // The vault's own usage history teaches it which memories belong together.
+  //   CO_RECALL=false        — disable recording + spreading activation
+  //   CO_RECALL_WEIGHT=0.2   — spreading-activation boost weight (0 disables boost only)
+  coRecallEnabled: process.env.CO_RECALL !== 'false',
+  coRecallWeight: parseFloat(process.env.CO_RECALL_WEIGHT ?? '0.2'),
+
   // Tool profile: tiny | nav | core | lean | full. Trims the registered tool
   // surface so reduced clients pay fewer manifest tokens. Tools outside the
   // profile remain registered (and discoverable via `tool_search`) but are

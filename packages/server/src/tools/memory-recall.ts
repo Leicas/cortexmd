@@ -2,7 +2,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { hybridSearch, getDocMeta } from '../lib/search.js';
 import { getInboundLinkCounts } from '../lib/graph.js';
-import { centralityBoost } from '../lib/recall-signals.js';
+import { centralityBoost, explainRecall, type RecallSignalBreakdown } from '../lib/recall-signals.js';
 import { readNote, writeNote } from '../lib/vault.js';
 import { parseFrontmatter, stringifyFrontmatter } from '../lib/frontmatter.js';
 import { wrapToolHandler } from '../lib/tool-wrapper.js';
@@ -155,6 +155,11 @@ export function register(server: McpServer): void {
         .number()
         .optional()
         .describe("Maximum approximate token budget for returned content (1 token ≈ 4 chars). Results are truncated to fit within budget."),
+      explain: z
+        .boolean()
+        .optional()
+        .default(false)
+        .describe("Attach a per-result `signals` breakdown (why it surfaced: match type, temperature, centrality, recency, validity/staleness) plus a one-line reason. Off by default to keep responses compact."),
     },
     wrapToolHandler("memory_recall", async (params) => {
       const query = sanitizeQuery(params.query as string);
@@ -169,6 +174,7 @@ export function register(server: McpServer): void {
       const includeContent = (params.includeContent as boolean | undefined) ?? false;
       const contextSnippet = params.contextSnippet as string | undefined;
       const maxTokens = params.maxTokens as number | undefined;
+      const explain = (params.explain as boolean | undefined) ?? false;
 
       // Extract context keywords for boosting
       const STOPWORDS = new Set([
@@ -229,6 +235,7 @@ export function register(server: McpServer): void {
         fusedScore: number;
         snippet: string;
         content?: string;
+        signals?: RecallSignalBreakdown;
       }
 
       const scored: ScoredResult[] = [];
@@ -274,13 +281,16 @@ export function register(server: McpServer): void {
 
         // Bayesian validity: filter quarantined, penalize stale.
         let validityPenalty = 1.0;
+        let validityScore: number | undefined;
+        let validityStale = false;
         if (config.memoryValidity) {
           const v = computeValidity({
             validity_alpha: meta.validity_alpha,
             validity_beta: meta.validity_beta,
           });
           if (v.quarantined) continue;
-          if (v.stale) validityPenalty = VALIDITY_STALE_RANK_PENALTY;
+          validityScore = v.validity;
+          if (v.stale) { validityPenalty = VALIDITY_STALE_RANK_PENALTY; validityStale = true; }
         }
 
         // Heat boost: use the granular numeric heat_score (0-16) when present,
@@ -331,8 +341,9 @@ export function register(server: McpServer): void {
         }
 
         // Graph-centrality boost: well-connected notes outrank equal orphans.
+        const inboundLinks = inboundCounts?.get(result.path) ?? 0;
         const centBoost = inboundCounts
-          ? centralityBoost(inboundCounts.get(result.path), config.recallCentralityWeight)
+          ? centralityBoost(inboundLinks, config.recallCentralityWeight)
           : 1.0;
 
         const finalScore = result.score * tempBoost * impBoost * relBoost * recencyBoost * contextBoost * validityPenalty * centBoost;
@@ -348,6 +359,19 @@ export function register(server: McpServer): void {
           semanticScore: result.semanticScore,
           fusedScore: result.fusedScore,
           snippet: body.slice(0, 200),
+          signals: explain
+            ? explainRecall({
+                lexicalScore: result.lexicalScore,
+                semanticScore: result.semanticScore,
+                temperature: noteTemperature,
+                heatScore,
+                recency: recencyBoost,
+                inboundLinks,
+                validity: validityScore,
+                stale: validityStale,
+                related: relBoost > 1,
+              })
+            : undefined,
         });
       }
 
@@ -434,7 +458,8 @@ export function register(server: McpServer): void {
 
       // Human-readable summary first, then structured JSON
       const summary = `Found ${results.length} memories:\n` +
-        results.map((r, i) => `${i + 1}. [${r.temperature}] ${r.title} (${r.category}, score: ${r.score.toFixed(1)})`).join('\n');
+        results.map((r, i) => `${i + 1}. [${r.temperature}] ${r.title} (${r.category}, score: ${r.score.toFixed(1)})` +
+          (r.signals ? ` — ${r.signals.reason}` : '')).join('\n');
 
       const recalledPaths = results.map(r => r.path);
       const detailStr = `q="${query}" → ${results.length} memories` +

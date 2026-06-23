@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { normalizeCentrality, centralityBoost, CENTRALITY_SATURATION } from '../recall-signals.js';
+import { normalizeCentrality, centralityBoost, CENTRALITY_SATURATION, explainRecall } from '../recall-signals.js';
 import { computeRescueAtK, type RescueCase } from '../benchmark.js';
 import {
   computeValidity,
@@ -32,6 +32,42 @@ describe('centrality signal', () => {
     const orphan = 10 * centralityBoost(0, w);
     const hub = 10 * centralityBoost(8, w);
     expect(hub).toBeGreaterThan(orphan);
+  });
+});
+
+describe('explainRecall', () => {
+  const base = {
+    lexicalScore: 0.1, semanticScore: 0.1, temperature: 'warm',
+    heatScore: 6, recency: 0.8, inboundLinks: 3, validity: 0.67,
+    stale: false, related: false,
+  };
+
+  it('classifies the retrieval arm', () => {
+    expect(explainRecall({ ...base, lexicalScore: 0.1, semanticScore: 0.1 }).match).toBe('hybrid');
+    expect(explainRecall({ ...base, lexicalScore: 0, semanticScore: 0.1 }).match).toBe('semantic');
+    expect(explainRecall({ ...base, lexicalScore: 0.1, semanticScore: 0 }).match).toBe('lexical');
+  });
+
+  it('builds a rationale from the active signals', () => {
+    const r = explainRecall(base);
+    expect(r.reason).toContain('lexical+semantic match');
+    expect(r.reason).toContain('warm');
+    expect(r.reason).toContain('central (3 links)');
+    expect(r.reason).toContain('recent');
+    expect(r.inboundLinks).toBe(3);
+    expect(r.validity).toBe(0.67);
+  });
+
+  it('flags staleness and singular link wording', () => {
+    const r = explainRecall({ ...base, stale: true, inboundLinks: 1, recency: 0.2 });
+    expect(r.reason).toContain('central (1 link)');
+    expect(r.reason).toContain('stale (contradicted)');
+    expect(r.reason).not.toContain('recent');
+    expect(r.stale).toBe(true);
+  });
+
+  it('omits validity when tracking is off', () => {
+    expect(explainRecall({ ...base, validity: undefined }).validity).toBeUndefined();
   });
 });
 

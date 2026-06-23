@@ -44,3 +44,71 @@ export function centralityBoost(
   if (!weight || weight <= 0) return 1.0;
   return 1 + weight * normalizeCentrality(inboundLinks ?? 0);
 }
+
+// ── Recall explainability ─────────────────────────────────────────────────
+//
+// A consuming agent gets far more from recall when it can tell *why* a memory
+// surfaced — a hot, canonical, well-connected fact deserves more trust than a
+// stale, contradicted observation that merely matched lexically. `explainRecall`
+// turns the per-result scoring inputs into a compact, human-readable breakdown
+// (opt-in, so it never inflates the default response).
+
+export interface RecallSignalBreakdown {
+  /** Whether the hit came from semantic, lexical, or both retrieval arms. */
+  match: 'semantic' | 'lexical' | 'hybrid';
+  temperature: string;
+  heatScore?: number;
+  /** Inbound [[wikilink]] count (graph centrality). */
+  inboundLinks: number;
+  /** Recency boost in 0..1 (1 = just accessed). */
+  recency: number;
+  /** Bayesian validity in 0..1 (undefined when validity tracking is off). */
+  validity?: number;
+  /** True when the memory is contradicted/stale (validity-penalised). */
+  stale: boolean;
+  /** True when the memory is linked to a relatedTo anchor. */
+  related: boolean;
+  /** One-line "why this surfaced" rationale. */
+  reason: string;
+}
+
+export interface RecallSignalInputs {
+  lexicalScore: number;
+  semanticScore: number;
+  temperature: string;
+  heatScore?: number;
+  recency: number;
+  inboundLinks: number;
+  validity?: number;
+  stale: boolean;
+  related: boolean;
+}
+
+export function explainRecall(x: RecallSignalInputs): RecallSignalBreakdown {
+  const match: RecallSignalBreakdown['match'] =
+    x.lexicalScore > 0 && x.semanticScore > 0
+      ? 'hybrid'
+      : x.semanticScore > 0
+        ? 'semantic'
+        : 'lexical';
+
+  const parts: string[] = [];
+  parts.push(match === 'hybrid' ? 'lexical+semantic match' : `${match} match`);
+  if (x.temperature === 'hot' || x.temperature === 'warm') parts.push(x.temperature);
+  if (x.related) parts.push('linked to context');
+  if (x.inboundLinks > 0) parts.push(`central (${x.inboundLinks} link${x.inboundLinks === 1 ? '' : 's'})`);
+  if (x.recency >= 0.5) parts.push('recent');
+  if (x.stale) parts.push('stale (contradicted)');
+
+  return {
+    match,
+    temperature: x.temperature,
+    heatScore: x.heatScore,
+    inboundLinks: x.inboundLinks,
+    recency: Math.round(x.recency * 100) / 100,
+    validity: x.validity !== undefined ? Math.round(x.validity * 100) / 100 : undefined,
+    stale: x.stale,
+    related: x.related,
+    reason: parts.join('; '),
+  };
+}

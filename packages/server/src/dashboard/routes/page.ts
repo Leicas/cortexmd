@@ -73,7 +73,14 @@ export function registerPageRoutes(router: Router): void {
       return;
     }
     res.setHeader('Content-Type', asset.contentType);
-    res.setHeader('Cache-Control', 'public, max-age=3600');
+    // `no-cache` = the browser MAY store the asset but MUST revalidate with the
+    // server before reuse. Express auto-generates an ETag for the body and
+    // returns 304 when unchanged, so this stays bandwidth-cheap while
+    // guaranteeing a fresh module after every deploy. A hard `max-age` here was
+    // the bug: the per-tab ES modules (e.g. intelligence.js) are statically
+    // imported at bare URLs that never carry the `?v=` cache-bust token, so a
+    // long TTL pinned the *old* JS even after the server HTML had updated.
+    res.setHeader('Cache-Control', 'no-cache');
     res.send(asset.body);
   });
 

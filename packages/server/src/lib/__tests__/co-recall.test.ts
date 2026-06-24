@@ -43,6 +43,26 @@ describe('CoRecallGraph.record', () => {
     expect(assoc.length).toBe(3);
     expect(assoc.map((a) => a.path)).toContain('strong.md'); // strongest survives
   });
+
+  it('prunes symmetrically, keeping the graph undirected', () => {
+    const g = new CoRecallGraph({ maxNeighbors: 3 });
+    g.record(['hub.md', 'strong.md']);
+    g.record(['hub.md', 'strong.md']); // strong weight 2 — always survives
+    for (const leaf of ['l1.md', 'l2.md', 'l3.md', 'l4.md']) g.record(['hub.md', leaf]);
+
+    const survivors = g.getAssociates('hub.md', 99).map((a) => a.path);
+    // Every leaf hub dropped must also drop its reverse edge back to hub —
+    // otherwise the graph goes asymmetric and stats() reports a fractional count.
+    for (const leaf of ['l1.md', 'l2.md', 'l3.md', 'l4.md']) {
+      const back = g.getAssociates(leaf).map((a) => a.path);
+      if (survivors.includes(leaf)) expect(back).toEqual(['hub.md']);
+      else expect(back).toEqual([]); // reverse edge pruned with the forward one
+    }
+    // edges is an exact integer == one per surviving unordered pair (all via hub).
+    const s = g.stats();
+    expect(Number.isInteger(s.edges)).toBe(true);
+    expect(s.edges).toBe(survivors.length);
+  });
 });
 
 describe('CoRecallGraph.spreadingBoosts', () => {

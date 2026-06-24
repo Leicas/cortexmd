@@ -11,6 +11,7 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
 
 import { initEmbeddings, persistIndex as persistEmbeddingIndex, isEmbeddingsReady, buildFullIndex, syncIndexIncremental, wasPersistedIndexLoaded } from './lib/embeddings.js';
+import { flushCoRecall } from './lib/co-recall.js';
 import { config } from './config.js';
 import { apiKeyMiddleware, dashboardAuthMiddleware, SESSION_COOKIE_NAME } from './auth.js';
 import { mintDashboardSession } from './oauth.js';
@@ -2387,6 +2388,11 @@ async function main(): Promise<void> {
     // Flush metrics to disk before shutting down
     persistMetricsToDisk(config.dataDir);
     stopMetricsSampling();
+
+    // Flush any pending co-recall associations — the persist timer is unref()'d,
+    // so a graceful restart inside its 5s debounce window would otherwise drop
+    // the most recent batch of learned associations.
+    flushCoRecall();
 
     if (sessionPersistInterval) clearInterval(sessionPersistInterval);
     if (sessionCleanupInterval) clearInterval(sessionCleanupInterval);

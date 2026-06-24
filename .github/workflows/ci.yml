@@ -15,7 +15,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        # windows-2022 (not windows-latest): the server depends on the native
+        # hnswlib-node addon, and the windows-latest image ships Visual Studio
+        # 18, which the npm-bundled node-gyp can't detect (it only knows VS
+        # 2017–2022), breaking `node-gyp rebuild`. Pin to the VS2022 image.
+        os: [ubuntu-latest, windows-2022]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4

@@ -517,6 +517,16 @@ export default {
       kgPredEl.innerHTML = emptyHtml('Graph empty', 'Knowledge graph empty or not enabled (set KG_ENABLED=true).');
     }
 
+    // ── Band F2 — Recall Engine (multi-signal recall fusion, v1.10.0) ────────
+    var re = data.recallIntelligence || {};
+    var reCo = re.coRecall || { nodes: 0, edges: 0 };
+    setLive('reEdges', fmt(reCo.edges || 0));
+    setLive('reNodes', fmt(reCo.nodes || 0));
+    if ($('reCentralityW')) $('reCentralityW').textContent = re.centralityWeight != null ? (+re.centralityWeight).toFixed(2) : '—';
+    if ($('reCoRecallW')) $('reCoRecallW').textContent = re.coRecallEnabled === false ? 'off' : (re.coRecallWeight != null ? (+re.coRecallWeight).toFixed(2) : '—');
+    var rePill = $('recallEnginePill');
+    if (rePill) rePill.innerHTML = pillHtml(re.coRecallEnabled === false ? 'muted' : 'ok', re.coRecallEnabled === false ? 'co-recall off' : 'active');
+
     // ── Band G — Dream History (overlaid sparklines) ─────────────────────────
     if (dh.length >= 2) {
       ctx.charts.drawMulti('chartDreamHealth', [

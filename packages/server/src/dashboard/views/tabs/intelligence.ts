@@ -190,6 +190,37 @@ export function renderIntelligenceTab(): string {
     </div>
   </div>`;
 
+  // ── Band 4.5 — RECALL ENGINE: multi-signal recall fusion (v1.10.0) ─────────
+  const recallEngine = `
+  <div class="grid">
+    <div class="col-12 card">
+      ${sectionHead('Recall Engine', `<span id="recallEnginePill"></span>`)}
+      <div class="card-sub" style="margin-top:0;margin-bottom:.75rem">Multi-signal recall fusion — graph-centrality boost, Hebbian co-recall associations (spreading activation), and per-result explainability.</div>
+      <div class="grid" style="grid-template-columns:repeat(4,1fr);margin-bottom:0">
+        <div>
+          <div class="card-label">Co-recall Links</div>
+          <div class="card-value card-value--xl" id="reEdges">0</div>
+          <div class="card-sub" style="margin-top:0">learned associations</div>
+        </div>
+        <div>
+          <div class="card-label">Associated Memories</div>
+          <div class="card-value card-value--xl" id="reNodes">0</div>
+          <div class="card-sub" style="margin-top:0">notes in the graph</div>
+        </div>
+        <div>
+          <div class="card-label">Centrality Weight</div>
+          <div class="card-value card-value--xl" id="reCentralityW">—</div>
+          <div class="card-sub" style="margin-top:0">graph-hub boost</div>
+        </div>
+        <div>
+          <div class="card-label">Co-recall Weight</div>
+          <div class="card-value card-value--xl" id="reCoRecallW">—</div>
+          <div class="card-sub" style="margin-top:0">spreading activation</div>
+        </div>
+      </div>
+    </div>
+  </div>`;
+
   // ── Band 5 — HISTORY & AGENTS: collapsed disclosure, col-7 / col-5 ─────────
   const historyAgents = `
   <details class="section">
@@ -226,5 +257,5 @@ export function renderIntelligenceTab(): string {
     </div>
   </details>`;
 
-  return vitalsKpis + soWhat + vitalsGauge + dreamEngine + findings + structure + historyAgents;
+  return vitalsKpis + soWhat + vitalsGauge + dreamEngine + findings + structure + recallEngine + historyAgents;
 }

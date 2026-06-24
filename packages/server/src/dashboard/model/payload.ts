@@ -20,6 +20,7 @@ import { isKgInitialized, kgStats } from '../../lib/knowledge-graph.js';
 import { listEntities } from '../../lib/entity-registry.js';
 import { listAgents } from '../../lib/journal.js';
 import { computeHealth as computeDreamHealth } from '../../lib/dream-engine.js';
+import { getCoRecallStats } from '../../lib/co-recall.js';
 import { config } from '../../config.js';
 import { logger } from '../../lib/logger.js';
 import { computeHealthScore } from './health.js';
@@ -218,6 +219,16 @@ export function buildSsePayload(): Record<string, unknown> {
     }
     payload.entityStats = { tierCounts, typeCounts, total: entities.length };
   } catch { /* non-critical */ }
+
+  // Recall engine — multi-signal recall fusion stats (v1.10.0): the learned
+  // co-recall association graph + the active signal weights, so the dashboard
+  // surfaces how memory_recall ranks beyond plain lexical/semantic match.
+  payload.recallIntelligence = {
+    coRecall: getCoRecallStats(),
+    centralityWeight: config.recallCentralityWeight,
+    coRecallEnabled: config.coRecallEnabled,
+    coRecallWeight: config.coRecallWeight,
+  };
 
   // Derived insight signals (errorRatePct, rpmTrend, healthTrend, …) — computed
   // once per tick over the already-capped arrays. Attached under `derived` so

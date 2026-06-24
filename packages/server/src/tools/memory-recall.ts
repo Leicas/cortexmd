@@ -1,6 +1,9 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { hybridSearch, getDocMeta } from '../lib/search.js';
+import { getInboundLinkCounts } from '../lib/graph.js';
+import { centralityBoost, explainRecall, type RecallSignalBreakdown } from '../lib/recall-signals.js';
+import { coRecallBoosts, recordCoRecall } from '../lib/co-recall.js';
 import { readNote, writeNote } from '../lib/vault.js';
 import { parseFrontmatter, stringifyFrontmatter } from '../lib/frontmatter.js';
 import { wrapToolHandler } from '../lib/tool-wrapper.js';
@@ -153,6 +156,11 @@ export function register(server: McpServer): void {
         .number()
         .optional()
         .describe("Maximum approximate token budget for returned content (1 token ≈ 4 chars). Results are truncated to fit within budget."),
+      explain: z
+        .boolean()
+        .optional()
+        .default(false)
+        .describe("Attach a per-result `signals` breakdown (why it surfaced: match type, temperature, centrality, recency, validity/staleness) plus a one-line reason. Off by default to keep responses compact."),
     },
     wrapToolHandler("memory_recall", async (params) => {
       const query = sanitizeQuery(params.query as string);
@@ -167,6 +175,7 @@ export function register(server: McpServer): void {
       const includeContent = (params.includeContent as boolean | undefined) ?? false;
       const contextSnippet = params.contextSnippet as string | undefined;
       const maxTokens = params.maxTokens as number | undefined;
+      const explain = (params.explain as boolean | undefined) ?? false;
 
       // Extract context keywords for boosting
       const STOPWORDS = new Set([
@@ -227,6 +236,7 @@ export function register(server: McpServer): void {
         fusedScore: number;
         snippet: string;
         content?: string;
+        signals?: RecallSignalBreakdown;
       }
 
       const scored: ScoredResult[] = [];
@@ -237,6 +247,11 @@ export function register(server: McpServer): void {
       // index time — so the common path does ZERO disk reads. Full content is
       // fetched from disk only for the final survivors when includeContent.
       const docMeta = getDocMeta();
+
+      // Graph-centrality signal: inbound [[wikilink]] counts from the cached
+      // link graph (null until the graph is built — then the boost is a no-op).
+      // Computed once per recall, not per result.
+      const inboundCounts = config.recallCentralityWeight > 0 ? getInboundLinkCounts() : null;
 
       for (const result of searchResults) {
         const meta = docMeta.get(result.path);
@@ -267,13 +282,16 @@ export function register(server: McpServer): void {
 
         // Bayesian validity: filter quarantined, penalize stale.
         let validityPenalty = 1.0;
+        let validityScore: number | undefined;
+        let validityStale = false;
         if (config.memoryValidity) {
           const v = computeValidity({
             validity_alpha: meta.validity_alpha,
             validity_beta: meta.validity_beta,
           });
           if (v.quarantined) continue;
-          if (v.stale) validityPenalty = VALIDITY_STALE_RANK_PENALTY;
+          validityScore = v.validity;
+          if (v.stale) { validityPenalty = VALIDITY_STALE_RANK_PENALTY; validityStale = true; }
         }
 
         // Heat boost: use the granular numeric heat_score (0-16) when present,
@@ -323,7 +341,13 @@ export function register(server: McpServer): void {
           }
         }
 
-        const finalScore = result.score * tempBoost * impBoost * relBoost * recencyBoost * contextBoost * validityPenalty;
+        // Graph-centrality boost: well-connected notes outrank equal orphans.
+        const inboundLinks = inboundCounts?.get(result.path) ?? 0;
+        const centBoost = inboundCounts
+          ? centralityBoost(inboundLinks, config.recallCentralityWeight)
+          : 1.0;
+
+        const finalScore = result.score * tempBoost * impBoost * relBoost * recencyBoost * contextBoost * validityPenalty * centBoost;
 
         scored.push({
           path: result.path,
@@ -336,11 +360,42 @@ export function register(server: McpServer): void {
           semanticScore: result.semanticScore,
           fusedScore: result.fusedScore,
           snippet: body.slice(0, 200),
+          signals: explain
+            ? explainRecall({
+                lexicalScore: result.lexicalScore,
+                semanticScore: result.semanticScore,
+                temperature: noteTemperature,
+                heatScore,
+                recency: recencyBoost,
+                inboundLinks,
+                validity: validityScore,
+                stale: validityStale,
+                related: relBoost > 1,
+              })
+            : undefined,
         });
       }
 
-      // Sort by score descending, then MMR-select the top `limit` for diversity
+      // Sort by base score, then apply co-recall spreading activation: the
+      // top seeds activate their learned associates (memories historically
+      // recalled alongside them), boosting coherent candidates before the
+      // diversity pass. Then MMR-select the top `limit`.
       scored.sort((a, b) => b.score - a.score);
+      const seeds = scored.slice(0, 5).map((s) => s.path);
+      const coBoosts = coRecallBoosts(seeds);
+      if (coBoosts.size > 0) {
+        for (const s of scored) {
+          const boost = coBoosts.get(s.path);
+          if (boost && boost > 1) {
+            s.score *= boost;
+            if (s.signals) {
+              s.signals.coRecall = Math.round((boost - 1) * 1000) / 1000;
+              s.signals.reason += '; co-recalled with top matches';
+            }
+          }
+        }
+        scored.sort((a, b) => b.score - a.score);
+      }
       let results = mmrSelect(scored, limit);
 
       // Fetch full content from disk only for the final survivors, in parallel,
@@ -392,6 +447,12 @@ export function register(server: McpServer): void {
         results = budgetResults;
       }
 
+      // Hebbian co-recall: the memories returned together strengthen their
+      // mutual association, so future recalls of any one can surface the
+      // others via spreading activation. Best-effort, persisted in the brain
+      // data dir (never mutates user notes).
+      recordCoRecall(results.map((r) => r.path));
+
       // Task 2: Fire-and-forget access tracking for top results.
       // Also bumps Bayesian validity α (memory was useful) when enabled.
       const today = new Date().toISOString().slice(0, 10);
@@ -422,7 +483,8 @@ export function register(server: McpServer): void {
 
       // Human-readable summary first, then structured JSON
       const summary = `Found ${results.length} memories:\n` +
-        results.map((r, i) => `${i + 1}. [${r.temperature}] ${r.title} (${r.category}, score: ${r.score.toFixed(1)})`).join('\n');
+        results.map((r, i) => `${i + 1}. [${r.temperature}] ${r.title} (${r.category}, score: ${r.score.toFixed(1)})` +
+          (r.signals ? ` — ${r.signals.reason}` : '')).join('\n');
 
       const recalledPaths = results.map(r => r.path);
       const detailStr = `q="${query}" → ${results.length} memories` +

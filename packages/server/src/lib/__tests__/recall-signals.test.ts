@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { normalizeCentrality, centralityBoost, CENTRALITY_SATURATION, explainRecall } from '../recall-signals.js';
-import { computeRescueAtK, type RescueCase } from '../benchmark.js';
+import { computeRescueAtK, runRescueBenchmark, type RescueCase } from '../benchmark.js';
 import {
   computeValidity,
   VALIDITY_PRIOR_ALPHA,
@@ -144,5 +144,20 @@ describe('Rescue@10 end-to-end ranking simulation', () => {
     const cases: RescueCase[] = [{ currentPath: 'current.md', supersededPath: 'x', ranked }];
     expect(computeRescueAtK(cases, 3).rescueAtK).toBe(0); // outside top-3
     expect(computeRescueAtK(cases, 10).rescueAtK).toBe(1); // inside top-10
+  });
+
+  // Guards the number published in docs/BENCHMARKS.md and surfaced on the
+  // dashboard. If the validity constants change such that Rescue@10 < 1.000,
+  // this fails — the published claim can never silently drift.
+  it('runRescueBenchmark publishes Rescue@10 = 1.000 over canonical scenarios', () => {
+    const r = runRescueBenchmark();
+    expect(r.k).toBe(10);
+    expect(r.cases).toBe(2);
+    expect(r.rescueAtK).toBe(1);
+    expect(r.supersededDemoted).toBe(1);
+    expect(r.scenarios.map((s) => s.name)).toEqual([
+      'single-contradiction',
+      'repeated-contradiction',
+    ]);
   });
 });

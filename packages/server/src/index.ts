@@ -2356,13 +2356,17 @@ async function main(): Promise<void> {
   }
 
   // Run retrieval benchmark (non-blocking)
-  import('./lib/benchmark.js').then(async ({ runBenchmark }) => {
+  import('./lib/benchmark.js').then(async ({ runBenchmark, runRescueBenchmark }) => {
     const summary = await runBenchmark();
-    const { setBenchmarkResults } = await import('./lib/metrics.js');
+    const { setBenchmarkResults, setRescueResults } = await import('./lib/metrics.js');
     setBenchmarkResults(summary);
+    // Reproducible, vault-independent contradiction-resilience metric.
+    const rescue = runRescueBenchmark();
+    setRescueResults(rescue);
     logger.info('Retrieval benchmark completed', {
       queries: summary.totalQueries,
       avgLatencyMs: Math.round(summary.totalLatencyMs / summary.totalQueries),
+      rescueAtK: rescue.rescueAtK,
     });
   }).catch(err => {
     logger.warn('Benchmark failed', { error: err instanceof Error ? err.message : String(err) });

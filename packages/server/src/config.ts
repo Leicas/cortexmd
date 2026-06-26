@@ -258,6 +258,16 @@ export const config = {
   // How often to flush metrics to disk (default: 5 minutes)
   metricsFlushIntervalMs: parseInt(process.env.METRICS_FLUSH_INTERVAL_MS ?? '300000', 10),
 
+  // Idle-edge dream: fire a lightweight consolidation pass once the server has
+  // been quiet (no tool calls / captures) for idleDreamMs. Opt-in via
+  // IDLE_DREAM=on, independent of the nightly DREAM_SCHEDULE cron. Cross-platform
+  // (pure wall-clock, no OS idle probing). Default idle threshold 5 min; the
+  // poller checks every idleDreamCheckMs.
+  idleDreamEnabled: (process.env.IDLE_DREAM ?? 'off').toLowerCase() === 'on',
+  idleDreamMs: parseInt(process.env.IDLE_DREAM_MS ?? '300000', 10),
+  idleDreamCheckMs: parseInt(process.env.IDLE_DREAM_CHECK_MS ?? '60000', 10),
+  idleDreamBudgetMs: parseInt(process.env.IDLE_DREAM_BUDGET_MS ?? '30000', 10),
+
   // Embeddings / semantic search
   enableEmbeddings: process.env.ENABLE_EMBEDDINGS !== 'false',
   embeddingModel: process.env.EMBEDDING_MODEL ?? 'Xenova/all-MiniLM-L6-v2',

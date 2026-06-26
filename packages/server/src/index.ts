@@ -122,6 +122,7 @@ import { register as registerGraphOrphans } from './tools/graph-orphans.js';
 import { register as registerGraphBrokenLinks } from './tools/graph-broken-links.js';
 import { register as registerTagsHygiene } from './tools/tags-hygiene.js';
 import { registerJob, stopAllJobs } from './lib/scheduler.js';
+import { markActivity, getLastActivityAt, shouldFireIdleDream } from './lib/activity.js';
 import { refreshSourceVaults, sourceVaultTransports } from './lib/vault/registry.js';
 import { decayMemories, autoArchiveColdMemories } from './lib/memory-lifecycle.js';
 // END AGENT-C new tool registrations
@@ -814,6 +815,7 @@ app.post('/api/store-memory', apiKeyMiddleware, async (req: Request, res: Respon
     const noteContent = stringifyFrontmatter(frontmatter, noteBody);
     await writeNote(notePath, noteContent);
     try { await indexNote(notePath); } catch { /* best-effort */ }
+    markActivity(); // capture counts as activity → resets the idle-dream timer
 
     res.json({ stored: true, path: notePath, category });
   } catch (err: any) {
@@ -2301,6 +2303,45 @@ async function main(): Promise<void> {
     logger.info('Scheduler enabled (DREAM_SCHEDULE=on)');
   } else {
     logger.info('Scheduler disabled — set DREAM_SCHEDULE=on to enable nightly dream + temperature refresh');
+  }
+
+  // Idle-edge dream (gap #8): consolidate promptly after a work burst instead of
+  // only at the nightly cron. A poller fires one lightweight dream pass once the
+  // server has been quiet for config.idleDreamMs, debounced to once per idle
+  // edge. Opt-in and independent of DREAM_SCHEDULE. Cross-platform — pure
+  // wall-clock over the server's own request stream (no OS idle probing).
+  if (config.idleDreamEnabled) {
+    let lastIdleDreamForActivity = 0; // the lastActivity value we last dreamed after
+    registerJob({
+      name: 'idle_dream',
+      intervalMs: config.idleDreamCheckMs,
+      handler: async () => {
+        const lastActivity = getLastActivityAt();
+        if (!shouldFireIdleDream(Date.now(), lastActivity, config.idleDreamMs, lastIdleDreamForActivity)) {
+          return;
+        }
+        lastIdleDreamForActivity = lastActivity; // claim this idle edge before the slow work
+        logger.info('Idle-edge dream firing', {
+          idleForMs: Date.now() - lastActivity,
+          idleThresholdMs: config.idleDreamMs,
+        });
+        const report = await runDreamCycle({
+          autoDecay: true,
+          autoArchive: false,
+          runLlm: false,             // keep the idle pass cheap
+          budgetMs: config.idleDreamBudgetMs,
+        });
+        await appendJournalEntry(
+          `Idle-edge dream: ${report.themes.length} themes, ${report.orphans.length} orphans, ` +
+          `${report.consolidationGroups.length} consolidation groups. ` +
+          `Decayed: ${report.lifecycle.decayed}, Archived: ${report.lifecycle.archived.length}`,
+        );
+      },
+    });
+    logger.info('Idle-edge dream enabled (IDLE_DREAM=on)', {
+      idleMs: config.idleDreamMs,
+      checkMs: config.idleDreamCheckMs,
+    });
   }
 
   const server = app.listen(config.port, () => {

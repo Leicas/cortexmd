@@ -123,8 +123,12 @@ macOS-tuned. cortexmd's relative edge is **leanness, transparency, and breadth**
    union-find.
 4. **Opt-in encrypted brain-vault backend** (gap #3, **M**). An encrypted
    `IVault` write impl behind a flag; plaintext stays the default.
-5. **Cross-platform idle-edge dream trigger + zero-RPC session buffer**
-   (gaps #8 + #9, **M+S**).
+5. **Cross-platform idle-edge dream trigger** (gap #8, **M**) — **shipped**:
+   `lib/activity.ts` + an `idle_dream` scheduler job (opt-in `IDLE_DREAM=on`),
+   pure wall-clock so it works on every OS, unlike iai's macOS-only detector.
+   The **zero-RPC session buffer** (gap #9) is deferred — the capture endpoint is
+   already lightweight and a file buffer is only zero-RPC when hook + server
+   share a filesystem.
 6. **Bounded self-tuning profile** (gap #10) and **single-binary distribution**
    (gap #11, **L**) — larger bets, after the above. **HD/VSA recall (gap #5)**
    stays a research spike, not a priority.
@@ -137,7 +141,8 @@ macOS-tuned. cortexmd's relative edge is **leanness, transparency, and breadth**
 - [x] Immutable episodic tier; consolidation never deletes source (gap #7) — shipped: `applyAutoConsolidation` archives sources (`consolidated_into`+`archived`) instead of deleting
 - [x] Community-detection clustering in the dream cycle (gap #4) — shipped: Louvain (`lib/community.ts`) over a tag-co-occurrence graph replaces tag union-find
 - [ ] Opt-in encrypted brain-vault backend (gap #3)
-- [ ] Cross-platform idle-edge consolidation trigger + zero-RPC buffer (gaps #8, #9)
+- [x] Cross-platform idle-edge consolidation trigger (gap #8) — shipped: `lib/activity.ts` + `idle_dream` job, opt-in `IDLE_DREAM=on`, pure wall-clock (cross-platform)
+- [ ] Zero-RPC capture buffer (gap #9) — deferred: capture endpoint already lightweight; modest win + searchability tradeoff + only zero-RPC when hook/server colocated
 - [ ] Bounded self-tuning procedural profile (gap #10)
 - [ ] Single-binary distribution (gap #11)
 - [ ] HD/VSA structural-recall research spike (gap #5) — low priority
@@ -188,5 +193,6 @@ truth.
    recorded dream-deletes-real-notes incidents), and `findConsolidationCandidates`
    clusters via Louvain (`lib/community.ts`) over a mega-tag-capped
    tag-co-occurrence graph instead of shared-tag union-find.
-3. **#3 encrypted backend, #8/#9 idle-edge + zero-RPC, #11 single-binary** —
-   now the next open work. **#5 HD/VSA** stays a research spike.
+3. **#3 encrypted backend, #11 single-binary** — the remaining bets (#8 idle-edge
+   dream **shipped**; #9 zero-RPC capture **deferred**). **#5 HD/VSA** stays a
+   research spike.

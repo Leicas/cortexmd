@@ -228,6 +228,6 @@ the fusion change, and the Rescue@10 test makes the contradiction win visible.
 - [x] Phase 3a: consolidation links instead of deletes (immutable episodes) — **shipped; `applyAutoConsolidation` stamps `consolidated_into`+`archived` instead of `deleteNote`**
 - [x] Phase 3b: `community.ts` Louvain clustering replaces tag union-find — **shipped; `findConsolidationCandidates` builds a tag-co-occurrence graph (mega-tag-capped) and runs Louvain**
 - [ ] Phase 4: `encrypted-local-vault.ts` + key management, default-off
-- [ ] Phase 5a: idle-edge dream trigger (cross-platform) in `scheduler.ts`
-- [ ] Phase 5b: zero-RPC append-buffer capture drained on idle
+- [x] Phase 5a: idle-edge dream trigger (cross-platform) — **shipped**: `lib/activity.ts` (`markActivity`/`shouldFireIdleDream`) + `idle_dream` scheduler job in `index.ts`, opt-in via `IDLE_DREAM=on`. Pure wall-clock, no OS idle probing (beats iai's macOS-only detector).
+- [ ] Phase 5b: zero-RPC append-buffer capture drained on idle — **deferred**: the capture endpoint (`POST /api/store-memory`) is already lightweight, so the latency win is modest and it trades away immediate searchability; the file-buffer approach is also only zero-RPC when hook and server share a filesystem (not in HTTP/remote mode). Revisit if per-turn capture latency becomes a measured problem.
 - [ ] Phase 6: procedural profile / single-binary dist / HD spike

@@ -1,5 +1,6 @@
 import { recordToolCall, recordToolCallDetailed } from './metrics.js';
 import { logger } from './logger.js';
+import { markActivity } from './activity.js';
 import { recordCodeNavSavings, BASELINE_TOKENS_BY_TOOL, extractRepoSlug } from './code-nav/savings.js';
 
 interface TextContent {
@@ -53,6 +54,8 @@ export function wrapToolHandler(
   return async (args: Record<string, unknown>, extra: unknown): Promise<McpToolResult> => {
     const start = Date.now();
     const argsSummary = summarizeArgs(toolName, args);
+    // Mark activity so the idle-edge dream waits for real quiet (see activity.ts).
+    markActivity(start);
     // Track tool usage per session
     const sessionId = (extra as any)?.sessionId as string | undefined;
     if (sessionId && sessionToolHook) sessionToolHook(sessionId, toolName);

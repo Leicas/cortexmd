@@ -225,8 +225,8 @@ the fusion change, and the Rescue@10 test makes the contradiction win visible.
 - [x] Phase 1b: contradiction-aware stale downweight — **shipped via Bayesian validity** (`computeValidity`/`detectMemoryConflicts`), *not* the `superseded`/`valid_to` schema below
 - [x] Phase 2 (harness): `computeRescueAtK` + R@5/10 + NDCG + p50/p95 in `benchmark.ts`; `benchmark_run` tool — **shipped**
 - [ ] Phase 2 (publish): committed fixture set, `docs/BENCHMARKS.md`, render `benchmarkSummary` on the Intelligence dashboard tab — **open, next PR**
-- [ ] Phase 3a: consolidation links instead of deletes (immutable episodes) — **open; `applyAutoConsolidation` still deletes originals**
-- [ ] Phase 3b: `community.ts` Louvain clustering replaces tag union-find — **open; no `community.ts` yet**
+- [x] Phase 3a: consolidation links instead of deletes (immutable episodes) — **shipped; `applyAutoConsolidation` stamps `consolidated_into`+`archived` instead of `deleteNote`**
+- [x] Phase 3b: `community.ts` Louvain clustering replaces tag union-find — **shipped; `findConsolidationCandidates` builds a tag-co-occurrence graph (mega-tag-capped) and runs Louvain**
 - [ ] Phase 4: `encrypted-local-vault.ts` + key management, default-off
 - [ ] Phase 5a: idle-edge dream trigger (cross-platform) in `scheduler.ts`
 - [ ] Phase 5b: zero-RPC append-buffer capture drained on idle

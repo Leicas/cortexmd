@@ -527,6 +527,13 @@ export default {
     var rePill = $('recallEnginePill');
     if (rePill) rePill.innerHTML = pillHtml(re.coRecallEnabled === false ? 'muted' : 'ok', re.coRecallEnabled === false ? 'co-recall off' : 'active');
 
+    // Rescue@10 — reproducible contradiction-resilience benchmark (run at boot)
+    var rescue = re.rescue;
+    var hasRescue = rescue && rescue.cases > 0;
+    if ($('reRescue')) $('reRescue').textContent = hasRescue ? (+rescue.rescueAtK).toFixed(3) : '—';
+    if ($('reDemoted')) $('reDemoted').textContent = hasRescue ? (+rescue.supersededDemoted).toFixed(3) : '—';
+    if ($('reRescueCases')) $('reRescueCases').textContent = hasRescue ? fmt(rescue.cases) : '—';
+
     // ── Band G — Dream History (overlaid sparklines) ─────────────────────────
     if (dh.length >= 2) {
       ctx.charts.drawMulti('chartDreamHealth', [

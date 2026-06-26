@@ -9,6 +9,17 @@ independently shippable and gated by the benchmark harness from Phase 2.
 > default-equivalent** until the benchmark proves a non-regression. The
 > open-Markdown-vault thesis is preserved (encryption stays opt-in).
 
+> **⚠️ STATUS UPDATE (2026-06-25).** Phases 1 and the Phase-2 *harness* have
+> **shipped** — but Phase 1 took a different route than written below. Recall now
+> fuses centrality/heat/recency/co-recall (`lib/recall-signals.ts`,
+> `lib/co-recall.ts`) and the Rescue@10 mechanism is a **Bayesian Beta(α,β)
+> validity posterior** (`memory.ts` `computeValidity` + `detectMemoryConflicts`),
+> **not** the `superseded`/`valid_to` frontmatter scheme in Phase 1b below. Treat
+> Phase 1 as DONE-by-other-means; Phase 1b's frontmatter design is superseded by
+> the validity-posterior implementation. The **live next PR is Phase 2's
+> *publication* + Phase 3** (see the re-audit in `GAPS-IAI-PME.md`). The Phase
+> 1/1a/1b text is kept below for historical context only.
+
 ---
 
 ## Phase 1 — Multi-signal, contradiction-aware recall ranking  *(gaps #1, #2)*
@@ -210,11 +221,12 @@ the fusion change, and the Rescue@10 test makes the contradiction win visible.
 
 ## Checklist
 
-- [ ] Phase 2: `recall_any@k` + Rescue@10 + latency in `benchmark.ts`; `BENCHMARKS.md`
-- [ ] Phase 1a: `recall-rank.ts` (heat/recency/centrality), wired into `search.ts`, `config.recallWeights`
-- [ ] Phase 1b: `superseded`/`valid_to` schema + stamp-on-contradiction + stale downweight
-- [ ] Phase 3a: consolidation links instead of deletes (immutable episodes)
-- [ ] Phase 3b: `community.ts` Louvain clustering replaces tag union-find
+- [x] Phase 1a: heat/recency/centrality + co-recall fused into recall (`lib/recall-signals.ts`, `lib/co-recall.ts`, `tools/memory-recall.ts`, `config.recall*`) — **shipped**
+- [x] Phase 1b: contradiction-aware stale downweight — **shipped via Bayesian validity** (`computeValidity`/`detectMemoryConflicts`), *not* the `superseded`/`valid_to` schema below
+- [x] Phase 2 (harness): `computeRescueAtK` + R@5/10 + NDCG + p50/p95 in `benchmark.ts`; `benchmark_run` tool — **shipped**
+- [ ] Phase 2 (publish): committed fixture set, `docs/BENCHMARKS.md`, render `benchmarkSummary` on the Intelligence dashboard tab — **open, next PR**
+- [ ] Phase 3a: consolidation links instead of deletes (immutable episodes) — **open; `applyAutoConsolidation` still deletes originals**
+- [ ] Phase 3b: `community.ts` Louvain clustering replaces tag union-find — **open; no `community.ts` yet**
 - [ ] Phase 4: `encrypted-local-vault.ts` + key management, default-off
 - [ ] Phase 5a: idle-edge dream trigger (cross-platform) in `scheduler.ts`
 - [ ] Phase 5b: zero-RPC append-buffer capture drained on idle

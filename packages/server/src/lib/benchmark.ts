@@ -5,7 +5,8 @@ import { readFileSync, writeFileSync, existsSync } from 'node:fs';
 import { createReadStream } from 'node:fs';
 import { createInterface } from 'node:readline';
 import path from 'node:path';
-import type { BenchmarkSummary } from './metrics.js';
+import type { BenchmarkSummary, RescueSummary } from './metrics.js';
+import { computeValidity, VALIDITY_STALE_RANK_PENALTY } from './memory.js';
 
 export interface BenchmarkQuery {
   id: string;
@@ -467,6 +468,52 @@ export function computeRescueAtK(cases: RescueCase[], k = 10): RescueResult {
     supersededDemoted: Math.round((demoted / n) * 10000) / 10000,
     cases: n,
   };
+}
+
+/**
+ * Rank two equally-scored memories — a fresh `current.md` and a `superseded.md`
+ * whose β has been bumped `supersededBeta` times — through the *actual*
+ * memory_recall scoring contract: quarantined results (validity ≤ 0.40) are
+ * dropped, stale results (≤ 0.60) take `VALIDITY_STALE_RANK_PENALTY` (×0.5).
+ * Base scores are equal so the validity pipeline is the only differentiator —
+ * exactly the Rescue@10 setup. Pure + deterministic: no vault, no embeddings.
+ */
+function rankAfterContradiction(supersededBeta: number): string[] {
+  const baseScore = 10;
+  const items = [
+    { path: 'current.md', alpha: 2, beta: 1 }, // fresh, never contradicted
+    { path: 'superseded.md', alpha: 2, beta: supersededBeta },
+  ];
+  return items
+    .map((it) => {
+      const v = computeValidity({ validity_alpha: it.alpha, validity_beta: it.beta });
+      if (v.quarantined) return null; // excluded from results
+      const penalty = v.stale ? VALIDITY_STALE_RANK_PENALTY : 1.0;
+      return { path: it.path, score: baseScore * penalty };
+    })
+    .filter((x): x is { path: string; score: number } => x !== null)
+    .sort((a, b) => b.score - a.score)
+    .map((s) => s.path);
+}
+
+/**
+ * Run the reproducible Rescue@k benchmark over canonical contradiction
+ * scenarios. Vault-independent and grounded in the real validity constants, so
+ * the published number is CI-guarded rather than asserted. Surfaced on the
+ * dashboard (recall engine) and documented in `docs/BENCHMARKS.md`.
+ */
+export function runRescueBenchmark(k = 10): RescueSummary {
+  const scenarios = [
+    { name: 'single-contradiction', contradictions: 1, ranked: rankAfterContradiction(2) },
+    { name: 'repeated-contradiction', contradictions: 2, ranked: rankAfterContradiction(3) },
+  ];
+  const cases: RescueCase[] = scenarios.map((s) => ({
+    currentPath: 'current.md',
+    supersededPath: 'superseded.md',
+    ranked: s.ranked,
+  }));
+  const r = computeRescueAtK(cases, k);
+  return { timestamp: Date.now(), ...r, k, scenarios };
 }
 
 /**

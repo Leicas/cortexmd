@@ -218,6 +218,24 @@ export function renderIntelligenceTab(): string {
           <div class="card-sub" style="margin-top:0">spreading activation</div>
         </div>
       </div>
+      <div class="card-sub" style="margin-top:1rem;margin-bottom:.5rem"><strong>Contradiction resilience</strong> — reproducible Rescue@10 over the Bayesian-validity pipeline (a superseded fact is down-ranked or quarantined; the current fact survives). <a href="https://github.com/Leicas/cortexmd/blob/main/docs/BENCHMARKS.md" target="_blank" rel="noopener">methodology</a></div>
+      <div class="grid" style="grid-template-columns:repeat(3,1fr);margin-bottom:0">
+        <div>
+          <div class="card-label">Rescue@10</div>
+          <div class="card-value card-value--xl" id="reRescue">—</div>
+          <div class="card-sub" style="margin-top:0">current fact stays top-10</div>
+        </div>
+        <div>
+          <div class="card-label">Superseded Demoted</div>
+          <div class="card-value card-value--xl" id="reDemoted">—</div>
+          <div class="card-sub" style="margin-top:0">stale fact down-ranked / dropped</div>
+        </div>
+        <div>
+          <div class="card-label">Scenarios</div>
+          <div class="card-value card-value--xl" id="reRescueCases">—</div>
+          <div class="card-sub" style="margin-top:0">contradiction cases scored</div>
+        </div>
+      </div>
     </div>
   </div>`;
 

@@ -11,6 +11,7 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
 
 import { initEmbeddings, persistIndex as persistEmbeddingIndex, isEmbeddingsReady, buildFullIndex, syncIndexIncremental, wasPersistedIndexLoaded } from './lib/embeddings.js';
+import { flushCoRecall } from './lib/co-recall.js';
 import { config } from './config.js';
 import { apiKeyMiddleware, dashboardAuthMiddleware, SESSION_COOKIE_NAME } from './auth.js';
 import { mintDashboardSession } from './oauth.js';
@@ -2355,13 +2356,17 @@ async function main(): Promise<void> {
   }
 
   // Run retrieval benchmark (non-blocking)
-  import('./lib/benchmark.js').then(async ({ runBenchmark }) => {
+  import('./lib/benchmark.js').then(async ({ runBenchmark, runRescueBenchmark }) => {
     const summary = await runBenchmark();
-    const { setBenchmarkResults } = await import('./lib/metrics.js');
+    const { setBenchmarkResults, setRescueResults } = await import('./lib/metrics.js');
     setBenchmarkResults(summary);
+    // Reproducible, vault-independent contradiction-resilience metric.
+    const rescue = runRescueBenchmark();
+    setRescueResults(rescue);
     logger.info('Retrieval benchmark completed', {
       queries: summary.totalQueries,
       avgLatencyMs: Math.round(summary.totalLatencyMs / summary.totalQueries),
+      rescueAtK: rescue.rescueAtK,
     });
   }).catch(err => {
     logger.warn('Benchmark failed', { error: err instanceof Error ? err.message : String(err) });
@@ -2387,6 +2392,11 @@ async function main(): Promise<void> {
     // Flush metrics to disk before shutting down
     persistMetricsToDisk(config.dataDir);
     stopMetricsSampling();
+
+    // Flush any pending co-recall associations — the persist timer is unref()'d,
+    // so a graceful restart inside its 5s debounce window would otherwise drop
+    // the most recent batch of learned associations.
+    flushCoRecall();
 
     if (sessionPersistInterval) clearInterval(sessionPersistInterval);
     if (sessionCleanupInterval) clearInterval(sessionCleanupInterval);

@@ -131,8 +131,9 @@ macOS-tuned. cortexmd's relative edge is **leanness, transparency, and breadth**
 
 ## Status
 
-- [ ] Recency + centrality + KG invalidation fused into recall ranking (gaps #1, #2)
-- [ ] Benchmarks published with honest methodology incl. a Rescue@10 test (gap #6)
+- [x] Recency + centrality + co-recall fused into recall ranking (gaps #1, #2) — shipped
+- [x] Contradiction-aware staleness (Rescue@10 mechanism) — shipped, **via Bayesian validity** (see re-audit below), not `superseded` frontmatter
+- [~] Benchmark **harness** done (`computeRescueAtK`, R@5/10, NDCG, p50/p95, `benchmark_run`); **publication still open** — no `BENCHMARKS.md`, results unrendered on dashboard (gap #6)
 - [ ] Immutable episodic tier; consolidation never deletes source (gap #7)
 - [ ] Community-detection clustering in the dream cycle (gap #4)
 - [ ] Opt-in encrypted brain-vault backend (gap #3)
@@ -140,3 +141,52 @@ macOS-tuned. cortexmd's relative edge is **leanness, transparency, and breadth**
 - [ ] Bounded self-tuning procedural profile (gap #10)
 - [ ] Single-binary distribution (gap #11)
 - [ ] HD/VSA structural-recall research spike (gap #5) — low priority
+
+---
+
+## Re-audit — 2026-06-25 (grounded in shipped source)
+
+A source-level re-audit after the recall-fusion, co-recall, and benchmark work
+landed (commits `58b827c`, `bd5a916`, plus `51300f4`). The original gap table
+above is preserved as the historical baseline; this section is the current
+truth.
+
+### What shipped (gaps now closed)
+
+- **#1 Multi-signal fusion — DONE.** `lib/recall-signals.ts` (centrality,
+  log-saturated at 25) + `tools/memory-recall.ts` fuse centrality, heat
+  (heat_score→0.5..1.5), category-specific recency half-lives, Bayesian validity,
+  related, and co-recall — multiplicatively, in the hot path. Weights are
+  config-driven (`RECALL_CENTRALITY_WEIGHT=0.15`, `CO_RECALL_WEIGHT=0.2`).
+- **#2 Contradiction-aware Rescue@10 — DONE, but a different mechanism than this
+  doc proposed.** We did **not** add `superseded`/`valid_to` frontmatter. Instead
+  recall uses a **Bayesian Beta(α,β) validity posterior** (`memory.ts`
+  `computeValidity`): `detectMemoryConflicts` flags a conflict at cosine ≥0.80 +
+  Jaccard <0.5 over the shared entity; `memory_store` then bumps the **older**
+  note's β (`updateValidity(path,'failure')`) and stamps `contradicts:[…]` on the
+  new note. At recall, validity ≤0.40 → **quarantined (excluded)**; 0.40–0.60 →
+  **stale (×0.5)**; successful recalls bump α. This is the Rescue@10 mechanism,
+  self-correcting rather than schema-stamped — **update copies of the plan that
+  still describe `superseded` frontmatter.**
+- **Bonus — Hebbian co-recall (not in the original gap list).** `lib/co-recall.ts`
+  is an undirected association graph (0.98^days decay, 32-neighbour cap, symmetric
+  pruning, atomic persist + flush-on-shutdown) that boosts associates of the
+  top-5 seeds. This is closer to iai's associative/spreading recall than anything
+  in the original plan.
+
+### Still open (re-sequenced by leverage)
+
+1. **#6 — Publish benchmarks (now mostly a writing+wiring task).** Harness +
+   `computeRescueAtK` (`benchmark.ts:417`) + `benchmark_run` exist;
+   `benchmarkSummary` already sits in the dashboard payload (`payload.ts:94`) but
+   is **not rendered**. Remaining: run it on a committed fixture set, write
+   `docs/BENCHMARKS.md`, and surface a benchmark panel on the Intelligence tab.
+   Lowest effort, highest credibility — and it doubles as the dashboard win.
+2. **#7 + #4 — Immutable episodic tier + Louvain.** `applyAutoConsolidation`
+   (`memory-lifecycle.ts:394`) **still `deleteNote`s the originals**; clustering
+   is still shared-tag union-find (`findConsolidationCandidates`), no
+   `lib/community.ts`. Given the recorded incidents of dream deleting real notes,
+   3a (stamp `consolidated_into`+`archived` instead of delete) is a **safety fix
+   first**, parity second. Then Louvain for cluster quality.
+3. **#3 encrypted backend, #8/#9 idle-edge + zero-RPC, #11 single-binary** —
+   unchanged, after the above. **#5 HD/VSA** stays a research spike.

@@ -539,6 +539,34 @@ export function getBenchmarkResults(): BenchmarkSummary | null {
   return lastBenchmark;
 }
 
+// ── Rescue@k (contradiction-resilience) results ──────────────────────────
+//
+// Reproducible, vault-independent metric: after a fact is contradicted, does
+// the current fact still rank top-k while the superseded one is demoted? See
+// `runRescueBenchmark` in benchmark.ts — it is grounded in the real validity
+// constants, so the published number is CI-guarded, not asserted.
+
+export interface RescueSummary {
+  timestamp: number;
+  /** Fraction of cases where the current fact ranks within top-k. */
+  rescueAtK: number;
+  /** Fraction of cases where the superseded fact was demoted below / dropped. */
+  supersededDemoted: number;
+  cases: number;
+  k: number;
+  scenarios: Array<{ name: string; contradictions: number; ranked: string[] }>;
+}
+
+let lastRescue: RescueSummary | null = null;
+
+export function setRescueResults(summary: RescueSummary): void {
+  lastRescue = summary;
+}
+
+export function getRescueResults(): RescueSummary | null {
+  return lastRescue;
+}
+
 // ── Persistence helpers ───────────────────────────────────────────────────
 
 interface PersistedMetrics {

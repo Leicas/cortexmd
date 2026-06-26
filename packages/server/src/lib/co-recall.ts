@@ -79,7 +79,14 @@ export class CoRecallGraph {
       for (const [k, w] of m) {
         if (w < min) { min = w; weakest = k; }
       }
-      if (weakest !== undefined && weakest !== b) m.delete(weakest);
+      if (weakest !== undefined && weakest !== b) {
+        m.delete(weakest);
+        // Keep the graph undirected: drop the reverse edge too. Otherwise
+        // a→weakest can survive while weakest→a is pruned (or vice-versa),
+        // which makes spreadingBoosts order-dependent and corrupts stats().
+        const rev = this.edges.get(weakest);
+        if (rev) { rev.delete(a); if (rev.size === 0) this.edges.delete(weakest); }
+      }
     }
   }
 
@@ -159,9 +166,15 @@ export class CoRecallGraph {
   }
 
   stats(): { nodes: number; edges: number } {
-    let edges = 0;
-    for (const m of this.edges.values()) edges += m.size;
-    return { nodes: this.edges.size, edges: edges / 2 }; // undirected: counted twice
+    // Count each unordered pair once. Robust even if the graph is momentarily
+    // asymmetric (an integer count, never a fractional `edges/2`), which is
+    // what the dashboard's "Co-recall Links" KPI renders.
+    const seen = new Set<string>();
+    for (const [a, m] of this.edges) {
+      // JSON-array key: unambiguous even for paths that contain spaces.
+      for (const b of m.keys()) seen.add(JSON.stringify(a < b ? [a, b] : [b, a]));
+    }
+    return { nodes: this.edges.size, edges: seen.size };
   }
 
   toJSON(): { version: number; lastDecayTs: number; edges: Array<[string, Array<[string, number]>]> } {
@@ -205,23 +218,43 @@ function graph(): CoRecallGraph {
   return singleton;
 }
 
+/** Synchronously write the current graph to disk (atomic tmp + rename). */
+function persistNow(): void {
+  if (!singleton) return;
+  try {
+    const fp = filePath();
+    const tmp = fp + '.tmp';
+    fs.mkdirSync(config.dataDir, { recursive: true });
+    fs.writeFileSync(tmp, JSON.stringify(singleton.toJSON()), { mode: 0o600 });
+    fs.renameSync(tmp, fp);
+  } catch (err) {
+    logger.warn('Co-recall persist failed', { error: err instanceof Error ? err.message : String(err) });
+  }
+}
+
 function schedulePersist(): void {
   if (persistTimer) clearTimeout(persistTimer);
   persistTimer = setTimeout(() => {
     persistTimer = null;
-    if (!singleton) return;
-    try {
-      const fp = filePath();
-      const tmp = fp + '.tmp';
-      fs.mkdirSync(config.dataDir, { recursive: true });
-      fs.writeFileSync(tmp, JSON.stringify(singleton.toJSON()), { mode: 0o600 });
-      fs.renameSync(tmp, fp);
-    } catch (err) {
-      logger.warn('Co-recall persist failed', { error: err instanceof Error ? err.message : String(err) });
-    }
+    persistNow();
   }, 5_000);
   // Don't keep the event loop alive just to flush associations.
   if (typeof persistTimer.unref === 'function') persistTimer.unref();
+}
+
+/**
+ * Synchronously flush a pending co-recall write. Call from the server shutdown
+ * path: the debounced persist timer is `unref()`'d, so without this every
+ * graceful restart inside the 5s debounce window silently drops the most
+ * recent batch of learned associations (and can desync the decay clock, which
+ * `record()` advances in memory before the write commits). No-op when nothing
+ * is pending. Best-effort; never throws.
+ */
+export function flushCoRecall(): void {
+  if (!persistTimer) return; // nothing dirty
+  clearTimeout(persistTimer);
+  persistTimer = null;
+  persistNow();
 }
 
 /**
@@ -250,7 +283,13 @@ export function coRecallBoosts(seeds: string[]): Map<string, number> {
     return new Map();
   }
   try {
-    return graph().spreadingBoosts(seeds, config.coRecallWeight);
+    const g = graph();
+    // Decay on the read path too — otherwise the first recall after a long idle
+    // spreads stale, un-decayed weights (decay() previously ran only on record).
+    // Guarded no-op when <1 day elapsed; in-memory advance is made durable by
+    // the next recordCoRecall persist.
+    g.decay(Date.now());
+    return g.spreadingBoosts(seeds, config.coRecallWeight);
   } catch {
     return new Map();
   }

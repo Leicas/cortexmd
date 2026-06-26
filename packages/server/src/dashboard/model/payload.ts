@@ -8,7 +8,7 @@
  * Mutable cross-push state (memory-stack cache, agent-diary cache, dream
  * history, LLM status, dismissed suggestions) lives in `model/state.ts`.
  */
-import { getMetrics, getRecentSearchScores, getBenchmarkResults } from '../../lib/metrics.js';
+import { getMetrics, getRecentSearchScores, getBenchmarkResults, getRescueResults } from '../../lib/metrics.js';
 import { getRateLimitSnapshot } from '../../lib/rate-limit.js';
 import { getSessionSnapshots } from '../../index.js';
 import { getOAuthClients } from '../../oauth.js';
@@ -228,6 +228,8 @@ export function buildSsePayload(): Record<string, unknown> {
     centralityWeight: config.recallCentralityWeight,
     coRecallEnabled: config.coRecallEnabled,
     coRecallWeight: config.coRecallWeight,
+    // Reproducible contradiction-resilience benchmark (Rescue@10), run at boot.
+    rescue: getRescueResults(),
   };
 
   // Derived insight signals (errorRatePct, rpmTrend, healthTrend, …) — computed

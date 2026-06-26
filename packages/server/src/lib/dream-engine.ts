@@ -85,8 +85,8 @@ export interface ConsolidationGroup {
   autoApplied?: boolean;
   /** Set when auto-applied: path of the new consolidated summary note. */
   consolidatedPath?: string;
-  /** Set when auto-applied: originals that were deleted. */
-  deletedOriginals?: string[];
+  /** Set when auto-applied: originals that were archived (not deleted). */
+  archivedOriginals?: string[];
 }
 
 export interface DreamLlmBlock {
@@ -125,7 +125,7 @@ export interface DreamReport {
   autoConsolidations: Array<{
     consolidatedPath: string;
     sourcePaths: string[];
-    deleted: string[];
+    archived: string[];
     errors: string[];
   }>;
 
@@ -711,11 +711,11 @@ export async function runDreamCycle(options: DreamOptions = {}): Promise<DreamRe
           if (result.consolidatedPath) {
             group.autoApplied = true;
             group.consolidatedPath = result.consolidatedPath;
-            group.deletedOriginals = result.deleted;
+            group.archivedOriginals = result.archived;
             autoConsolidations.push({
               consolidatedPath: result.consolidatedPath,
               sourcePaths: group.paths,
-              deleted: result.deleted,
+              archived: result.archived,
               errors: result.errors,
             });
           }

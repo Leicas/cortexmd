@@ -134,8 +134,8 @@ macOS-tuned. cortexmd's relative edge is **leanness, transparency, and breadth**
 - [x] Recency + centrality + co-recall fused into recall ranking (gaps #1, #2) — shipped
 - [x] Contradiction-aware staleness (Rescue@10 mechanism) — shipped, **via Bayesian validity** (see re-audit below), not `superseded` frontmatter
 - [~] Benchmark **harness** done (`computeRescueAtK`, R@5/10, NDCG, p50/p95, `benchmark_run`); **publication still open** — no `BENCHMARKS.md`, results unrendered on dashboard (gap #6)
-- [ ] Immutable episodic tier; consolidation never deletes source (gap #7)
-- [ ] Community-detection clustering in the dream cycle (gap #4)
+- [x] Immutable episodic tier; consolidation never deletes source (gap #7) — shipped: `applyAutoConsolidation` archives sources (`consolidated_into`+`archived`) instead of deleting
+- [x] Community-detection clustering in the dream cycle (gap #4) — shipped: Louvain (`lib/community.ts`) over a tag-co-occurrence graph replaces tag union-find
 - [ ] Opt-in encrypted brain-vault backend (gap #3)
 - [ ] Cross-platform idle-edge consolidation trigger + zero-RPC buffer (gaps #8, #9)
 - [ ] Bounded self-tuning procedural profile (gap #10)
@@ -182,11 +182,11 @@ truth.
    is **not rendered**. Remaining: run it on a committed fixture set, write
    `docs/BENCHMARKS.md`, and surface a benchmark panel on the Intelligence tab.
    Lowest effort, highest credibility — and it doubles as the dashboard win.
-2. **#7 + #4 — Immutable episodic tier + Louvain.** `applyAutoConsolidation`
-   (`memory-lifecycle.ts:394`) **still `deleteNote`s the originals**; clustering
-   is still shared-tag union-find (`findConsolidationCandidates`), no
-   `lib/community.ts`. Given the recorded incidents of dream deleting real notes,
-   3a (stamp `consolidated_into`+`archived` instead of delete) is a **safety fix
-   first**, parity second. Then Louvain for cluster quality.
+2. ~~**#7 + #4 — Immutable episodic tier + Louvain.**~~ **DONE.**
+   `applyAutoConsolidation` now stamps `consolidated_into`+`archived` on each
+   source instead of deleting it (immutable episodes; the safety fix re: the
+   recorded dream-deletes-real-notes incidents), and `findConsolidationCandidates`
+   clusters via Louvain (`lib/community.ts`) over a mega-tag-capped
+   tag-co-occurrence graph instead of shared-tag union-find.
 3. **#3 encrypted backend, #8/#9 idle-edge + zero-RPC, #11 single-binary** —
-   unchanged, after the above. **#5 HD/VSA** stays a research spike.
+   now the next open work. **#5 HD/VSA** stays a research spike.

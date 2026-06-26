@@ -1,6 +1,7 @@
-import { listFiles, readNote, writeNote, resolveSafePathForRead, deleteNote } from './vault.js';
+import { listFiles, readNote, writeNote, resolveSafePathForRead } from './vault.js';
 import { parseFrontmatter, stringifyFrontmatter } from './frontmatter.js';
-import { getDocMeta, indexNote, removeFromIndex } from './search.js';
+import { getDocMeta, indexNote } from './search.js';
+import { louvain, type WeightedEdge } from './community.js';
 import { recordConsolidation } from './metrics.js';
 import { logger } from './logger.js';
 import { lstat } from 'node:fs/promises';
@@ -31,6 +32,16 @@ const AGENT_DIARY_PATH = /agent[ -]diar(?:y|ies)/i;
 /** Safety backstop: cap the consolidation candidate set so a runaway vault
  * state can never stall a scheduled/boot run, even past the exclusion above. */
 const MAX_CONSOLIDATE_CANDIDATES = 4000;
+
+/** Minimum shared-tag count for a co-occurrence edge to exist between two
+ * candidate notes (matches the previous union-find "shares ≥2 tags" relation). */
+const CONSOLIDATE_MIN_SHARED_TAGS_EDGE = 2;
+
+/** Tags carried by more than this many candidates are treated as generic/noise
+ * bridges and excluded from edge-building: they are what collapse unrelated
+ * notes into a tag-soup blob, and materialising their full clique is the O(N²)
+ * hazard. Bounds edge construction to ~Σ_tag(MAX_TAG_FANOUT²). */
+const MAX_TAG_FANOUT = 60;
 
 /** Cap on disk reads in the ROI-demotion scan (advisory output — a bounded
  * subset is fine and keeps the pass from hammering disk on a large vault). */
@@ -224,52 +235,49 @@ export async function findConsolidationCandidates(): Promise<
     }
   }
 
-  // Union-find over candidates.
-  const parent = new Map<string, string>();
-  function find(x: string): string {
-    if (!parent.has(x)) parent.set(x, x);
-    if (parent.get(x) !== x) {
-      parent.set(x, find(parent.get(x)!));
-    }
-    return parent.get(x)!;
-  }
-  function union(a: string, b: string): void {
-    const ra = find(a);
-    const rb = find(b);
-    if (ra !== rb) parent.set(ra, rb);
-  }
-  for (const p of tagsByPath.keys()) find(p);
-
-  // Cluster by shared tags via a tag-PAIR inverted index. Two notes belong in
-  // the same cluster iff they share ≥2 tags, which is exactly iff they share at
-  // least one (tagA, tagB) pair. Bucketing notes by pair and unioning each new
-  // note with the bucket's first member yields the same connected components as
-  // the old O(N²) pairwise scan, but at ~O(N · tags²) — no longer a quadratic
-  // event-loop block on a large cold set.
-  const pairRep = new Map<string, string>(); // pairKey -> representative path
+  // Cluster by tag co-occurrence, then run Louvain community detection.
+  //
+  // Build a weighted undirected graph where an edge weight = the number of tags
+  // two candidate notes share. Generic/noise tags carried by more than
+  // MAX_TAG_FANOUT candidates are skipped — they are exactly the bridges that
+  // collapse unrelated notes into one tag-soup blob, and densifying their full
+  // clique is the O(N²) hazard. Only edges of weight ≥ 2 are kept, so the base
+  // relation ("shares ≥2 tags") matches the previous union-find — but Louvain
+  // partitions that graph into *modular* communities instead of taking whole
+  // connected components, so weakly-bridged notes no longer merge.
+  const tagToNotes = new Map<string, string[]>();
   for (const [p, tags] of tagsByPath) {
-    const uniq = [...new Set(tags)].sort();
-    for (let i = 0; i < uniq.length; i++) {
-      for (let j = i + 1; j < uniq.length; j++) {
-        const key = uniq[i] + '|||' + uniq[j];
-        const rep = pairRep.get(key);
-        if (rep === undefined) pairRep.set(key, p);
-        else union(rep, p);
+    for (const t of new Set(tags)) {
+      const arr = tagToNotes.get(t);
+      if (arr) arr.push(p);
+      else tagToNotes.set(t, [p]);
+    }
+  }
+
+  const edgeWeight = new Map<string, number>(); // "u|||v" (u<v) -> shared tags
+  for (const notes of tagToNotes.values()) {
+    if (notes.length > MAX_TAG_FANOUT) continue; // generic/noise bridge tag
+    for (let i = 0; i < notes.length; i++) {
+      for (let j = i + 1; j < notes.length; j++) {
+        const [u, v] = notes[i] < notes[j] ? [notes[i], notes[j]] : [notes[j], notes[i]];
+        const key = u + '|||' + v;
+        edgeWeight.set(key, (edgeWeight.get(key) ?? 0) + 1);
       }
     }
   }
 
-  // Collect clusters
-  const clusters = new Map<string, string[]>();
-  for (const p of tagsByPath.keys()) {
-    const root = find(p);
-    if (!clusters.has(root)) clusters.set(root, []);
-    clusters.get(root)!.push(p);
+  const edges: WeightedEdge[] = [];
+  for (const [key, weight] of edgeWeight) {
+    if (weight < CONSOLIDATE_MIN_SHARED_TAGS_EDGE) continue;
+    const sep = key.indexOf('|||');
+    edges.push({ a: key.slice(0, sep), b: key.slice(sep + 3), weight });
   }
 
-  // Build results for clusters of 3+
+  const { communities } = louvain([...tagsByPath.keys()], edges);
+
+  // Build results for communities of 3+
   const results: Array<{ paths: string[]; commonTags: string[]; suggestedTitle: string }> = [];
-  for (const [, paths] of clusters) {
+  for (const paths of communities) {
     if (paths.length < 3) continue;
 
     // Find tags present in at least 2 notes of the cluster (O(1) tag lookup
@@ -298,9 +306,13 @@ export async function findConsolidationCandidates(): Promise<
 }
 
 /**
- * Auto-apply a single high-confidence consolidation group: write a summary
- * note under Memories/consolidated/, then delete the originals. Returns
- * the consolidated path plus the list of deleted originals.
+ * Auto-apply a single high-confidence consolidation group: write a derived
+ * summary note under Memories/consolidated/, then **archive** the originals —
+ * stamping each with a `consolidated_into` backlink + `archived: true` rather
+ * than deleting it. This is the immutable episodic tier: the derived summary is
+ * the active note, but every source stays on disk, linked, and recoverable, so
+ * consolidation can never destroy unique information. Returns the consolidated
+ * path plus the list of archived originals.
  *
  * Caller is expected to only call this for groups meeting the
  * AUTO_CONSOLIDATE_MIN_* thresholds — this helper does not re-check them.
@@ -309,7 +321,7 @@ export async function applyAutoConsolidation(group: {
   paths: string[];
   commonTags: string[];
   suggestedTitle: string;
-}): Promise<{ consolidatedPath: string; deleted: string[]; errors: string[] }> {
+}): Promise<{ consolidatedPath: string; archived: string[]; errors: string[] }> {
   const errors: string[] = [];
   const todayStr = new Date().toISOString().slice(0, 10);
 
@@ -328,7 +340,7 @@ export async function applyAutoConsolidation(group: {
   }
 
   if (sources.length === 0) {
-    return { consolidatedPath: '', deleted: [], errors };
+    return { consolidatedPath: '', archived: [], errors };
   }
 
   // Slug + target path under Memories/consolidated/
@@ -388,29 +400,37 @@ export async function applyAutoConsolidation(group: {
     await indexNote(consolidatedPath);
   } catch (err) {
     errors.push(`write ${consolidatedPath}: ${err instanceof Error ? err.message : String(err)}`);
-    return { consolidatedPath, deleted: [], errors };
+    return { consolidatedPath, archived: [], errors };
   }
 
-  // Delete originals only after the summary has been written successfully
-  const deleted: string[] = [];
+  // Immutable episodic tier: archive the originals instead of deleting them.
+  // Each source is stamped with a `consolidated_into` backlink + `archived`
+  // flag so it drops out of active recall (the existing archived filters skip
+  // it) while staying on disk, linked, and recoverable. Re-index so docMeta
+  // reflects the archived state immediately. We reuse the already-parsed
+  // data/body from the read above — no second disk read.
+  const archived: string[] = [];
   for (const src of sources) {
     try {
-      await deleteNote(src.path);
-      removeFromIndex(src.path);
-      deleted.push(src.path);
+      src.data.consolidated_into = consolidatedPath;
+      src.data.archived = true;
+      src.data.archived_at = todayStr;
+      await writeNote(src.path, stringifyFrontmatter(src.data, src.body));
+      await indexNote(src.path);
+      archived.push(src.path);
     } catch (err) {
-      errors.push(`delete ${src.path}: ${err instanceof Error ? err.message : String(err)}`);
+      errors.push(`archive ${src.path}: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 
-  recordConsolidation(deleted.length);
-  logger.info('Auto-consolidation applied', {
+  recordConsolidation(archived.length);
+  logger.info('Auto-consolidation applied (sources archived, not deleted)', {
     consolidatedPath,
-    deleted: deleted.length,
+    archived: archived.length,
     errors: errors.length,
   });
 
-  return { consolidatedPath, deleted, errors };
+  return { consolidatedPath, archived, errors };
 }
 
 // ─────────────────────── ROI demotion + auto-promotion ───────────────────────

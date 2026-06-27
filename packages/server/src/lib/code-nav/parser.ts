@@ -10,10 +10,30 @@ let TS_Lang_javascript: any = null;
 let TS_Lang_python: any = null;
 let TS_Lang_rust: any = null;
 let TS_Lang_go: any = null;
+let TS_Lang_cpp: any = null;
+let TS_Lang_c: any = null;
+let TS_Lang_java: any = null;
+let TS_Lang_kotlin: any = null;
+let TS_Lang_ruby: any = null;
+let TS_Lang_php: any = null;
+let TS_Lang_dart: any = null;
 let parsersReady = false;
 const parserLoadErrors: Record<string, string> = {};
 
-export type Language = 'typescript' | 'tsx' | 'javascript' | 'python' | 'rust' | 'go';
+export type Language =
+  | 'typescript'
+  | 'tsx'
+  | 'javascript'
+  | 'python'
+  | 'rust'
+  | 'go'
+  | 'cpp'
+  | 'c'
+  | 'java'
+  | 'kotlin'
+  | 'ruby'
+  | 'php'
+  | 'dart';
 
 export interface ParsedSymbol {
   id: string;
@@ -141,6 +161,64 @@ async function ensureParsers(): Promise<void> {
     logger.warn('Failed to load tree-sitter-go', { error: msg });
   }
 
+  // Single-export grammars: the module (or its default) is the Language itself.
+  const loadSimple = async (lang: Language, mod: string): Promise<any | null> => {
+    try {
+      const m: any = await import(mod);
+      return m.default ?? m;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      parserLoadErrors[lang] = `${lang} grammar unavailable: ${msg}`;
+      logger.warn(`Failed to load ${mod}`, { error: msg });
+      return null;
+    }
+  };
+
+  TS_Lang_cpp = await loadSimple('cpp', 'tree-sitter-cpp');
+  TS_Lang_c = await loadSimple('c', 'tree-sitter-c');
+  TS_Lang_java = await loadSimple('java', 'tree-sitter-java');
+  TS_Lang_kotlin = await loadSimple('kotlin', 'tree-sitter-kotlin');
+  TS_Lang_ruby = await loadSimple('ruby', 'tree-sitter-ruby');
+  TS_Lang_dart = await loadSimple('dart', 'tree-sitter-dart');
+
+  // tree-sitter-php exposes { php, php_only }; the full grammar handles `<?php`.
+  try {
+    const phpMod: any = await import('tree-sitter-php');
+    const phpExp: any = phpMod.default ?? phpMod;
+    TS_Lang_php = phpExp.php ?? phpExp;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    parserLoadErrors['php'] = `php grammar unavailable: ${msg}`;
+    logger.warn('Failed to load tree-sitter-php', { error: msg });
+  }
+
+  // Some grammars publish a newer ABI than the pinned tree-sitter runtime can
+  // load (e.g. tree-sitter-dart@1.0 needs a newer core; bumping it would break
+  // the `{ bufferSize }` parse API the other grammars rely on). Validate each
+  // newly-added grammar with a throwaway setLanguage so an incompatible one
+  // degrades to a clean "unavailable" error instead of throwing deep inside
+  // parseFile. The Rust CLI indexer still handles every language regardless.
+  const validate = (lang: Language, grammar: any): any => {
+    if (!grammar) return null;
+    try {
+      const p = new TS_Parser();
+      p.setLanguage(grammar);
+      return grammar;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      parserLoadErrors[lang] = `${lang} grammar incompatible with tree-sitter runtime: ${msg}`;
+      logger.warn(`tree-sitter grammar ${lang} failed ABI validation`, { error: msg });
+      return null;
+    }
+  };
+  TS_Lang_cpp = validate('cpp', TS_Lang_cpp);
+  TS_Lang_c = validate('c', TS_Lang_c);
+  TS_Lang_java = validate('java', TS_Lang_java);
+  TS_Lang_kotlin = validate('kotlin', TS_Lang_kotlin);
+  TS_Lang_ruby = validate('ruby', TS_Lang_ruby);
+  TS_Lang_php = validate('php', TS_Lang_php);
+  TS_Lang_dart = validate('dart', TS_Lang_dart);
+
   parsersReady = true;
   logger.info('Code-nav: tree-sitter parsers loaded', {
     typescript: !!TS_Lang_typescript,
@@ -149,6 +227,13 @@ async function ensureParsers(): Promise<void> {
     python: !!TS_Lang_python,
     rust: !!TS_Lang_rust,
     go: !!TS_Lang_go,
+    cpp: !!TS_Lang_cpp,
+    c: !!TS_Lang_c,
+    java: !!TS_Lang_java,
+    kotlin: !!TS_Lang_kotlin,
+    ruby: !!TS_Lang_ruby,
+    php: !!TS_Lang_php,
+    dart: !!TS_Lang_dart,
   });
 }
 
@@ -165,6 +250,13 @@ function getLanguage(lang: Language): any {
     case 'python':     return TS_Lang_python;
     case 'rust':       return TS_Lang_rust;
     case 'go':         return TS_Lang_go;
+    case 'cpp':        return TS_Lang_cpp;
+    case 'c':          return TS_Lang_c;
+    case 'java':       return TS_Lang_java;
+    case 'kotlin':     return TS_Lang_kotlin;
+    case 'ruby':       return TS_Lang_ruby;
+    case 'php':        return TS_Lang_php;
+    case 'dart':       return TS_Lang_dart;
   }
 }
 
@@ -270,7 +362,13 @@ export async function parseFile(
         drafted.kind === 'struct' ||
         drafted.kind === 'enum' ||
         drafted.kind === 'trait' ||
-        drafted.kind === 'impl'
+        drafted.kind === 'impl' ||
+        drafted.kind === 'union' ||
+        drafted.kind === 'namespace' ||
+        drafted.kind === 'module' ||
+        drafted.kind === 'object' ||
+        drafted.kind === 'mixin' ||
+        drafted.kind === 'extension'
       ) {
         nextParentIdx = newIdx;
         nextNamespace = [...namespace, drafted.name];
@@ -492,6 +590,129 @@ function draftFor(
     return null;
   }
 
+  // ── C / C++ ──────────────────────────────────────────────────────────────
+  // Mirrors crates/cli/src/lang/{c,cpp}.rs.
+  if (language === 'c' || language === 'cpp') {
+    if (t === 'function_definition') {
+      const name = language === 'cpp' ? cppFunctionName(node, src) : cFunctionName(node, src);
+      if (!name) return null;
+      const kind = namespace.length > 0 ? 'method' : 'function';
+      return makeDraft(name, kind, funcSigToBody(src, node), node, parentIdx, namespace, src);
+    }
+    if (t === 'struct_specifier') return cTypeDraft(node, src, 'struct', parentIdx, namespace, language);
+    if (t === 'union_specifier') return cTypeDraft(node, src, 'union', parentIdx, namespace, language);
+    if (t === 'enum_specifier') return cTypeDraft(node, src, 'enum', parentIdx, namespace, language);
+    if (language === 'cpp') {
+      if (t === 'class_specifier') return cTypeDraft(node, src, 'class', parentIdx, namespace, language);
+      if (t === 'namespace_definition') {
+        const n = node.childForFieldName('name');
+        if (!n) return null;
+        const name = nodeText(src, n);
+        // Namespaces are treated as class-like containers (matches cpp.rs).
+        return makeDraft(name, 'class', `namespace ${name}`, node, parentIdx, namespace, src);
+      }
+    }
+    return null;
+  }
+
+  // ── Java ─────────────────────────────────────────────────────────────────
+  if (language === 'java') {
+    if (t === 'class_declaration') return javaContainer(node, src, 'class', parentIdx, namespace);
+    if (t === 'interface_declaration' || t === 'annotation_type_declaration')
+      return javaContainer(node, src, 'interface', parentIdx, namespace);
+    if (t === 'enum_declaration') return javaContainer(node, src, 'enum', parentIdx, namespace);
+    if (t === 'record_declaration') return javaContainer(node, src, 'class', parentIdx, namespace);
+    if (t === 'method_declaration' || t === 'constructor_declaration') {
+      const n = node.childForFieldName('name');
+      if (!n) return null;
+      return makeDraft(nodeText(src, n), 'method', declSigToBody(src, node), node, parentIdx, namespace, src);
+    }
+    return null;
+  }
+
+  // ── Kotlin ───────────────────────────────────────────────────────────────
+  if (language === 'kotlin') {
+    if (t === 'class_declaration') {
+      const name = kotlinName(node, src);
+      if (!name) return null;
+      return makeDraft(name, kotlinClassKind(src, node), upToBraceOrLine(src, node), node, parentIdx, namespace, src);
+    }
+    if (t === 'object_declaration') {
+      const name = kotlinName(node, src);
+      if (!name) return null;
+      return makeDraft(name, 'object', upToBraceOrLine(src, node), node, parentIdx, namespace, src);
+    }
+    if (t === 'function_declaration') {
+      const name = kotlinName(node, src);
+      if (!name) return null;
+      const kind = namespace.length > 0 ? 'method' : 'function';
+      return makeDraft(name, kind, upToBraceOrLine(src, node), node, parentIdx, namespace, src);
+    }
+    return null;
+  }
+
+  // ── Ruby ─────────────────────────────────────────────────────────────────
+  if (language === 'ruby') {
+    if (t === 'method' || t === 'singleton_method') {
+      const n = node.childForFieldName('name');
+      if (!n) return null;
+      const kind = namespace.length > 0 ? 'method' : 'function';
+      return makeDraft(nodeText(src, n), kind, firstLine(src, node), node, parentIdx, namespace, src);
+    }
+    if (t === 'class' || t === 'singleton_class') {
+      const n = node.childForFieldName('name');
+      if (!n) return null;
+      return makeDraft(nodeText(src, n), 'class', firstLine(src, node), node, parentIdx, namespace, src);
+    }
+    if (t === 'module') {
+      const n = node.childForFieldName('name');
+      if (!n) return null;
+      return makeDraft(nodeText(src, n), 'module', firstLine(src, node), node, parentIdx, namespace, src);
+    }
+    return null;
+  }
+
+  // ── PHP ──────────────────────────────────────────────────────────────────
+  if (language === 'php') {
+    const phpKind: Record<string, string> = {
+      function_definition: 'function',
+      method_declaration: 'method',
+      class_declaration: 'class',
+      interface_declaration: 'interface',
+      trait_declaration: 'trait',
+      enum_declaration: 'enum',
+      namespace_definition: 'namespace',
+    };
+    const k = phpKind[t];
+    if (k) {
+      const n = node.childForFieldName('name');
+      if (!n) return null;
+      return makeDraft(nodeText(src, n), k, declSigToBody(src, node), node, parentIdx, namespace, src);
+    }
+    return null;
+  }
+
+  // ── Dart ─────────────────────────────────────────────────────────────────
+  if (language === 'dart') {
+    if (t === 'class_declaration') return dartNamed(node, src, 'class', parentIdx, namespace);
+    if (t === 'enum_declaration') return dartNamed(node, src, 'enum', parentIdx, namespace);
+    if (t === 'mixin_declaration') return dartNamed(node, src, 'mixin', parentIdx, namespace);
+    if (t === 'extension_declaration') return dartNamed(node, src, 'extension', parentIdx, namespace);
+    if (
+      t === 'function_signature' ||
+      t === 'getter_signature' ||
+      t === 'setter_signature' ||
+      t === 'constructor_signature' ||
+      t === 'factory_constructor_signature'
+    ) {
+      const name = dartIdent(node, src);
+      if (!name) return null;
+      const kind = namespace.length > 0 ? 'method' : 'function';
+      return makeDraft(name, kind, upToBraceOrLine(src, node), node, parentIdx, namespace, src);
+    }
+    return null;
+  }
+
   return null;
 }
 
@@ -639,6 +860,104 @@ function collectImports(
           for (const ch of cur.namedChildren ?? []) stack2.push(ch);
         }
       }
+    } else if (language === 'cpp' || language === 'c') {
+      if (t === 'preproc_include') {
+        const pathNode = node.childForFieldName?.('path');
+        if (pathNode) {
+          const raw = nodeText(src, pathNode).trim();
+          let inner = raw;
+          if (raw.startsWith('<') && raw.endsWith('>')) inner = raw.slice(1, -1);
+          else if (raw.startsWith('"') && raw.endsWith('"')) inner = raw.slice(1, -1);
+          if (inner && !seen.has(inner)) {
+            seen.add(inner);
+            const basename = (inner.split('/').pop() ?? inner).split('.')[0];
+            out.push({ importedName: basename, sourceModule: inner });
+          }
+        }
+      }
+    } else if (language === 'java') {
+      if (t === 'import_declaration') {
+        const path = (node.namedChildren ?? []).find(
+          (c: any) => c.type === 'scoped_identifier' || c.type === 'identifier',
+        );
+        if (path) {
+          const module = nodeText(src, path);
+          const parts = module.split('.').filter((s) => s !== '*');
+          const last = parts.length ? parts[parts.length - 1] : module;
+          const key = `${last}|${module}`;
+          if (!seen.has(key)) {
+            seen.add(key);
+            out.push({ importedName: last, sourceModule: module });
+          }
+        }
+      }
+    } else if (language === 'kotlin') {
+      if (t === 'import' || t === 'import_header') {
+        const id = (node.namedChildren ?? []).find(
+          (c: any) => c.type === 'qualified_identifier' || c.type === 'identifier',
+        );
+        if (id) {
+          const module = nodeText(src, id);
+          const last = module.split('.').pop() ?? module;
+          const key = `${last}|${module}`;
+          if (!seen.has(key)) {
+            seen.add(key);
+            out.push({ importedName: last, sourceModule: module });
+          }
+        }
+      }
+    } else if (language === 'ruby') {
+      if (t === 'call') {
+        const m = node.childForFieldName?.('method');
+        const mname = m ? nodeText(src, m) : null;
+        if (mname === 'require' || mname === 'require_relative') {
+          const args = node.childForFieldName?.('arguments');
+          const arg = args?.namedChildren?.[0];
+          if (arg && arg.type === 'string') {
+            const content = (arg.namedChildren ?? []).find((c: any) => c.type === 'string_content');
+            const module = content ? nodeText(src, content) : stripQuotes(nodeText(src, arg));
+            if (module) {
+              const name = module.split('/').pop() ?? module;
+              const key = `${name}|${module}`;
+              if (!seen.has(key)) {
+                seen.add(key);
+                out.push({ importedName: name, sourceModule: module });
+              }
+            }
+          }
+        }
+      }
+    } else if (language === 'php') {
+      if (t === 'namespace_use_declaration') {
+        const inner = [...(node.namedChildren ?? [])];
+        while (inner.length > 0) {
+          const child = inner.pop();
+          if (!child) continue;
+          if (child.type === 'qualified_name' || child.type === 'name') {
+            const module = nodeText(src, child).replace(/^\\+/, '');
+            const last = module.split('\\').pop() ?? module;
+            const key = `${last}|${module}`;
+            if (!seen.has(key)) {
+              seen.add(key);
+              out.push({ importedName: last, sourceModule: module });
+            }
+            continue;
+          }
+          for (const ch of child.namedChildren ?? []) inner.push(ch);
+        }
+      }
+    } else if (language === 'dart') {
+      if (t.includes('import')) {
+        const uri = dartFindUri(node, src);
+        if (uri) {
+          const name = (uri.split('/').pop() ?? uri).replace(/\.dart$/, '');
+          const key = `${name}|${uri}`;
+          if (!seen.has(key)) {
+            seen.add(key);
+            out.push({ importedName: name, sourceModule: uri });
+          }
+        }
+      }
     }
 
     for (const ch of node.namedChildren ?? []) stack.push(ch);
@@ -709,6 +1028,182 @@ function extractGoFuncSignature(src: string, node: any): string {
   const braceIdx = text.indexOf('{');
   if (braceIdx > 0) return text.slice(0, braceIdx).trim();
   return text.split('\n')[0].trim();
+}
+
+// ── Helpers for C/C++/Java/Kotlin/Ruby/PHP/Dart ──────────────────────────────
+// These mirror the per-language adapters in crates/cli/src/lang/*.rs so that
+// (name, kind, normalizedSignature) — and therefore symbol IDs — match exactly.
+
+/** Signature from the node start up to its `body`, else the first line. */
+function funcSigToBody(src: string, node: any): string {
+  const body = node.childForFieldName?.('body');
+  if (body) return src.slice(node.startIndex, body.startIndex).trim();
+  return nodeText(src, node).split('\n')[0].trim();
+}
+
+/** Header up to `body`, else up to `{`, else the first line. */
+function declSigToBody(src: string, node: any): string {
+  const body = node.childForFieldName?.('body');
+  if (body) return src.slice(node.startIndex, body.startIndex).trim();
+  return upToBraceOrLine(src, node);
+}
+
+/** Text up to the first `{`, else the first line. */
+function upToBraceOrLine(src: string, node: any): string {
+  const text = nodeText(src, node);
+  const i = text.indexOf('{');
+  if (i >= 0) return text.slice(0, i).trim();
+  return text.split('\n')[0].trim();
+}
+
+function firstLine(src: string, node: any): string {
+  return nodeText(src, node).split('\n')[0].trim();
+}
+
+/** C function name: unwrap the declarator chain to the identifier. */
+function cFunctionName(node: any, src: string): string | null {
+  let decl = node.childForFieldName?.('declarator');
+  while (decl) {
+    if (decl.type === 'function_declarator') {
+      const inner = decl.childForFieldName?.('declarator');
+      return inner ? cDeclId(inner, src) : null;
+    }
+    if (
+      decl.type === 'pointer_declarator' ||
+      decl.type === 'array_declarator' ||
+      decl.type === 'parenthesized_declarator'
+    ) {
+      decl = decl.childForFieldName?.('declarator');
+      continue;
+    }
+    return null;
+  }
+  return null;
+}
+
+function cDeclId(node: any, src: string): string | null {
+  switch (node.type) {
+    case 'identifier':
+    case 'field_identifier':
+      return nodeText(src, node);
+    case 'pointer_declarator':
+    case 'parenthesized_declarator':
+    case 'function_declarator': {
+      const d = node.childForFieldName?.('declarator');
+      return d ? cDeclId(d, src) : null;
+    }
+    default:
+      return null;
+  }
+}
+
+/** C++ function name: handles qualified (Foo::bar), operator, destructor names. */
+function cppFunctionName(node: any, src: string): string | null {
+  let decl = node.childForFieldName?.('declarator');
+  while (decl) {
+    if (decl.type === 'function_declarator') {
+      const inner = decl.childForFieldName?.('declarator');
+      return inner ? cppDeclId(inner, src) : null;
+    }
+    if (decl.type === 'pointer_declarator' || decl.type === 'reference_declarator') {
+      decl = decl.childForFieldName?.('declarator');
+      continue;
+    }
+    return null;
+  }
+  return null;
+}
+
+function cppDeclId(node: any, src: string): string | null {
+  switch (node.type) {
+    case 'identifier':
+    case 'field_identifier':
+    case 'destructor_name':
+    case 'operator_name':
+      return nodeText(src, node);
+    case 'qualified_identifier':
+    case 'scoped_identifier':
+    case 'template_function': {
+      const parts = nodeText(src, node).split('::');
+      return parts[parts.length - 1];
+    }
+    default:
+      return null;
+  }
+}
+
+/** struct/union/enum/class draft. C synthesizes `kind name`; C++ takes the header. */
+function cTypeDraft(
+  node: any,
+  src: string,
+  kind: string,
+  parentIdx: number | null,
+  namespace: string[],
+  language: Language,
+): SymbolDraft | null {
+  const n = node.childForFieldName?.('name');
+  if (!n) return null;
+  const name = nodeText(src, n);
+  const sig = language === 'c' ? `${kind} ${name}` : upToBraceOrLine(src, node);
+  return makeDraft(name, kind, sig, node, parentIdx, namespace, src);
+}
+
+function javaContainer(
+  node: any,
+  src: string,
+  kind: string,
+  parentIdx: number | null,
+  namespace: string[],
+): SymbolDraft | null {
+  const n = node.childForFieldName?.('name');
+  if (!n) return null;
+  return makeDraft(nodeText(src, n), kind, declSigToBody(src, node), node, parentIdx, namespace, src);
+}
+
+// The identifier node kind differs by Kotlin grammar lineage: kotlin-ng (Rust)
+// uses `identifier`; fwcd (npm) uses `simple_identifier` / `type_identifier`.
+const KOTLIN_NAME_KINDS = ['identifier', 'type_identifier', 'simple_identifier'];
+
+function kotlinName(node: any, src: string): string | null {
+  const n = (node.namedChildren ?? []).find((c: any) => KOTLIN_NAME_KINDS.includes(c.type));
+  return n ? nodeText(src, n) : null;
+}
+
+function kotlinClassKind(src: string, node: any): string {
+  const head = nodeText(src, node).split('\n')[0];
+  if (head.includes('interface')) return 'interface';
+  if (head.includes('enum')) return 'enum';
+  return 'class';
+}
+
+function dartNamed(
+  node: any,
+  src: string,
+  kind: string,
+  parentIdx: number | null,
+  namespace: string[],
+): SymbolDraft | null {
+  const name = dartIdent(node, src);
+  if (!name) return null;
+  return makeDraft(name, kind, upToBraceOrLine(src, node), node, parentIdx, namespace, src);
+}
+
+function dartIdent(node: any, src: string): string | null {
+  const n = (node.namedChildren ?? []).find((c: any) => c.type === 'identifier');
+  return n ? nodeText(src, n) : null;
+}
+
+function dartFindUri(node: any, src: string): string | null {
+  const stack: any[] = [node];
+  while (stack.length > 0) {
+    const cur = stack.pop();
+    if (!cur) continue;
+    if (cur.type === 'string_literal' || cur.type === 'uri') {
+      return stripQuotes(nodeText(src, cur));
+    }
+    for (const ch of cur.namedChildren ?? []) stack.push(ch);
+  }
+  return null;
 }
 
 /** Walk the tree and attach docstrings + collect calls. */

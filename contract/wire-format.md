@@ -19,7 +19,7 @@ Prose companion to [`code-ingest-payload.schema.json`](./code-ingest-payload.sch
 ```jsonc
 {
   "relative_path": "src/foo.ts",   // required — repo-relative POSIX path; part of symbol_id
-  "language": "typescript",        // required — one of: typescript tsx javascript python rust go cpp
+  "language": "typescript",        // required — one of: typescript tsx javascript python rust go cpp c java kotlin ruby php dart
   "symbols": [ /* Symbol[] */ ],   // required
   "calls":   [ /* Call[] */ ],     // optional, default []
   "imports": [ /* Import[] */ ]    // optional, default []

@@ -2,7 +2,7 @@
 // Claude Code SessionStart hook — code-nav directive + auto-refresh.
 //
 // When a session starts inside a git repo that contains TS/TSX/JS/JSX/Python/
-// Rust/Go source files, this hook:
+// Rust/Go/C/C++/Java/Kotlin/Ruby/PHP/Dart source files, this hook:
 //   1. Tells the agent that `code_*` MCP tools are the primary way to read
 //      code in this repo (Read/Grep are the fallback, not the default).
 //   2. Looks the cwd up in the server's repo list. If the repo isn't yet
@@ -38,6 +38,8 @@ if (HOOK_DISABLED || envFlag('CORTEXMD_CODE_NAV_HINT_DISABLE')) passthrough();
 const CODE_EXTS = new Set([
   '.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs',
   '.py', '.rs', '.go',
+  '.cpp', '.cc', '.cxx', '.c++', '.hpp', '.hxx', '.h++', '.h', '.c',
+  '.java', '.kt', '.kts', '.rb', '.php', '.dart',
 ]);
 
 const SKIP_DIRS = new Set([
@@ -50,7 +52,7 @@ const SCAN_DEPTH = 3;
 const TIME_BUDGET_MS = 50;
 
 const CONTEXT_INDEXED = [
-  "**Code repo — USE cortexmd's `code_*` MCP tools instead of Read/Grep.** They are 60-100× cheaper on TS/TSX/JS/JSX/Python/Rust/Go:",
+  "**Code repo — USE cortexmd's `code_*` MCP tools instead of Read/Grep.** They are 60-100× cheaper on TS/TSX/JS/JSX/Python/Rust/Go/C/C++/Java/Kotlin/Ruby/PHP/Dart:",
   "- code_symbol_search(query) — find symbols by name/sig/docstring (~60 tokens/result)",
   "- code_file_outline(repo, path) — file overview without reading the whole file",
   "- code_symbol_get(id) — body of one symbol (capped 200 lines)",

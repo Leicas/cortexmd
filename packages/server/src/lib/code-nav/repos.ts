@@ -5,6 +5,7 @@ import { promisify } from 'node:util';
 import { glob } from 'glob';
 import { config } from '../../config.js';
 import { getCodeDb } from './db.js';
+import type { Language } from './parser.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -108,7 +109,12 @@ export function resolveRepoFull(slug: string): CodeRepo {
   return { id: row.id, slug: row.slug, absolutePath: abs };
 }
 
-const SUPPORTED_EXTS_DEFAULT = ['ts', 'tsx', 'js', 'jsx', 'py', 'rs', 'go'];
+const SUPPORTED_EXTS_DEFAULT = [
+  'ts', 'tsx', 'js', 'jsx', 'py', 'rs', 'go',
+  // C / C++ (.h defaults to C++, matching the Rust walker)
+  'cpp', 'cc', 'cxx', 'c++', 'hpp', 'hxx', 'h++', 'h', 'c',
+  'java', 'kt', 'kts', 'rb', 'php', 'dart',
+];
 const SKIP_DIRS = new Set([
   'node_modules', 'dist', '.git', '.next', 'build', 'out',
   'target', '__pycache__', 'venv', '.venv', 'vendor',
@@ -178,16 +184,36 @@ export async function walkRepo(repo: CodeRepo): Promise<string[]> {
   });
 }
 
-/** Map a file extension to a tree-sitter language tag. */
-export function languageForPath(
-  relPath: string,
-): 'typescript' | 'tsx' | 'javascript' | 'python' | 'rust' | 'go' | null {
+/**
+ * Map a file extension to a tree-sitter language tag. Mirrors
+ * `Language::from_extension` in crates/cli/src/payload.rs.
+ */
+export function languageForPath(relPath: string): Language | null {
   const ext = path.extname(relPath).toLowerCase();
-  if (ext === '.ts') return 'typescript';
-  if (ext === '.tsx') return 'tsx';
-  if (ext === '.js' || ext === '.jsx') return 'javascript';
-  if (ext === '.py') return 'python';
-  if (ext === '.rs') return 'rust';
-  if (ext === '.go') return 'go';
-  return null;
+  switch (ext) {
+    case '.ts': return 'typescript';
+    case '.tsx': return 'tsx';
+    case '.js':
+    case '.jsx': return 'javascript';
+    case '.py': return 'python';
+    case '.rs': return 'rust';
+    case '.go': return 'go';
+    // .h stays C++ (most headers compile as C++; tree-sitter-cpp also parses C).
+    case '.cpp':
+    case '.cc':
+    case '.cxx':
+    case '.c++':
+    case '.hpp':
+    case '.hxx':
+    case '.h++':
+    case '.h': return 'cpp';
+    case '.c': return 'c';
+    case '.java': return 'java';
+    case '.kt':
+    case '.kts': return 'kotlin';
+    case '.rb': return 'ruby';
+    case '.php': return 'php';
+    case '.dart': return 'dart';
+    default: return null;
+  }
 }

@@ -272,7 +272,18 @@ fn iterate_for_drafts(
             let kind = drafts[new_idx].kind.as_str();
             if matches!(
                 kind,
-                "class" | "interface" | "struct" | "enum" | "trait" | "impl" | "union"
+                "class"
+                    | "interface"
+                    | "struct"
+                    | "enum"
+                    | "trait"
+                    | "impl"
+                    | "union"
+                    | "namespace"
+                    | "module"
+                    | "object"
+                    | "mixin"
+                    | "extension"
             ) {
                 next_parent = Some(new_idx);
                 next_namespace.push(drafts[new_idx].name.clone());

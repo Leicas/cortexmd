@@ -34,7 +34,10 @@
         },
         "language": {
           "type": "string",
-          "enum": ["typescript", "tsx", "javascript", "python", "rust", "go", "cpp"]
+          "enum": [
+            "typescript", "tsx", "javascript", "python", "rust", "go",
+            "cpp", "c", "java", "kotlin", "ruby", "php", "dart"
+          ]
         },
         "symbols": {
           "type": "array",

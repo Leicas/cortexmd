@@ -765,8 +765,13 @@ export function registerCodeIndexRepo(server: McpServer): void {
 const SymbolKind = z.enum([
   'function', 'class', 'method', 'interface', 'type',
   'const-export', 'struct', 'enum', 'trait', 'impl', 'union',
+  // Container kinds introduced with C/Java/Kotlin/Ruby/PHP/Dart support.
+  'namespace', 'module', 'object', 'mixin', 'extension',
 ]);
-const Language = z.enum(['typescript', 'tsx', 'javascript', 'python', 'rust', 'go', 'cpp']);
+const Language = z.enum([
+  'typescript', 'tsx', 'javascript', 'python', 'rust', 'go',
+  'cpp', 'c', 'java', 'kotlin', 'ruby', 'php', 'dart',
+]);
 
 const SymbolPayloadSchema = z.object({
   id: z.string().regex(SYMBOL_ID_RE),

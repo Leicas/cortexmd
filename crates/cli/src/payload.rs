@@ -68,6 +68,12 @@ pub enum Language {
     Rust,
     Go,
     Cpp,
+    C,
+    Java,
+    Kotlin,
+    Ruby,
+    Php,
+    Dart,
 }
 
 impl Language {
@@ -79,7 +85,15 @@ impl Language {
             "py" => Some(Self::Python),
             "rs" => Some(Self::Rust),
             "go" => Some(Self::Go),
+            // `.h` stays C++ (most headers compile as C++; tree-sitter-cpp also
+            // parses C). `.c` is plain C.
             "cpp" | "cc" | "cxx" | "c++" | "hpp" | "hxx" | "h++" | "h" => Some(Self::Cpp),
+            "c" => Some(Self::C),
+            "java" => Some(Self::Java),
+            "kt" | "kts" => Some(Self::Kotlin),
+            "rb" => Some(Self::Ruby),
+            "php" => Some(Self::Php),
+            "dart" => Some(Self::Dart),
             _ => None,
         }
     }
@@ -92,6 +106,12 @@ impl Language {
             Self::Rust => "rust",
             Self::Go => "go",
             Self::Cpp => "cpp",
+            Self::C => "c",
+            Self::Java => "java",
+            Self::Kotlin => "kotlin",
+            Self::Ruby => "ruby",
+            Self::Php => "php",
+            Self::Dart => "dart",
         }
     }
 }

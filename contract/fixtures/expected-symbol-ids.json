@@ -1,4 +1,134 @@
 {
+  "src/Greeter.java": [
+    {
+      "name": "Greeter",
+      "kind": "class",
+      "id": "6177771f2db2aa74",
+      "signature_normalized": "public class Greeter"
+    },
+    {
+      "name": "hello",
+      "kind": "method",
+      "id": "52b8cab49a9c64f6",
+      "signature_normalized": "public String hello()"
+    },
+    {
+      "name": "Shape",
+      "kind": "interface",
+      "id": "f8cf678d04b0a1c5",
+      "signature_normalized": "interface Shape"
+    },
+    {
+      "name": "area",
+      "kind": "method",
+      "id": "a1f408c509d1bdec",
+      "signature_normalized": "double area();"
+    }
+  ],
+  "src/greeter.cpp": [
+    {
+      "name": "ns",
+      "kind": "class",
+      "id": "af89722d9fe88f5e",
+      "signature_normalized": "namespace ns"
+    },
+    {
+      "name": "Greeter",
+      "kind": "class",
+      "id": "5f5c14b6fd1c0176",
+      "signature_normalized": "class Greeter"
+    },
+    {
+      "name": "hello",
+      "kind": "method",
+      "id": "68df6c627e01bdc5",
+      "signature_normalized": "int hello()"
+    },
+    {
+      "name": "top",
+      "kind": "method",
+      "id": "bf66b515f9ef4170",
+      "signature_normalized": "int top()"
+    }
+  ],
+  "src/greeter.kt": [
+    {
+      "name": "Greeter",
+      "kind": "class",
+      "id": "d1f673b171716dac",
+      "signature_normalized": "class Greeter(val name: String)"
+    },
+    {
+      "name": "hello",
+      "kind": "method",
+      "id": "4cac9812dfe2e719",
+      "signature_normalized": "fun hello(): String"
+    },
+    {
+      "name": "Singleton",
+      "kind": "object",
+      "id": "c8007497eb358b8f",
+      "signature_normalized": "object Singleton"
+    },
+    {
+      "name": "instance",
+      "kind": "method",
+      "id": "f0c30d1a48620447",
+      "signature_normalized": "fun instance()"
+    },
+    {
+      "name": "topLevel",
+      "kind": "function",
+      "id": "a4bb25aadca9123e",
+      "signature_normalized": "fun topLevel(x: Int): Int"
+    }
+  ],
+  "src/greeter.php": [
+    {
+      "name": "App",
+      "kind": "namespace",
+      "id": "44bc721e844b5808",
+      "signature_normalized": "namespace App;"
+    },
+    {
+      "name": "Greeter",
+      "kind": "class",
+      "id": "8e433344fe93c36b",
+      "signature_normalized": "class Greeter"
+    },
+    {
+      "name": "hello",
+      "kind": "method",
+      "id": "1e68523b6a9ce0d6",
+      "signature_normalized": "public function hello()"
+    },
+    {
+      "name": "top",
+      "kind": "function",
+      "id": "cdd5aea030a72f1f",
+      "signature_normalized": "function top()"
+    }
+  ],
+  "src/greeter.rb": [
+    {
+      "name": "Greeter",
+      "kind": "class",
+      "id": "fc1d3feca5ebaee1",
+      "signature_normalized": "class Greeter"
+    },
+    {
+      "name": "hello",
+      "kind": "method",
+      "id": "be6e6eaddbef9184",
+      "signature_normalized": "def hello"
+    },
+    {
+      "name": "top",
+      "kind": "function",
+      "id": "617820e18a5792f9",
+      "signature_normalized": "def top"
+    }
+  ],
   "src/helper.rs": [
     {
       "name": "clamp",
@@ -95,6 +225,20 @@
       "kind": "method",
       "id": "c1394ce9588e0e2f",
       "signature_normalized": "length(): number"
+    }
+  ],
+  "src/point.c": [
+    {
+      "name": "Point",
+      "kind": "struct",
+      "id": "26b6de16e95779fd",
+      "signature_normalized": "struct Point"
+    },
+    {
+      "name": "add",
+      "kind": "function",
+      "id": "b5a8d3e5321f88a1",
+      "signature_normalized": "int add(int a, int b)"
     }
   ],
   "src/util.py": [

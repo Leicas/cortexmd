@@ -306,7 +306,7 @@ const OBSIDIAN_MD: &str = r#"# cortexmd
 mirrors a SQLite cache of the symbol DB, and drives session hooks (HUD line,
 memory recall, store-memory).
 
-## Cheap MCP code-nav tools (prefer over Read/Grep on TS/JS/Python/Rust/Go/C++)
+## Cheap MCP code-nav tools (prefer over Read/Grep on TS/JS/Python/Rust/Go/C/C++/Java/Kotlin/Ruby/PHP/Dart)
 
 - `code_symbol_search(query, repo)` — FTS over names/sigs/docstrings (~60 tokens/result)
 - `code_file_outline(repo, path)` — file overview without reading the body

@@ -36,6 +36,15 @@ function languageForPath(relPath) {
   if (ext === '.py') return 'python';
   if (ext === '.rs') return 'rust';
   if (ext === '.go') return 'go';
+  if (['.cpp', '.cc', '.cxx', '.c++', '.hpp', '.hxx', '.h++', '.h'].includes(ext)) return 'cpp';
+  if (ext === '.c') return 'c';
+  if (ext === '.java') return 'java';
+  if (ext === '.kt' || ext === '.kts') return 'kotlin';
+  if (ext === '.rb') return 'ruby';
+  if (ext === '.php') return 'php';
+  // .dart is intentionally omitted: tree-sitter-dart's npm grammar targets a
+  // newer ABI than the pinned runtime, so the TS parser can't load it. The Rust
+  // CLI still indexes Dart; it's just excluded from this golden parity fixture.
   return null;
 }
 

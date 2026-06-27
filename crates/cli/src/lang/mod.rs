@@ -1,9 +1,15 @@
 //! Per-language tree-sitter dispatch. Mirrors `src/lib/code-nav/parser.ts`'s
 //! `draftFor` (line 317) and `collectImports` (line 491) split by language.
 
+pub mod c;
 pub mod cpp;
+pub mod dart;
 pub mod go;
+pub mod java;
+pub mod kotlin;
+pub mod php;
 pub mod python;
+pub mod ruby;
 pub mod rust_lang;
 pub mod ts_js;
 
@@ -23,6 +29,14 @@ pub fn tree_sitter_language(lang: Language) -> tree_sitter::Language {
         Language::Rust => tree_sitter_rust::LANGUAGE.into(),
         Language::Go => tree_sitter_go::LANGUAGE.into(),
         Language::Cpp => tree_sitter_cpp::LANGUAGE.into(),
+        Language::C => tree_sitter_c::LANGUAGE.into(),
+        Language::Java => tree_sitter_java::LANGUAGE.into(),
+        Language::Kotlin => tree_sitter_kotlin_ng::LANGUAGE.into(),
+        Language::Ruby => tree_sitter_ruby::LANGUAGE.into(),
+        // tree-sitter-php exposes LANGUAGE_PHP (full, with `<?php`) and
+        // LANGUAGE_PHP_ONLY (no open tag). Source files carry the tag.
+        Language::Php => tree_sitter_php::LANGUAGE_PHP.into(),
+        Language::Dart => tree_sitter_dart::LANGUAGE.into(),
     }
 }
 
@@ -43,6 +57,12 @@ pub fn draft_for(
         Language::Rust => rust_lang::draft_for(node, src, parent_idx, namespace),
         Language::Go => go::draft_for(node, src, parent_idx, namespace),
         Language::Cpp => cpp::draft_for(node, src, parent_idx, namespace),
+        Language::C => c::draft_for(node, src, parent_idx, namespace),
+        Language::Java => java::draft_for(node, src, parent_idx, namespace),
+        Language::Kotlin => kotlin::draft_for(node, src, parent_idx, namespace),
+        Language::Ruby => ruby::draft_for(node, src, parent_idx, namespace),
+        Language::Php => php::draft_for(node, src, parent_idx, namespace),
+        Language::Dart => dart::draft_for(node, src, parent_idx, namespace),
     }
 }
 
@@ -62,5 +82,11 @@ pub fn collect_imports(
         Language::Rust => rust_lang::collect_imports(root, src, out),
         Language::Go => go::collect_imports(root, src, out),
         Language::Cpp => cpp::collect_imports(root, src, out),
+        Language::C => c::collect_imports(root, src, out),
+        Language::Java => java::collect_imports(root, src, out),
+        Language::Kotlin => kotlin::collect_imports(root, src, out),
+        Language::Ruby => ruby::collect_imports(root, src, out),
+        Language::Php => php::collect_imports(root, src, out),
+        Language::Dart => dart::collect_imports(root, src, out),
     }
 }

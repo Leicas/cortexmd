@@ -45,7 +45,8 @@ const REPO_PATHS_CACHE_FILE: &str = "repo-paths.json";
 
 const SOURCE_EXTS: &[&str] = &[
     ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".py", ".rs", ".go", ".cpp",
-    ".cc", ".cxx", ".hpp", ".hxx", ".h", ".c",
+    ".cc", ".cxx", ".c++", ".hpp", ".hxx", ".h++", ".h", ".c",
+    ".java", ".kt", ".kts", ".rb", ".php", ".dart",
 ];
 
 const REWRITE_BIN: &str = "cortexmd";

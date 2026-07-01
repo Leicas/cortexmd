@@ -360,6 +360,23 @@ Categories: observation, decision, insight, conversation, fact, preference, plan
       await indexNote(notePath);
       updateGraphForNote(notePath, noteContent);
 
+      // Bitemporal supersession pass (DORMANT unless config.bitemporalKg). When
+      // enabled, derives single-valued facts from this memory, closes any
+      // superseded KG rival (never deletes), and stamps the EARLIER source
+      // note's frontmatter with valid_to/superseded_by. With the flag off this
+      // is a no-op and ingestion behaves exactly as today. Never throws.
+      if (config.bitemporalKg) {
+        try {
+          const { runSupersessionPass } = await import('../lib/bitemporal.js');
+          await runSupersessionPass(notePath, frontmatter, body);
+        } catch (err) {
+          logger.warn('bitemporal supersession pass failed', {
+            path: notePath,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
+
       // Task 4: Check for consolidation candidates sharing 2+ tags
       let consolidation_suggested: { paths: string[]; commonTags: string[] } | undefined;
       if (tags && tags.length >= 2) {

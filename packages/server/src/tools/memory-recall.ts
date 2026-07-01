@@ -142,6 +142,10 @@ export function register(server: McpServer): void {
       tags: z.array(z.string()).optional().describe("Filter results by tags"),
       dateFrom: z.string().optional().describe("Filter results from this date (YYYY-MM-DD)"),
       dateTo: z.string().optional().describe("Filter results up to this date (YYYY-MM-DD)"),
+      asOf: z
+        .string()
+        .optional()
+        .describe("Bitemporal point-in-time (ISO date/instant). When set, only memories whose validity window includes this instant are returned — superseded/stale facts are suppressed. Omit for normal recall (returns latest, unchanged behavior)."),
       limit: z.number().optional().default(10).describe("Maximum number of results"),
       includeContent: z
         .boolean()
@@ -171,6 +175,7 @@ export function register(server: McpServer): void {
       const tags = params.tags as string[] | undefined;
       const dateFrom = params.dateFrom as string | undefined;
       const dateTo = params.dateTo as string | undefined;
+      const asOf = params.asOf as string | undefined;
       const limit = (params.limit as number | undefined) ?? 10;
       const includeContent = (params.includeContent as boolean | undefined) ?? false;
       const contextSnippet = params.contextSnippet as string | undefined;
@@ -217,6 +222,9 @@ export function register(server: McpServer): void {
         tags,
         dateFrom,
         dateTo,
+        // Pass-through only — when undefined (the normal call) hybridSearch does
+        // zero bitemporal filtering and behaves exactly as today.
+        asOf,
         limit: overFetchLimit,
       });
 

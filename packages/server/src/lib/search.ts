@@ -12,6 +12,7 @@ import { isRerankerEnabled, rerankResults } from './reranker.js';
 import { isPathIndexable, sourceNameForVault } from './index-allowlist.js';
 import { getVault, pruneStaleVaultTransports } from './vault/registry.js';
 import { listSourceVaultPaths } from './source-vaults.js';
+import { withinWindow } from './bitemporal.js';
 
 export interface SearchOptions {
   scopePaths?: string[];
@@ -26,6 +27,13 @@ export interface SearchOptions {
   importance?: string;
   excludeArchived?: boolean;
   collections?: string[];
+  /**
+   * Bitemporal as-of instant (ISO). When set, notes whose validity window
+   * `[valid_from, valid_to)` excludes `asOf` are suppressed from results. When
+   * UNSET (the normal production path) no bitemporal filtering happens and
+   * results are byte-identical to today.
+   */
+  asOf?: string;
 }
 
 export interface SearchResult {
@@ -55,6 +63,12 @@ interface DocMeta {
   related?: string[];
   validity_alpha?: number;
   validity_beta?: number;
+  // Bitemporal source-note validity window (populated only when a supersession
+  // pass has stamped the note; otherwise all undefined and every asOf filter is
+  // a no-op). Read from frontmatter exactly like the validity_* fields above.
+  valid_from?: string;
+  valid_to?: string;
+  superseded_by?: string;
 }
 
 export interface IndexHealthEntry {
@@ -236,6 +250,9 @@ export async function rebuildIndex(): Promise<void> {
           related: Array.isArray(data.related) ? data.related as string[] : undefined,
           validity_alpha: typeof data.validity_alpha === 'number' ? data.validity_alpha : undefined,
           validity_beta: typeof data.validity_beta === 'number' ? data.validity_beta : undefined,
+          valid_from: typeof data.valid_from === 'string' ? data.valid_from : undefined,
+          valid_to: typeof data.valid_to === 'string' ? data.valid_to : undefined,
+          superseded_by: typeof data.superseded_by === 'string' ? data.superseded_by : undefined,
         });
 
         miniSearch.add({
@@ -515,6 +532,23 @@ export function searchNotes(
 }
 
 /**
+ * Bitemporal as-of filter. Drops results whose source-note validity window
+ * `[valid_from, valid_to)` excludes `asOf`. `valid_from` falls back to the
+ * note's `date` when unstamped (matching the ingest default). Applied to a
+ * result list so it can gate BOTH the lexical-only early-return path and the
+ * fused path. NO-OP contract: callers only invoke this when `asOf` is set, so
+ * with no `asOf` recall is byte-identical to today.
+ */
+function filterByAsOf<T extends { path: string }>(results: T[], asOf: string): T[] {
+  return results.filter((r) => {
+    const meta = docMeta.get(r.path);
+    if (!meta) return true; // no metadata → don't drop (fail-open, matches non-temporal behavior)
+    const vf = meta.valid_from ?? meta.date;
+    return withinWindow(vf, meta.valid_to, asOf);
+  });
+}
+
+/**
  * Hybrid search combining lexical (MiniSearch) and semantic (embeddings) results
  * using Reciprocal Rank Fusion. Falls back to lexical-only if embeddings unavailable.
  */
@@ -526,7 +560,14 @@ export async function hybridSearch(
   const overFetch = limit * 2;
 
   // Lexical results (always available)
-  const lexicalResults = searchNotes(query, { ...opts, limit: overFetch });
+  let lexicalResults = searchNotes(query, { ...opts, limit: overFetch });
+
+  // Bitemporal as-of suppression (ONLY when asOf is passed). Applied to the
+  // lexical list up front so the lexical-only early-return branches below are
+  // filtered too — that is the branch the default (embeddings-off) eval hits.
+  if (opts.asOf) {
+    lexicalResults = filterByAsOf(lexicalResults, opts.asOf);
+  }
 
   // Semantic results (if available)
   if (!isEmbeddingsReady()) {
@@ -585,6 +626,12 @@ export async function hybridSearch(
 
     // Apply same filters as searchNotes
     if (excludeArchived && meta.archived === true) continue;
+    // Bitemporal as-of suppression on the fused path (semantic results can
+    // reintroduce a note the lexical pre-filter dropped). ONLY when asOf set.
+    if (opts.asOf) {
+      const vf = meta.valid_from ?? meta.date;
+      if (!withinWindow(vf, meta.valid_to, opts.asOf)) continue;
+    }
     if (collections && collections.length > 0 && !collections.includes(meta.collection)) continue;
     if (scopePaths && scopePaths.length > 0 && !scopePaths.some(sp => fusedPath.startsWith(sp))) continue;
     if (tags && tags.length > 0 && !tags.some(t => meta.tags.includes(t))) continue;

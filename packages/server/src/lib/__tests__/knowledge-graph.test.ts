@@ -25,6 +25,7 @@ const {
   kgTimeline,
   kgStats,
   kgSearch,
+  kgSupersede,
 } = await import('../knowledge-graph.js');
 
 const dbPath = join(tmpDir, 'knowledge-graph.sqlite');
@@ -156,5 +157,152 @@ describe('knowledge-graph', () => {
     kgAddTriple('Alice', 'knows', 'Bob');
     const stats = kgStats();
     expect(stats.entityCount).toBe(2);
+  });
+
+  // --- Bitemporal schema migration ---
+
+  describe('bitemporal columns', () => {
+    it('should expose transaction-time + supersession columns on new rows', () => {
+      kgAddTriple('Alice', 'located_in', 'Building A', { validFrom: '2026-01-01' });
+      const { triples } = kgQueryEntity('Alice', 'outgoing');
+      const t = triples.find((x) => x.predicate === 'located_in')!;
+      expect(t.recorded_at).toBeTruthy();          // stamped at insert
+      expect(t.invalidated_at).toBeNull();          // live row
+      expect(t.superseded_by).toBeNull();
+      expect(t.supersedes).toBeNull();
+    });
+
+    it('kgInvalidateTriple stamps invalidated_at (transaction time)', () => {
+      kgAddTriple('Alice', 'knows', 'Bob');
+      kgInvalidateTriple('Alice', 'knows', 'Bob', '2026-03-01');
+      const timeline = kgTimeline('Alice');
+      expect(timeline[0].valid_to).toBe('2026-03-01');
+      expect(timeline[0].invalidated_at).not.toBeNull();
+    });
+  });
+
+  // --- Supersession primitive (close-and-link, never delete) ---
+
+  describe('kgSupersede', () => {
+    it('closes the prior rival and links both directions', () => {
+      const first = kgAddTriple('team office', 'office_location', 'Building A', {
+        validFrom: '2026-01-01',
+        source: 'note-a.md',
+      });
+
+      const { newId, supersededIds } = kgSupersede(
+        'team office',
+        'office_location',
+        'Building C',
+        '2026-03-01',
+        { source: 'note-c.md' },
+      );
+
+      expect(supersededIds).toEqual([first.id]);
+
+      // Full history query returns BOTH rows — nothing is deleted.
+      const { triples } = kgQueryEntity('team office', 'outgoing');
+      expect(triples).toHaveLength(2);
+
+      const oldRow = triples.find((t) => t.object === 'Building A')!;
+      const newRow = triples.find((t) => t.object === 'Building C')!;
+
+      // Old row: closed at the new fact's event time, transaction-invalidated,
+      // and forward-linked to the replacement.
+      expect(oldRow.valid_to).toBe('2026-03-01');
+      expect(oldRow.invalidated_at).not.toBeNull();
+      expect(oldRow.superseded_by).toBe(newId);
+
+      // New row: live, and back-links to the fact it replaced.
+      expect(newRow.id).toBe(newId);
+      expect(newRow.valid_to).toBeNull();
+      expect(newRow.invalidated_at).toBeNull();
+      expect(newRow.supersedes).toBe(first.id);
+    });
+
+    it('never hard-deletes — superseded rows remain SELECT-able', () => {
+      kgAddTriple('team office', 'office_location', 'Building A', { validFrom: '2026-01-01' });
+      kgSupersede('team office', 'office_location', 'Building C', '2026-03-01');
+
+      const stats = kgStats();
+      expect(stats.tripleCount).toBe(2);        // both rows persist
+      expect(stats.activeTriples).toBe(1);       // only the new one is event-active
+      expect(stats.expiredTriples).toBe(1);
+    });
+
+    it('does not supersede facts with the same object (idempotent re-assert)', () => {
+      const first = kgAddTriple('team office', 'office_location', 'Building A', { validFrom: '2026-01-01' });
+      const { newId, supersededIds } = kgSupersede('team office', 'office_location', 'Building A', '2026-03-01');
+
+      expect(newId).toBe(first.id);       // same triple id
+      expect(supersededIds).toEqual([]);  // nothing closed
+      const { triples } = kgQueryEntity('team office', 'outgoing');
+      expect(triples).toHaveLength(1);
+      expect(triples[0].valid_to).toBeNull();
+    });
+
+    it('closes multiple concurrent rivals in one call', () => {
+      const a = kgAddTriple('billing service', 'primary_database', 'Postgres', { validFrom: '2026-01-01' });
+      const b = kgAddTriple('billing service', 'primary_database', 'MySQL', { validFrom: '2026-01-02' });
+
+      const { supersededIds } = kgSupersede('billing service', 'primary_database', 'DynamoDB', '2026-04-01');
+
+      expect(supersededIds.sort()).toEqual([a.id, b.id].sort());
+      const { triples } = kgQueryEntity('billing service', 'outgoing');
+      const live = triples.filter((t) => t.valid_to === null);
+      expect(live).toHaveLength(1);
+      expect(live[0].object).toBe('DynamoDB');
+    });
+
+    it('does not clobber an already-set valid_to on a superseded rival', () => {
+      kgAddTriple('team office', 'office_location', 'Building A', { validFrom: '2026-01-01' });
+      // Manually end it earlier than the superseding fact's event time.
+      kgInvalidateTriple('team office', 'office_location', 'Building A', '2026-02-15');
+      // A closed (valid_to set) row is no longer transaction-active, so it is
+      // NOT a rival and its valid_to is preserved.
+      const { supersededIds } = kgSupersede('team office', 'office_location', 'Building C', '2026-03-01');
+      expect(supersededIds).toEqual([]);
+
+      const { triples } = kgQueryEntity('team office', 'outgoing');
+      const oldRow = triples.find((t) => t.object === 'Building A')!;
+      expect(oldRow.valid_to).toBe('2026-02-15');   // preserved, not clobbered
+    });
+  });
+
+  // --- As-of (point-in-time) queries: half-open [valid_from, valid_to) ---
+
+  describe('as-of queries', () => {
+    beforeEach(() => {
+      kgAddTriple('team office', 'office_location', 'Building A', { validFrom: '2026-01-01' });
+      kgSupersede('team office', 'office_location', 'Building C', '2026-03-01');
+    });
+
+    it('returns the fact valid at an early instant (Building A)', () => {
+      const { triples } = kgQueryEntity('team office', 'outgoing', '2026-02-01');
+      expect(triples).toHaveLength(1);
+      expect(triples[0].object).toBe('Building A');
+    });
+
+    it('returns the superseding fact at a later instant (Building C)', () => {
+      const { triples } = kgQueryEntity('team office', 'outgoing', '2026-04-01');
+      expect(triples).toHaveLength(1);
+      expect(triples[0].object).toBe('Building C');
+    });
+
+    it('is half-open: valid_from is inclusive, valid_to is exclusive', () => {
+      // Exactly at Building A's valid_from → included.
+      expect(kgQueryEntity('team office', 'outgoing', '2026-01-01').triples.map((t) => t.object)).toEqual([
+        'Building A',
+      ]);
+      // Exactly at the cutover (Building A.valid_to == Building C.valid_from ==
+      // 2026-03-01): A is excluded (asOf >= valid_to), C is included.
+      const atCutover = kgQueryEntity('team office', 'outgoing', '2026-03-01').triples.map((t) => t.object);
+      expect(atCutover).toEqual(['Building C']);
+    });
+
+    it('without asOf returns full history (both rows)', () => {
+      const { triples } = kgQueryEntity('team office', 'outgoing');
+      expect(triples).toHaveLength(2);
+    });
   });
 });

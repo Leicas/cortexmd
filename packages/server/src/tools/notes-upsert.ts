@@ -315,6 +315,19 @@ Use wiki-links in content to build the knowledge graph: [[Note Name]] links to a
         }
       }
 
+      // Bitemporal supersession pass (DORMANT unless config.bitemporalKg). Closes
+      // any superseded KG rival (never deletes) and stamps the earlier source
+      // note's validity window. No-op + identical to today when the flag is off.
+      if (config.bitemporalKg) {
+        try {
+          const { runSupersessionPass } = await import('../lib/bitemporal.js');
+          const { data, body } = parseFrontmatter(finalContent);
+          await runSupersessionPass(notePath, data, body);
+        } catch {
+          // Non-critical — never fail an upsert on a bitemporal error.
+        }
+      }
+
       const { similarNotes, suggestion } = await findSimilarNotes(finalContent, notePath);
       const responseData: Record<string, unknown> = { path: notePath, updated: true, etag };
       if (similarNotes.length > 0) {

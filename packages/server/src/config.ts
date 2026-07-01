@@ -281,6 +281,15 @@ export const config = {
   // Knowledge graph
   kgEnabled: process.env.ENABLE_KG !== 'false',
 
+  // Bitemporal knowledge graph (v1). DORMANT by default — note the inverted
+  // default vs. the sibling flags above (those default ON via `!== 'false'`;
+  // this one defaults OFF via `=== 'true'`). When ON, ingestion runs
+  // supersession detection + stamps source-note validity windows. As-of recall
+  // filtering is a SEPARATE, independent gate — it triggers only when an `asOf`
+  // argument is passed to recall, regardless of this flag. With the flag off and
+  // no `asOf`, both ingestion and recall behave exactly as they do today.
+  bitemporalKg: process.env.BITEMPORAL_KG === 'true',
+
   // Automatic linking on store (memory_store / notes_upsert). Conservative +
   // reversible defaults: entity links keep the historical 0.7 confidence gate;
   // similarity backlinks use a higher score floor than the advisory

@@ -60,7 +60,43 @@ export function initKnowledgeGraph(): void {
     CREATE INDEX IF NOT EXISTS idx_triples_validity ON triples(valid_from, valid_to);
   `);
 
+  migrateBitemporalColumns(db);
+
   logger.info('Knowledge graph initialized', { dbPath });
+}
+
+/**
+ * Bitemporal KG migration (additive, idempotent). Adds TRANSACTION-time columns
+ * (recorded_at / invalidated_at) and the supersession links (superseded_by /
+ * supersedes) to the existing EVENT-time columns (valid_from / valid_to).
+ *
+ * Safety: purely additive ALTER TABLE ADD COLUMN guarded against re-run; never
+ * drops or hard-deletes. On a DB that already has the columns this is a no-op.
+ * With the BITEMPORAL_KG flag off, the columns simply stay at their backfilled
+ * defaults (recorded_at = created, everything else NULL) and no code writes them.
+ */
+function migrateBitemporalColumns(d: BetterSqlite3.Database): void {
+  const cols = new Set(
+    (d.prepare('PRAGMA table_info(triples)').all() as Array<{ name: string }>).map((c) => c.name),
+  );
+
+  const addColumn = (name: string, decl: string): void => {
+    if (cols.has(name)) return;
+    d.exec(`ALTER TABLE triples ADD COLUMN ${name} ${decl}`);
+    cols.add(name);
+  };
+
+  addColumn('recorded_at', 'TEXT');
+  addColumn('invalidated_at', 'TEXT');
+  addColumn('superseded_by', 'TEXT');
+  addColumn('supersedes', 'TEXT');
+
+  // Backfill transaction-time for pre-existing rows so `recorded_at` is never
+  // NULL going forward (it defaults to the row's original creation timestamp).
+  d.exec('UPDATE triples SET recorded_at = created WHERE recorded_at IS NULL');
+
+  d.exec('CREATE INDEX IF NOT EXISTS idx_triples_sp  ON triples(subject, predicate)');
+  d.exec('CREATE INDEX IF NOT EXISTS idx_triples_txn ON triples(invalidated_at)');
 }
 
 export function shutdownKG(): void {
@@ -107,16 +143,19 @@ export function kgAddTriple(
   const existing = d.prepare('SELECT id FROM triples WHERE id = ?').get(id) as { id: string } | undefined;
 
   if (existing) {
+    // Re-opening an existing triple clears any prior transaction-time closure so
+    // the row is live again (invalidated_at = NULL). superseded_by/supersedes are
+    // left untouched — they are managed exclusively by kgSupersede.
     d.prepare(
-      `UPDATE triples SET valid_from = ?, valid_to = NULL, confidence = ?, source = ? WHERE id = ?`,
+      `UPDATE triples SET valid_from = ?, valid_to = NULL, confidence = ?, source = ?, invalidated_at = NULL WHERE id = ?`,
     ).run(validFrom, confidence, source, id);
     return { id, created: false };
   }
 
   d.prepare(
-    `INSERT INTO triples (id, subject, predicate, object, valid_from, confidence, source, created)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(id, subject, predicate, object, validFrom, confidence, source, now);
+    `INSERT INTO triples (id, subject, predicate, object, valid_from, confidence, source, created, recorded_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(id, subject, predicate, object, validFrom, confidence, source, now, now);
 
   return { id, created: true };
 }
@@ -130,9 +169,98 @@ export function kgInvalidateTriple(
   const d = getDb();
   const id = tripleId(subject, predicate, object);
   const validTo = ended ?? todayISO();
+  const now = nowISO();
 
-  const result = d.prepare('UPDATE triples SET valid_to = ? WHERE id = ? AND valid_to IS NULL').run(validTo, id);
+  // Close the fact's EVENT-time window (valid_to) and stamp its TRANSACTION-time
+  // closure (invalidated_at). Additive: existing callers are unaffected — the
+  // return contract (did we close a live triple?) is identical to before.
+  const result = d
+    .prepare('UPDATE triples SET valid_to = ?, invalidated_at = ? WHERE id = ? AND valid_to IS NULL')
+    .run(validTo, now, id);
   return result.changes > 0;
+}
+
+/**
+ * Bitemporal supersession primitive (close-and-link, never delete).
+ *
+ * When a new single-valued fact (subject, predicate, newObject) arrives with
+ * EVENT time `eventTime`, any transaction-active rival with the same
+ * (subject, predicate) but a different object is CLOSED:
+ *   - valid_to        = eventTime   (event-time window ends when the new fact begins)
+ *   - invalidated_at  = now         (transaction-time closure)
+ *   - superseded_by   = newId       (forward link to the replacement)
+ * and the new triple is inserted/re-opened with `supersedes` pointing back at
+ * the first rival it replaced. History is preserved: superseded rows remain
+ * SELECT-able, just marked closed and linked.
+ *
+ * Caller (bitemporal.ts, owner B) is responsible for gating this behind
+ * config.bitemporalKg and for restricting `predicate` to single-valued
+ * relations. This function itself performs no flag check — it is a pure KG
+ * write primitive.
+ */
+export function kgSupersede(
+  subject: string,
+  predicate: string,
+  newObject: string,
+  eventTime: string,
+  opts?: { source?: string; confidence?: number },
+): { newId: string; supersededIds: string[] } {
+  const d = getDb();
+  const newId = tripleId(subject, predicate, newObject);
+  const now = nowISO();
+  const confidence = opts?.confidence ?? 1.0;
+  const source = opts?.source ?? null;
+
+  const runTxn = d.transaction((): { newId: string; supersededIds: string[] } => {
+    ensureEntity(subject);
+    ensureEntity(newObject);
+
+    // 1. Find transaction-active rivals: same (subject, predicate), different
+    //    object, not already closed.
+    const rivals = d
+      .prepare(
+        `SELECT id FROM triples
+         WHERE subject = ? AND predicate = ? AND object != ? AND invalidated_at IS NULL`,
+      )
+      .all(subject, predicate, newObject) as Array<{ id: string }>;
+    const supersededIds = rivals.map((r) => r.id);
+    const firstRival = supersededIds.length > 0 ? supersededIds[0] : null;
+
+    // 2. Insert or re-open the new (superseding) triple.
+    const existing = d.prepare('SELECT id FROM triples WHERE id = ?').get(newId) as
+      | { id: string }
+      | undefined;
+    if (existing) {
+      d.prepare(
+        `UPDATE triples
+         SET valid_from = ?, valid_to = NULL, confidence = ?, source = ?,
+             invalidated_at = NULL, supersedes = COALESCE(?, supersedes)
+         WHERE id = ?`,
+      ).run(eventTime, confidence, source, firstRival, newId);
+    } else {
+      d.prepare(
+        `INSERT INTO triples
+           (id, subject, predicate, object, valid_from, confidence, source, created, recorded_at, supersedes)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(newId, subject, predicate, newObject, eventTime, confidence, source, now, now, firstRival);
+    }
+
+    // 3. Close each rival. Only stamp valid_to when it is still open so a
+    //    manually-ended fact isn't clobbered; always link superseded_by and
+    //    stamp the transaction-time closure.
+    const closeRival = d.prepare(
+      `UPDATE triples
+       SET valid_to = COALESCE(valid_to, ?), invalidated_at = ?, superseded_by = ?
+       WHERE id = ?`,
+    );
+    for (const id of supersededIds) {
+      closeRival.run(eventTime, now, newId, id);
+    }
+
+    return { newId, supersededIds };
+  });
+
+  return runTxn();
 }
 
 export interface TripleRow {
@@ -142,6 +270,10 @@ export interface TripleRow {
   object: string;
   valid_from: string | null;
   valid_to: string | null;
+  recorded_at: string;
+  invalidated_at: string | null;
+  superseded_by: string | null;
+  supersedes: string | null;
   confidence: number;
   source: string | null;
   created: string;

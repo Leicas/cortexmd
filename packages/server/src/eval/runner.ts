@@ -33,6 +33,16 @@ export interface RunHarnessOptions {
    * temp vault (see {@link createRealRetriever}). Inject a mock in tests.
    */
   retriever?: Retriever;
+  /**
+   * Enable the BITEMPORAL_KG feature for this run (A/B "treatment" arm). When
+   * true the real retriever (a) turns on the flag + KG at ingest so
+   * supersession detection and note-validity stamping run for each scenario's
+   * dated events, and (b) passes each query's point-in-time `ts` as `asOf` so
+   * as-of recall filtering engages. When false (the "baseline" arm) the flag
+   * stays OFF and no `asOf` is passed, so recall behaves exactly as today.
+   * Ignored when an explicit `retriever` (e.g. the unit-test mock) is injected.
+   */
+  bitemporal?: boolean;
 }
 
 /**
@@ -95,7 +105,8 @@ function validateScenario(obj: unknown, lineNo: number, src: string): Scenario {
 export async function runHarness(dataset: Dataset, opts: RunHarnessOptions = {}): Promise<EvalReport> {
   const k = opts.k ?? 5;
   const retriever: LifecycleRetriever =
-    (opts.retriever as LifecycleRetriever | undefined) ?? (await createRealRetriever(dataset, k));
+    (opts.retriever as LifecycleRetriever | undefined) ??
+    (await createRealRetriever(dataset, k, { bitemporal: opts.bitemporal ?? false }));
   try {
     const results: QueryResult[] = [];
     for (const scenario of dataset) {
@@ -142,8 +153,30 @@ export interface LifecycleRetriever {
  * Embeddings are OPT-IN (EVAL_EMBEDDINGS=1). Lexical-only still exercises the
  * real MiniSearch index + hybridSearch fusion path and gives a fast, valid
  * baseline; enabling embeddings loads the model (~seconds) for full fidelity.
+ *
+ * BITEMPORAL ARM (`opts.bitemporal`): the treatment side of the A/B. It flips
+ * on the real feature end-to-end for this temp vault ONLY — never production:
+ *   - BITEMPORAL_KG='true' + ENABLE_KG='true' are set BEFORE the dynamic
+ *     imports (mirroring how BRAIN_VAULT etc. are set above) so config.ts
+ *     freezes the flag ON and knowledge-graph.ts initializes;
+ *   - `runSupersessionForNotes` runs after each scenario's notes are written so
+ *     dated events supersede their predecessors + stamp note validity windows;
+ *   - the query's point-in-time `ts` is passed to hybridSearch as `asOf`, which
+ *     is the ONLY trigger for as-of recall filtering.
+ * With `opts.bitemporal` false none of the above happens and the arm is
+ * byte-identical to the pre-existing baseline (flag off, no asOf).
  */
-export async function createRealRetriever(_dataset: Dataset, _k: number): Promise<LifecycleRetriever> {
+export interface RealRetrieverOptions {
+  /** Enable the BITEMPORAL_KG treatment arm (see {@link createRealRetriever}). */
+  bitemporal?: boolean;
+}
+
+export async function createRealRetriever(
+  _dataset: Dataset,
+  _k: number,
+  opts: RealRetrieverOptions = {},
+): Promise<LifecycleRetriever> {
+  const bitemporal = opts.bitemporal ?? false;
   const tmpRoot = await mkdtemp(path.join(os.tmpdir(), 'cortexmd-eval-'));
   const brainVault = path.join(tmpRoot, 'brain');
   const dataDir = path.join(tmpRoot, 'data');
@@ -161,7 +194,12 @@ export async function createRealRetriever(_dataset: Dataset, _k: number): Promis
   delete process.env.SOURCE_VAULTS;
   delete process.env.VAULT_RO_PERSO;
   delete process.env.VAULT_RO_HAPLY;
-  process.env.ENABLE_KG = 'false';
+  // Bitemporal arm needs the KG on (supersession writes go through KG-core) and
+  // the feature flag flipped ON — both read at module-load, so set them here
+  // BEFORE the dynamic imports. Baseline arm leaves the flag OFF and the KG off,
+  // exactly as the pre-existing harness did.
+  process.env.ENABLE_KG = bitemporal ? 'true' : 'false';
+  process.env.BITEMPORAL_KG = bitemporal ? 'true' : 'false';
   process.env.AUTO_LINK = 'false';
   process.env.AUTO_SEED_KG = 'false';
   process.env.ENABLE_EMBEDDINGS = useEmbeddings ? 'true' : 'false';
@@ -172,14 +210,29 @@ export async function createRealRetriever(_dataset: Dataset, _k: number): Promis
   const search = await import('../lib/search.js');
   const embeddings = useEmbeddings ? await import('../lib/embeddings.js') : null;
 
+  // Bitemporal-only imports: init the KG so isKgInitialized() passes, and pull
+  // the batch supersession pass. Both are no-ops on the baseline arm (not even
+  // imported), keeping that path unchanged.
+  const kg = bitemporal ? await import('../lib/knowledge-graph.js') : null;
+  const bitemp = bitemporal ? await import('../lib/bitemporal.js') : null;
+  if (kg) {
+    kg.initKnowledgeGraph();
+  }
+
   if (embeddings) {
     await embeddings.initEmbeddings();
   }
 
   let scenarioSeq = 0;
 
-  const retriever = (async ({ query, k }) => {
-    const results = await search.hybridSearch(query, { limit: k, type: 'memory' });
+  const retriever = (async ({ query, ts, k }) => {
+    // Bitemporal arm: pass the query's point-in-time `ts` as `asOf` so as-of
+    // recall filtering engages (its ONLY trigger). Baseline arm passes no
+    // `asOf`, so recall is byte-identical to today.
+    const searchOpts = bitemporal
+      ? { limit: k, type: 'memory' as const, asOf: ts }
+      : { limit: k, type: 'memory' as const };
+    const results = await search.hybridSearch(query, searchOpts);
     const docMeta = search.getDocMeta();
     return results.map((r) => {
       const meta = docMeta.get(r.path);
@@ -194,6 +247,9 @@ export async function createRealRetriever(_dataset: Dataset, _k: number): Promis
     // one scenario's memories never bleed into another's recall.
     scenarioSeq++;
     const prefix = `Memories/eval-${String(scenarioSeq).padStart(3, '0')}-${scenario.id}`;
+    // Collect note descriptors for the bitemporal supersession pass. On the
+    // baseline arm this array is simply unused.
+    const written: Array<{ path: string; frontmatter: Record<string, unknown>; body: string }> = [];
     for (let i = 0; i < scenario.events.length; i++) {
       const ev = scenario.events[i];
       const notePath = `${prefix}/event-${String(i).padStart(3, '0')}.md`;
@@ -215,8 +271,19 @@ export async function createRealRetriever(_dataset: Dataset, _k: number): Promis
       const noteBody = `# ${firstLine(ev.content)}\n\n${ev.content}\n`;
       const noteContent = stringifyFrontmatter(frontmatter, noteBody);
       await writeNote(notePath, noteContent);
+      written.push({ path: notePath, frontmatter, body: noteBody });
     }
-    // Rebuild the real lexical index over the freshly written notes.
+    // Bitemporal arm: run supersession over this scenario's dated events so
+    // single-valued facts (office move, role change, db choice) close their
+    // predecessors and stamp the earlier notes' validity windows. It is a
+    // no-op unless BITEMPORAL_KG is on AND the KG is initialized (both true on
+    // this arm). Ordered by valid_from internally. Never throws.
+    if (bitemp) {
+      await bitemp.runSupersessionForNotes(written);
+    }
+    // Rebuild the real lexical index over the freshly written notes. This runs
+    // AFTER supersession so DocMeta reflects the stamped valid_to/superseded_by
+    // windows the as-of filter reads.
     await search.rebuildIndex();
     // Build the real embedding index over the same docs when enabled.
     if (embeddings) {
@@ -229,6 +296,16 @@ export async function createRealRetriever(_dataset: Dataset, _k: number): Promis
   };
 
   retriever.cleanup = async () => {
+    // Close the KG's SQLite handle first — on Windows the open WAL/-shm files
+    // keep the temp dir locked and `rm` fails with EBUSY otherwise. No-op on
+    // the baseline arm (kg was never imported/opened).
+    if (kg) {
+      try {
+        kg.shutdownKG();
+      } catch {
+        // best-effort; still attempt the rm below.
+      }
+    }
     await rm(tmpRoot, { recursive: true, force: true });
   };
 

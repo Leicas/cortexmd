@@ -9,6 +9,7 @@
     "start": "node dist/index.js",
     "dev": "tsx --watch src/index.ts",
     "test": "vitest run",
+    "eval": "tsx src/eval/index.ts",
     "hooks:install": "node scripts/install-hooks.mjs",
     "hooks:uninstall": "node scripts/install-hooks.mjs --uninstall",
     "code:index": "node bin/code-index.mjs",

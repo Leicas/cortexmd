@@ -28,6 +28,7 @@ import {
   claimPendingRequests,
 } from '../lib/code-nav/index-requests.js';
 import { projectSymbolById } from '../lib/code-nav/projection.js';
+import { resolveSymbolId } from '../lib/code-nav/resolve.js';
 import { getCodeNavStats } from '../lib/code-nav/stats.js';
 import { config } from '../config.js';
 import { getCodeNavSavings, recordExternalCodeNavSavings } from '../lib/code-nav/savings.js';
@@ -1613,12 +1614,18 @@ export function registerCodeSymbolSearch(server: McpServer): void {
 export function registerCodeSymbolGet(server: McpServer): void {
   server.tool(
     'code_symbol_get',
-    'Fetch a single symbol by ID, including its source body (capped to 200 lines).',
+    'Fetch a single symbol, including its source body (capped to 200 lines). Identify the symbol EITHER by `id` (16-char hex) OR by `name` (+ optional `repo` slug). When `name` is ambiguous the error lists candidate ids to pick from.',
     {
-      id: z.string().regex(SYMBOL_ID_RE).describe('16-char hex symbol ID'),
+      id: z.string().regex(SYMBOL_ID_RE).optional().describe('16-char hex symbol ID'),
+      name: z.string().optional().describe('Symbol name to resolve (alternative to `id`); exact match'),
+      repo: z.string().optional().describe('Repo slug to scope `name` resolution (defaults to the sole repo if only one is registered)'),
     },
     wrapToolHandler('code_symbol_get', async (params) => {
-      const id = params.id as string;
+      const id = resolveSymbolId({
+        id: params.id as string | undefined,
+        name: params.name as string | undefined,
+        repo: params.repo as string | undefined,
+      });
       const db = getCodeDb();
       const sym = db.prepare(`SELECT * FROM symbols WHERE id=?`).get(id) as SymbolRow | undefined;
       if (!sym) throw new Error(`Symbol not found: ${id}`);
@@ -1710,13 +1717,19 @@ function buildSlugMap(): (id: string) => string {
 export function registerCodeSymbolCallers(server: McpServer): void {
   server.tool(
     'code_symbol_callers',
-    'Return symbols that call this symbol. BFS, depth-limited (default 1, max 3).',
+    'Return symbols that call this symbol. BFS, depth-limited (default 1, max 3). Identify the symbol EITHER by `id` (16-char hex) OR by `name` (+ optional `repo` slug).',
     {
-      id: z.string().regex(SYMBOL_ID_RE),
+      id: z.string().regex(SYMBOL_ID_RE).optional(),
+      name: z.string().optional().describe('Symbol name to resolve (alternative to `id`); exact match'),
+      repo: z.string().optional().describe('Repo slug to scope `name` resolution (defaults to the sole repo if only one is registered)'),
       depth: z.number().int().min(1).max(3).optional().default(1),
     },
     wrapToolHandler('code_symbol_callers', async (params) => {
-      const id = params.id as string;
+      const id = resolveSymbolId({
+        id: params.id as string | undefined,
+        name: params.name as string | undefined,
+        repo: params.repo as string | undefined,
+      });
       const depth = (params.depth as number | undefined) ?? 1;
       const db = getCodeDb();
 
@@ -1771,13 +1784,19 @@ export function registerCodeSymbolCallers(server: McpServer): void {
 export function registerCodeSymbolCallees(server: McpServer): void {
   server.tool(
     'code_symbol_callees',
-    'Return symbols this symbol calls. BFS, depth-limited (default 1, max 3). Unresolved callee names are returned separately.',
+    'Return symbols this symbol calls. BFS, depth-limited (default 1, max 3). Unresolved callee names are returned separately. Identify the symbol EITHER by `id` (16-char hex) OR by `name` (+ optional `repo` slug).',
     {
-      id: z.string().regex(SYMBOL_ID_RE),
+      id: z.string().regex(SYMBOL_ID_RE).optional(),
+      name: z.string().optional().describe('Symbol name to resolve (alternative to `id`); exact match'),
+      repo: z.string().optional().describe('Repo slug to scope `name` resolution (defaults to the sole repo if only one is registered)'),
       depth: z.number().int().min(1).max(3).optional().default(1),
     },
     wrapToolHandler('code_symbol_callees', async (params) => {
-      const id = params.id as string;
+      const id = resolveSymbolId({
+        id: params.id as string | undefined,
+        name: params.name as string | undefined,
+        repo: params.repo as string | undefined,
+      });
       const depth = (params.depth as number | undefined) ?? 1;
       const db = getCodeDb();
 
@@ -2098,14 +2117,20 @@ interface ImpactRow {
 export function registerCodeChangeImpact(server: McpServer): void {
   server.tool(
     'code_change_impact',
-    'Transitive caller graph for a symbol — "who depends on this if I change it?". Walks calls.callee_id → calls.caller_id via recursive CTE up to `depth` levels, returning each caller with its BFS distance from the root. Use this before refactoring to scope the blast radius.',
+    'Transitive caller graph for a symbol — "who depends on this if I change it?". Walks calls.callee_id → calls.caller_id via recursive CTE up to `depth` levels, returning each caller with its BFS distance from the root. Use this before refactoring to scope the blast radius. Identify the symbol EITHER by `id` (16-char hex) OR by `name` (+ optional `repo` slug).',
     {
-      id: z.string().regex(SYMBOL_ID_RE),
+      id: z.string().regex(SYMBOL_ID_RE).optional(),
+      name: z.string().optional().describe('Symbol name to resolve (alternative to `id`); exact match'),
+      repo: z.string().optional().describe('Repo slug to scope `name` resolution (defaults to the sole repo if only one is registered)'),
       depth: z.number().int().min(1).max(5).optional().default(3),
       limit: z.number().int().positive().max(500).optional().default(100),
     },
     wrapToolHandler('code_change_impact', async (params) => {
-      const id = params.id as string;
+      const id = resolveSymbolId({
+        id: params.id as string | undefined,
+        name: params.name as string | undefined,
+        repo: params.repo as string | undefined,
+      });
       const depth = (params.depth as number | undefined) ?? 3;
       const limit = (params.limit as number | undefined) ?? 100;
 

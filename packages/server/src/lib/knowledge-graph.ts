@@ -436,6 +436,61 @@ export function kgAllMentionTriples(): Array<{ subject: string; predicate: strin
   }
 }
 
+/** One supersession event: an old fact closed by a newer replacement fact. */
+export interface SupersessionEvent {
+  subject: string;
+  predicate: string;
+  oldObject: string;
+  newObject: string;
+  validFrom: string | null;    // old fact's valid_from
+  validTo: string | null;      // old fact's valid_to (= new fact's valid_from)
+  supersededAt: string | null; // old fact's invalidated_at (transaction time)
+}
+
+/**
+ * Recent supersession events — facts whose validity was closed by a newer fact
+ * (superseded_by set), joined to the replacement triple to surface the new
+ * object. Most-recently-superseded first, capped by `limit`. Pure, read-only,
+ * additive; drives the Bitemporal-KG panel's validity timeline. KG-off safe:
+ * returns [] when the graph isn't initialized, and tolerant of a dangling
+ * superseded_by link (the replacement row may have been pruned).
+ */
+export function kgRecentSupersessions(limit = 10): SupersessionEvent[] {
+  if (!isKgInitialized()) return [];
+  try {
+    const d = getDb();
+    const rows = d.prepare(
+      `SELECT old.subject     AS subject,
+              old.predicate   AS predicate,
+              old.object      AS oldObject,
+              new.object      AS newObject,
+              old.valid_from  AS validFrom,
+              old.valid_to    AS validTo,
+              old.invalidated_at AS supersededAt
+         FROM triples old
+         LEFT JOIN triples new ON new.id = old.superseded_by
+        WHERE old.superseded_by IS NOT NULL
+        ORDER BY old.invalidated_at DESC
+        LIMIT ?`,
+    ).all(limit) as Array<{
+      subject: string; predicate: string;
+      oldObject: string; newObject: string | null;
+      validFrom: string | null; validTo: string | null; supersededAt: string | null;
+    }>;
+    return rows.map((r) => ({
+      subject: r.subject,
+      predicate: r.predicate,
+      oldObject: r.oldObject,
+      newObject: r.newObject ?? '(pruned)',
+      validFrom: r.validFrom,
+      validTo: r.validTo,
+      supersededAt: r.supersededAt,
+    }));
+  } catch {
+    return [];
+  }
+}
+
 /**
  * Repair the knowledge graph database.
  * Runs PRAGMA integrity_check; if corrupt, backs up and recreates.

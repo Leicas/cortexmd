@@ -261,6 +261,51 @@ button.pill:hover{filter:brightness(1.12)}
 .kpi-delta.invert.up{color:var(--err);background:var(--err-fill)}
 .kpi-delta.invert.down{color:var(--ok);background:var(--ok-fill)}
 
+/* ─────────────────── Retrieval tab components ───────────────────
+   Shared, generic classes for the Retrieval tab (arm mix / recall quality /
+   bitemporal validity). Reuse the existing spectral pair (violet=lexical anchor,
+   cyan=semantic) and semantic status colors; dormant arms are encoded in FORM
+   (a hatch), never faked as a zero-width segment. The view module owns the
+   inline SVG (validity spans, seed-spread glyph) that these lay out. */
+
+/* Arm contribution bar (3-arm, dormant-aware) — extends the .stacked-bar idea. */
+.arm-bar{display:flex;height:22px;border-radius:var(--r-sm);overflow:hidden;margin-top:.5rem}
+.arm-bar .arm-seg{display:flex;align-items:center;justify-content:center;
+  font:600 var(--fs-xs)/1 var(--mono);color:#0a0c12;min-width:0;white-space:nowrap;
+  overflow:hidden;transition:flex-basis var(--t-med,.4s)}
+.arm-seg.arm-lex{background:var(--brand)}       /* violet anchor arm */
+.arm-seg.arm-sem{background:var(--brand-2)}     /* cyan */
+.arm-seg.arm-graph{background:var(--info)}      /* graph arm active */
+.arm-seg.arm-dormant{color:var(--text-dim);
+  background:repeating-linear-gradient(45deg,
+    var(--line-faint),var(--line-faint) 4px,transparent 4px,transparent 8px)}  /* arm off */
+
+/* Validity timeline lane (bitemporal supersession events). */
+.validity-lane{display:flex;align-items:center;gap:.5rem;padding:.3rem 0;
+  border-bottom:1px solid var(--line-faint);font-size:var(--fs-sm)}
+.validity-lane .vl-fact{width:130px;flex-shrink:0;font-family:var(--mono);
+  color:var(--text-dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.validity-lane .vl-track{flex:1;height:10px;position:relative}   /* SVG span goes here */
+.validity-lane .vl-new{font-family:var(--mono);color:var(--text);flex-shrink:0}
+.validity-lane .vl-arrow{color:var(--warn)}     /* ► supersession marker */
+.validity-lane .vl-ts{color:var(--text-faint);font-family:var(--mono);width:56px;
+  text-align:right;flex-shrink:0}
+
+/* Metric-vs-arm compare grid (the Recall-Quality hero). One label column + N
+   arm columns; each cell is a bar + a mono value + an optional delta chip. */
+.arm-compare{display:grid;gap:.4rem .75rem;align-items:center;
+  grid-template-columns:auto repeat(var(--arm-cols,4),1fr)}
+.arm-compare .ac-metric{font:600 var(--fs-xs)/1 var(--font-sans);
+  text-transform:uppercase;letter-spacing:var(--tracking-cap);color:var(--text-dim)}
+.arm-compare .ac-head{font:600 var(--fs-xs)/1 var(--font-sans);
+  text-transform:uppercase;letter-spacing:var(--tracking-cap);color:var(--text-faint);
+  text-align:center}
+.arm-compare .ac-cell{display:flex;flex-direction:column;gap:.15rem}
+.arm-compare .ac-bar{height:8px;border-radius:var(--r-pill);
+  background:var(--brand-grad);opacity:.7}
+.arm-compare .ac-val{font:700 var(--fs-md)/1 var(--mono);font-feature-settings:var(--num)}
+.arm-compare .ac-base{opacity:.55}              /* baseline column reads quieter */
+
 /* ────────────────────────── Tables ────────────────────────── */
 .table-wrap{overflow:auto;border-radius:var(--r-sm)}
 table{width:100%;border-collapse:separate;border-spacing:0;font:var(--fs-sm)/1.4 var(--font-sans)}
@@ -356,7 +401,7 @@ tbody tr:last-child td{border-bottom:none}
 .state-error .state-error-icon{color:var(--err);flex-shrink:0}
 
 /* ────────────────────────── Bars (dimensional) ────────────────────────── */
-.stacked-bar .seg, .hist-bar, .cat-row .cat-bar, .sr-seg{
+.stacked-bar .seg, .hist-bar, .cat-row .cat-bar{
   background-image:linear-gradient(rgba(255,255,255,.12),transparent)}
 .stacked-bar{display:flex;height:24px;border-radius:var(--r-sm);overflow:hidden;margin-top:.5rem}
 .stacked-bar .seg{display:flex;align-items:center;justify-content:center;
@@ -417,15 +462,9 @@ tbody tr:last-child td{border-bottom:none}
 .log-entry .log-meta{color:var(--text-dim);flex:1;overflow:hidden;text-overflow:ellipsis;min-width:0}
 .log-entry.copied{background:var(--ok-fill);transition:background .3s}
 
-/* Score breakdown bars */
-.score-row{display:flex;align-items:center;gap:.5rem;margin-bottom:.5rem;font-size:var(--fs-sm)}
-.score-row .sr-query{width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--info);flex-shrink:0}
-.score-row .sr-bar-wrap{flex:1;display:flex;flex-direction:column;gap:.2rem}
-.score-row .sr-bar{display:flex;height:14px;border-radius:3px;overflow:hidden}
-.score-row .sr-seg{height:100%;display:flex;align-items:center;justify-content:center;font:600 var(--fs-xs)/1 var(--mono);color:#0a0c12;min-width:0}
-.sr-seg.lex{background:var(--info)}
-.sr-seg.sem{background:var(--ok)}
-.score-row .sr-path{font-size:var(--fs-xs);color:var(--text-dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+/* Score breakdown bars removed — the two-arm lexical/semantic .score-row /
+   .sr-seg widget (searchScoreBreakdowns) was superseded by the Retrieval tab's
+   3-arm Recall Arms bar (.arm-bar). */
 
 /* Benchmark gauge */
 .bench-gauge{text-align:center;padding:.5rem}

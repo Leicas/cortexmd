@@ -517,22 +517,9 @@ export default {
       kgPredEl.innerHTML = emptyHtml('Graph empty', 'Knowledge graph empty or not enabled (set KG_ENABLED=true).');
     }
 
-    // ── Band F2 — Recall Engine (multi-signal recall fusion, v1.10.0) ────────
-    var re = data.recallIntelligence || {};
-    var reCo = re.coRecall || { nodes: 0, edges: 0 };
-    setLive('reEdges', fmt(reCo.edges || 0));
-    setLive('reNodes', fmt(reCo.nodes || 0));
-    if ($('reCentralityW')) $('reCentralityW').textContent = re.centralityWeight != null ? (+re.centralityWeight).toFixed(2) : '—';
-    if ($('reCoRecallW')) $('reCoRecallW').textContent = re.coRecallEnabled === false ? 'off' : (re.coRecallWeight != null ? (+re.coRecallWeight).toFixed(2) : '—');
-    var rePill = $('recallEnginePill');
-    if (rePill) rePill.innerHTML = pillHtml(re.coRecallEnabled === false ? 'muted' : 'ok', re.coRecallEnabled === false ? 'co-recall off' : 'active');
-
-    // Rescue@10 — reproducible contradiction-resilience benchmark (run at boot)
-    var rescue = re.rescue;
-    var hasRescue = rescue && rescue.cases > 0;
-    if ($('reRescue')) $('reRescue').textContent = hasRescue ? (+rescue.rescueAtK).toFixed(3) : '—';
-    if ($('reDemoted')) $('reDemoted').textContent = hasRescue ? (+rescue.supersededDemoted).toFixed(3) : '—';
-    if ($('reRescueCases')) $('reRescueCases').textContent = hasRescue ? fmt(rescue.cases) : '—';
+    // ── Band F2 — Recall Engine: REMOVED. Recall internals (co-recall weights,
+    //    Rescue@10) now live in the dedicated Retrieval tab; no `recallIntelligence`
+    //    read here anymore. ────────────────────────────────────────────────────
 
     // ── Band G — Dream History (overlaid sparklines) ─────────────────────────
     if (dh.length >= 2) {

@@ -117,6 +117,12 @@ export const THRESHOLDS: Record<string, Threshold> = {
   callResolutionPct:   { good: 0.9,  warn: 0.7,  direction: 'higher' },
   toolSuccessRate:     { good: 0.98, warn: 0.9,  direction: 'higher' },
   healthScore:         { good: 80,   warn: 60,   direction: 'higher' },
+  // Retrieval quality (0–1 fractions). recall@k + point-in-time accuracy are
+  // higher-better; staleLeakRate is lower-better (a superseded fact leaking into
+  // the top-k is a bug the bitemporal arm must drive toward 0).
+  recallAtK:              { good: 0.8,  warn: 0.6,  direction: 'higher' },
+  pointInTimeAccuracy:    { good: 0.8,  warn: 0.5,  direction: 'higher' },
+  staleLeakRate:          { good: 0.05, warn: 0.15, direction: 'lower'  },
 };
 
 /** Map a value + threshold key to a pill state. Unknown key → 'ok'. */
@@ -177,6 +183,13 @@ export interface DerivedSignals {
   callResolutionPct: number;
   // Health
   healthTrend: Trend;
+  // Retrieval — headline-metric trends over the persisted eval history.
+  retrieval: {
+    recallTrend: Trend;
+    pitTrend: Trend;
+    staleLeakTrend: Trend;
+    runs: number;
+  };
   // generic
   [key: string]: unknown;
 }
@@ -292,6 +305,17 @@ export function computeDerived(payload: Dict): DerivedSignals {
   const dreamHistory = arr(payload.dreamHistory) as Array<Dict>;
   const healthTrend = trend(dreamHistory.map((d) => num(d.healthScore)));
 
+  // Retrieval-quality trends over the persisted eval history (baseline arm's
+  // headline metrics per run). Each is 'flat' until ≥2 runs exist.
+  const retrievalObj = obj(payload.retrieval);
+  const qualityHistory = arr(retrievalObj.qualityHistory) as Array<Dict>;
+  const retrieval = {
+    recallTrend: trend(qualityHistory.map((r) => num(r.recallAtK))),
+    pitTrend: trend(qualityHistory.map((r) => num(r.pointInTimeAccuracy))),
+    staleLeakTrend: trend(qualityHistory.map((r) => num(r.staleLeakRate))),
+    runs: qualityHistory.length,
+  };
+
   return {
     errorRatePct,
     rpmSeries,
@@ -309,5 +333,6 @@ export function computeDerived(payload: Dict): DerivedSignals {
     savingsRunRate,
     callResolutionPct,
     healthTrend,
+    retrieval,
   };
 }

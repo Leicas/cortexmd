@@ -21,6 +21,7 @@ import {
   runPPR,
   extractSeeds,
   pprRrfContribution,
+  type RecallGraph,
 } from './graph-recall.js';
 
 export interface SearchOptions {
@@ -659,11 +660,114 @@ function computeGraphArm(query: string, lexicalTopPaths: string[], k: number): M
     const seeds = extractSeeds(graph, lexicalTopPaths, detected);
     if (seeds.length === 0) return new Map();
 
+    // Capture a cheap seed→spread readout for the dashboard's Graph-Recall panel
+    // (reachable-set sizes at 1/2/3 hops from the seeds). BFS over the same
+    // adjacency the PPR walk uses; best-effort, never affects the returned RRF.
+    try { lastSeedSpread = computeSeedSpread(graph, query, seeds); } catch { /* non-critical */ }
+
     const ppr = runPPR(graph, seeds, { limit: lexicalTopPaths.length + 40 });
     return pprRrfContribution(ppr, k);
   } catch {
     return new Map();
   }
+}
+
+// ── Recall-graph telemetry (Graph-Recall dashboard panel) ─────────────────
+//
+// Cheap, honest readouts of the PPR substrate: graph size (nodes/edges/avg
+// degree) with a short TTL cache so the 2s SSE tick doesn't rebuild the graph
+// every time, plus the last real query's seed→spread (reachable-set sizes at
+// 1/2/3 hops). Nothing here is decorative — the numbers are the actual graph.
+
+interface SeedSpread {
+  query: string;
+  seeds: number;
+  hop1: number; hop2: number; hop3: number;
+}
+let lastSeedSpread: SeedSpread | null = null;
+
+interface RecallGraphStats {
+  nodes: number;
+  edges: number;
+  avgDegree: number;
+  lastSeedSpread: SeedSpread | null;
+}
+let cachedGraphStats: { at: number; stats: RecallGraphStats } | null = null;
+const GRAPH_STATS_TTL_MS = 15_000;
+
+/**
+ * BFS reachable-set sizes at 1/2/3 hops from the PPR seeds (note-path nodes
+ * only, so the counts are notes the walk can reach). Router entity nodes are
+ * traversed but not counted. Pure over the prebuilt graph adjacency.
+ */
+function computeSeedSpread(graph: RecallGraph, query: string, seeds: string[]): SeedSpread {
+  const { adj, noteNodes } = graph;
+  const seedSet = new Set(seeds.filter((s) => adj.has(s)));
+  const visited = new Set<string>(seedSet);
+  let frontier = new Set<string>(seedSet);
+  const hopCounts: number[] = [];
+  for (let hop = 0; hop < 3; hop++) {
+    const next = new Set<string>();
+    for (const node of frontier) {
+      const nbrs = adj.get(node);
+      if (!nbrs) continue;
+      for (const nbr of nbrs.keys()) {
+        if (visited.has(nbr)) continue;
+        visited.add(nbr);
+        next.add(nbr);
+      }
+    }
+    // Count only note-path nodes reached at this hop.
+    let noteHits = 0;
+    for (const n of next) if (noteNodes.has(n)) noteHits++;
+    hopCounts.push(noteHits);
+    frontier = next;
+  }
+  return {
+    query,
+    seeds: seedSet.size,
+    hop1: hopCounts[0] ?? 0,
+    hop2: hopCounts[1] ?? 0,
+    hop3: hopCounts[2] ?? 0,
+  };
+}
+
+/**
+ * Recall-graph substrate stats for the dashboard, TTL-cached (15s) so the SSE
+ * tick never rebuilds the graph on the hot path. Builds the SAME wikilink +
+ * mention graph the PPR arm walks, then counts note-path nodes, undirected
+ * edges, and average weighted degree over note nodes. `lastSeedSpread` reflects
+ * the most recent real PPR query (null until one runs). Safe to call with the
+ * graph arm off — it just reports the substrate + a null spread.
+ */
+export function getRecallGraphStats(): RecallGraphStats {
+  const now = Date.now();
+  if (cachedGraphStats && now - cachedGraphStats.at < GRAPH_STATS_TTL_MS) {
+    // Refresh only the seed spread (cheap pointer copy) so a fresh query shows
+    // through even within the TTL window; the size counts stay cached.
+    return { ...cachedGraphStats.stats, lastSeedSpread };
+  }
+  let stats: RecallGraphStats = { nodes: 0, edges: 0, avgDegree: 0, lastSeedSpread };
+  try {
+    const { linkGraph, titleToPath } = buildLinkGraphFromDocMeta();
+    const mentions = kgAllMentionTriples();
+    const graph = buildRecallGraph({ linkGraph, titleToPath, mentions });
+    const nodes = graph.noteNodes.size;
+    // Count undirected edges once (adjacency is symmetric): sum degrees / 2.
+    let edgeEnds = 0;
+    let noteDegreeSum = 0;
+    for (const [node, nbrs] of graph.adj) {
+      edgeEnds += nbrs.size;
+      if (graph.noteNodes.has(node)) noteDegreeSum += nbrs.size;
+    }
+    const edges = Math.round(edgeEnds / 2);
+    const avgDegree = nodes > 0 ? Math.round((noteDegreeSum / nodes) * 100) / 100 : 0;
+    stats = { nodes, edges, avgDegree, lastSeedSpread };
+  } catch {
+    // fall through with the zeroed stats
+  }
+  cachedGraphStats = { at: now, stats };
+  return stats;
 }
 
 /**

@@ -8,6 +8,7 @@ import { renderOverviewTab } from './tabs/overview.js';
 import { renderSessionsTab } from './tabs/sessions.js';
 import { renderRateLimitsTab } from './tabs/ratelimits.js';
 import { renderVaultTab } from './tabs/vault.js';
+import { renderRetrievalTab } from './tabs/retrieval.js';
 import { renderIntelligenceTab } from './tabs/intelligence.js';
 import { renderGraphTab } from './tabs/graph.js';
 import { renderAgentsTab } from './tabs/agents.js';
@@ -17,7 +18,7 @@ import { renderOAuthTab } from './tabs/oauth.js';
 
 export type TabId =
   | 'overview' | 'sessions' | 'ratelimits' | 'oauth' | 'vault'
-  | 'intelligence' | 'graph' | 'agents' | 'code' | 'logs';
+  | 'retrieval' | 'intelligence' | 'graph' | 'agents' | 'code' | 'logs';
 
 /** Visual cluster a tab belongs to (REVAMP.md §4). Does NOT affect the SSE/tab contract. */
 export type TabGroup = 'ops' | 'knowledge' | 'build';
@@ -39,6 +40,7 @@ export const TABS: readonly TabDef[] = [
   { id: 'oauth',        label: 'OAuth Clients',  group: 'ops',       render: renderOAuthTab },
   { id: 'logs',         label: 'Logs',           group: 'ops',       render: renderLogsTab },
   { id: 'vault',        label: 'Vault & Memory', group: 'knowledge', render: renderVaultTab },
+  { id: 'retrieval',    label: 'Retrieval',      group: 'knowledge', render: renderRetrievalTab },
   { id: 'intelligence', label: 'Intelligence',   group: 'knowledge', render: renderIntelligenceTab },
   { id: 'graph',        label: 'Graph',          group: 'knowledge', render: renderGraphTab },
   { id: 'agents',       label: 'Agents',         group: 'build',     render: renderAgentsTab },

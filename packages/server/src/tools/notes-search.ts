@@ -5,7 +5,7 @@ import { readNote } from '../lib/vault.js';
 import { parseFrontmatter } from '../lib/frontmatter.js';
 import { wrapToolHandler } from '../lib/tool-wrapper.js';
 import { sanitizeQuery, sanitizePath, validateDateString } from '../lib/sanitize.js';
-import { recordSearchQuery, recordSearchScoreBreakdown, recordSearchTypeBreakdown } from '../lib/metrics.js';
+import { recordSearchQuery, recordSearchScoreBreakdown, recordSearchTypeBreakdown, recordArmBreakdown } from '../lib/metrics.js';
 
 const IMPORTANCE_ORDER = ['low', 'medium', 'high', 'critical'];
 
@@ -87,6 +87,7 @@ export function register(server: McpServer): void {
         recordSearchQuery(query, results.length, searchDurationMs);
         recordSearchScoreBreakdown(query, results);
         recordSearchTypeBreakdown(results);
+        recordArmBreakdown(query, results);
         const detailStr = `q="${query}" → ${results.length} results` +
           (results.length > 0 ? ` (top: ${results[0].path.split('/').pop()?.replace(/\.md$/, '')})` : '');
         return {
@@ -127,6 +128,7 @@ export function register(server: McpServer): void {
       recordSearchQuery(query, filtered.length, searchDurationMs);
       recordSearchScoreBreakdown(query, filtered);
       recordSearchTypeBreakdown(filtered);
+      recordArmBreakdown(query, filtered);
       const detailStr = `q="${query}" → ${filtered.length} results` +
         (filtered.length > 0 ? ` (top: ${filtered[0].path.split('/').pop()?.replace(/\.md$/, '')})` : '');
       return {

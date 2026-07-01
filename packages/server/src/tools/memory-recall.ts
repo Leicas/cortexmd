@@ -8,7 +8,7 @@ import { readNote, writeNote } from '../lib/vault.js';
 import { parseFrontmatter, stringifyFrontmatter } from '../lib/frontmatter.js';
 import { wrapToolHandler } from '../lib/tool-wrapper.js';
 import { sanitizeQuery, validateDateString } from '../lib/sanitize.js';
-import { recordSearchQuery, recordSearchScoreBreakdown, recordSearchTypeBreakdown } from '../lib/metrics.js';
+import { recordSearchQuery, recordSearchScoreBreakdown, recordSearchTypeBreakdown, recordArmBreakdown } from '../lib/metrics.js';
 import { config } from '../config.js';
 import { projectCodeRefsFromBody } from '../lib/code-nav/projection.js';
 import {
@@ -423,6 +423,7 @@ export function register(server: McpServer): void {
       recordSearchQuery(query, results.length, searchDurationMs);
       recordSearchScoreBreakdown(query, results);
       recordSearchTypeBreakdown(results);
+      recordArmBreakdown(query, results);
 
       // Best-effort auto-projection of any [[code:...]] refs in result bodies.
       // Capped (3 per recall) and gated by env config; failures swallowed.

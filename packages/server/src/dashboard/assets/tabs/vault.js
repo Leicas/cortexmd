@@ -325,25 +325,8 @@ export default {
     setRatioPill(ctx, 'kpiZeroPill', pillState(zeroRate, 'zeroResultRate'),
       zeroRate <= 0.1 ? 'healthy' : zeroRate <= 0.25 ? 'leaky' : 'poor');
 
-    // ── Hybrid-balance KPI ──
-    var sa = data.searchTypeStats || {};
-    var avgLex = sa.avgLexicalContribution || 0;
-    var avgSem = sa.avgSemanticContribution || 0;
-    var hybridBar = $('kpiHybridBar');
-    if (avgLex + avgSem > 0) {
-      var lexPct = Math.round(avgLex / (avgLex + avgSem) * 100);
-      var semPct = 100 - lexPct;
-      setLive('kpiHybridVal', lexPct + '/' + semPct);
-      $('kpiHybridSub').textContent = 'lexical / semantic';
-      hybridBar.innerHTML = '<div class="seg" style="width:' + lexPct + '%;background:var(--info)"></div>'
-        + '<div class="seg" style="width:' + semPct + '%;background:var(--ok)"></div>';
-    } else {
-      setLive('kpiHybridVal', '—');
-      var bothHits = sa.bothHits || 0;
-      var hitTot = (sa.lexicalOnlyHits || 0) + (sa.semanticOnlyHits || 0) + bothHits;
-      $('kpiHybridSub').textContent = hitTot ? Math.round(bothHits / hitTot * 100) + '% both-retriever hits' : 'no fusion data';
-      hybridBar.innerHTML = '';
-    }
+    // ── Hybrid-balance KPI: REMOVED (two-arm-blind). Arm mix across all three
+    //    retrieval arms now lives in the Retrieval tab (Recall Arms panel). ──
 
     // ── Search Quality detail card ──
     setLive('sqTotal', fmtN(sq.totalSearches));
@@ -489,19 +472,8 @@ export default {
       }
     }
 
-    // ── Search Analytics ──
-    setLive('saLexOnly', fmtN(sa.lexicalOnlyHits));
-    setLive('saSemOnly', fmtN(sa.semanticOnlyHits));
-    setLive('saBoth', fmtN(sa.bothHits));
-    var saBar = $('saContribBar');
-    if (avgLex + avgSem > 0) {
-      var lexPctSa = Math.round(avgLex / (avgLex + avgSem) * 100);
-      var semPctSa = 100 - lexPctSa;
-      saBar.innerHTML = '<div class="seg" style="width:' + lexPctSa + '%;background:var(--info)">' + lexPctSa + '%</div>'
-        + '<div class="seg" style="width:' + semPctSa + '%;background:var(--ok)">' + semPctSa + '%</div>';
-    } else {
-      saBar.innerHTML = '<div class="seg" style="width:100%;background:var(--border);color:var(--text-dim)">No data</div>';
-    }
+    // ── Search Analytics: REMOVED (two-arm lexical/semantic split, blind to the
+    //    graph arm). Superseded by the Retrieval tab's Recall Arms (armMix). ──
 
     // ── Memory Lifecycle ──
     var ml = data.memoryLifecycle || {};
@@ -578,33 +550,9 @@ export default {
     // ── Collections ──
     renderCatBars(ctx, 'collectionBars', data.collectionDistribution || {}, 'No collection data');
 
-    // ── Score breakdown ──
-    var ssb = data.searchScoreBreakdowns || [];
-    var sbEl = $('scoreBreakdowns');
-    if (!ssb.length) {
-      sbEl.innerHTML = '<div class="empty-msg">No searches with score data.</div>';
-    } else {
-      sbEl.innerHTML = ssb.slice().reverse().map(function (s) {
-        var rows = s.results.map(function (r) {
-          var rTotal = r.lexical + r.semantic;
-          if (rTotal === 0) rTotal = 1;
-          var lexPct = Math.round(r.lexical / rTotal * 100);
-          var semPct = 100 - lexPct;
-          var pathShort = r.path.split('/').pop() || r.path;
-          return '<div class="score-row">'
-            + '<span class="sr-path" title="' + escAttr(r.path) + '">' + esc(pathShort) + '</span>'
-            + '<div class="sr-bar-wrap"><div class="sr-bar">'
-            + '<div class="sr-seg lex" style="width:' + lexPct + '%" title="Lexical: ' + r.lexical.toFixed(4) + '">' + (lexPct > 15 ? lexPct + '%' : '') + '</div>'
-            + '<div class="sr-seg sem" style="width:' + semPct + '%" title="Semantic: ' + r.semantic.toFixed(4) + '">' + (semPct > 15 ? semPct + '%' : '') + '</div>'
-            + '</div></div>'
-            + '</div>';
-        }).join('');
-        return '<div style="margin-bottom:.75rem;padding-bottom:.5rem;border-bottom:1px solid var(--line-faint)">'
-          + '<div style="font-size:var(--fs-sm);margin-bottom:.3rem"><span style="color:var(--info)">' + esc(s.query) + '</span> <span class="mono" style="color:var(--text-dim)">' + fmtTime(s.timestamp) + '</span></div>'
-          + rows
-          + '</div>';
-      }).join('');
-    }
+    // ── Score breakdown: REMOVED. The two-segment lexical/semantic bar omitted
+    //    the graph arm (misleading now SearchResult carries graphScore). Replaced
+    //    by the Retrieval tab's 3-arm Recall Arms contribution bar. ──
 
     // ── Benchmark summary card ──
     var bench = data.benchmarkSummary;

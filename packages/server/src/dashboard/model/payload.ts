@@ -8,15 +8,15 @@
  * Mutable cross-push state (memory-stack cache, agent-diary cache, dream
  * history, LLM status, dismissed suggestions) lives in `model/state.ts`.
  */
-import { getMetrics, getRecentSearchScores, getBenchmarkResults, getRescueResults } from '../../lib/metrics.js';
+import { getMetrics, getRecentSearchScores, getBenchmarkResults, getRescueResults, getRecentArmBreakdown } from '../../lib/metrics.js';
 import { getRateLimitSnapshot } from '../../lib/rate-limit.js';
 import { getSessionSnapshots } from '../../index.js';
 import { getOAuthClients } from '../../oauth.js';
-import { getDocMeta, getDocMetaSummary, getCollectionDistribution, getIndexHealth } from '../../lib/search.js';
-import { getEmbeddingStats } from '../../lib/embeddings.js';
+import { getDocMeta, getDocMetaSummary, getCollectionDistribution, getIndexHealth, getRecallGraphStats } from '../../lib/search.js';
+import { getEmbeddingStats, isEmbeddingsReady } from '../../lib/embeddings.js';
 import { getRecentLogs } from '../../lib/logger.js';
 import { wakeUp } from '../../lib/memory-stack.js';
-import { isKgInitialized, kgStats } from '../../lib/knowledge-graph.js';
+import { isKgInitialized, kgStats, kgRecentSupersessions, kgAllMentionTriples } from '../../lib/knowledge-graph.js';
 import { listEntities } from '../../lib/entity-registry.js';
 import { listAgents } from '../../lib/journal.js';
 import { computeHealth as computeDreamHealth } from '../../lib/dream-engine.js';
@@ -25,6 +25,8 @@ import { config } from '../../config.js';
 import { logger } from '../../lib/logger.js';
 import { computeHealthScore } from './health.js';
 import { computeDerived } from './derive.js';
+import { readLastEvalReport, readEvalHistory } from './eval-report-reader.js';
+import type { RetrievalPayload } from '../payload.types.js';
 import {
   getMemoryStackCache, setMemoryStackCache,
   getAgentDiaryCache, setAgentDiaryCache,
@@ -232,10 +234,101 @@ export function buildSsePayload(): Record<string, unknown> {
     rescue: getRescueResults(),
   };
 
+  // ── Retrieval tab (v1.11): multi-arm fused recall + PPR graph + bitemporal
+  //    KG + live eval quality. New top-level `retrieval` key (frozen contract in
+  //    payload.types.ts §3). Additive — `recallIntelligence` above is retained
+  //    until the Deprecate agent prunes the view widgets that read it.
+  payload.retrieval = buildRetrievalPayload();
+
   // Derived insight signals (errorRatePct, rpmTrend, healthTrend, …) — computed
   // once per tick over the already-capped arrays. Attached under `derived` so
   // every existing field is untouched and the single-EventSource model is intact.
   payload.derived = computeDerived(payload);
 
   return payload;
+}
+
+/**
+ * Assemble `payload.retrieval` from metrics (arm breakdown), the KG (bitemporal
+ * facts + supersessions), the recall-graph substrate stats, and the persisted
+ * eval report. Every arm honestly encodes its dormant state (graph share is 0
+ * and armWeights.graph is null when PPR is off; bitemporal counts only when the
+ * flag is on). Defensive throughout — a failed reader degrades to an empty
+ * panel, never a crashed tick.
+ */
+function buildRetrievalPayload(): RetrievalPayload {
+  const embeddingsReady = isEmbeddingsReady();
+
+  // ── arm mix — average the per-query fractions over the recent breakdowns ──
+  const recent = getRecentArmBreakdown();
+  let lexSum = 0, semSum = 0, graphSum = 0;
+  for (const e of recent) { lexSum += e.lexical; semSum += e.semantic; graphSum += e.graph; }
+  const n = recent.length;
+  const armMix = {
+    lexical: n > 0 ? lexSum / n : 0,
+    semantic: n > 0 ? semSum / n : 0,
+    graph: n > 0 ? graphSum / n : 0,
+    sampleQueries: n,
+  };
+  // graph arm is active if configured on OR any recent query actually produced a
+  // graph contribution (a per-call opts.graph run leaves a non-zero share).
+  const graphActive = config.pprRecall || recent.some((e) => e.graph > 0);
+  const armsActive = {
+    lexical: true as const,
+    semantic: embeddingsReady,
+    graph: graphActive,
+  };
+  const armWeights = {
+    centrality: config.recallCentralityWeight,
+    coRecall: config.coRecallEnabled ? config.coRecallWeight : null,
+    graph: graphActive ? config.recallCentralityWeight : null,
+  };
+  const recentArmBreakdown = recent.map((e) => ({
+    timestamp: e.timestamp,
+    query: e.query,
+    lexical: e.lexical,
+    semantic: e.semantic,
+    graph: e.graph,
+  }));
+
+  // ── quality — persisted eval report + history (pure fs reads, tolerant) ──
+  let quality: RetrievalPayload['quality'] = null;
+  let qualityHistory: RetrievalPayload['qualityHistory'] = [];
+  try { quality = readLastEvalReport(config.dataDir); } catch { /* none */ }
+  try { qualityHistory = readEvalHistory(config.dataDir); } catch { /* none */ }
+
+  // ── bitemporal — active vs superseded facts + recent supersession events ──
+  const bitemporal: RetrievalPayload['bitemporal'] = {
+    enabled: config.bitemporalKg,
+    active: 0,
+    superseded: 0,
+    recentSupersessions: [],
+  };
+  if (isKgInitialized()) {
+    try {
+      const stats = kgStats();
+      bitemporal.active = stats.activeTriples;
+      bitemporal.superseded = stats.expiredTriples;
+    } catch { /* non-critical */ }
+    // Supersession lane only makes sense when the bitemporal model stamps
+    // valid_to; if the flag is off nothing closes a fact, so skip the reader.
+    if (config.bitemporalKg) {
+      try { bitemporal.recentSupersessions = kgRecentSupersessions(10); } catch { /* none */ }
+    }
+  }
+
+  // ── graph — substrate stats (TTL-cached) + entity-bridge count + spread ──
+  const graphStats = getRecallGraphStats();
+  let bridgeTriples = 0;
+  try { bridgeTriples = kgAllMentionTriples().length; } catch { /* none */ }
+  const graph: RetrievalPayload['graph'] = {
+    enabled: config.pprRecall,
+    nodes: graphStats.nodes,
+    edges: graphStats.edges,
+    bridgeTriples,
+    avgDegree: graphStats.avgDegree,
+    lastSeedSpread: graphStats.lastSeedSpread,
+  };
+
+  return { armMix, armWeights, armsActive, recentArmBreakdown, quality, qualityHistory, bitemporal, graph };
 }

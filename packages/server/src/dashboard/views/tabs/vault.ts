@@ -19,9 +19,9 @@
  * memHot/Warm/Cold, memBar, embeddingBadge, embModel, embVectors, embAvgTime,
  * topNotesBody, categoryBars, sqTotal/AvgResults/AvgLatency/ZeroRate,
  * recentSearchesFeed, vhTotal/Archived/Stale/FileTypes, ldTotal/Avg/Orphans/
- * MostLinked, saLexOnly/SemOnly/Both, saContribBar, mlArchived/Consolidated,
+ * MostLinked, mlArchived/Consolidated,
  * mlTempBar, mlRecentOps, memoryOpsFeed, notesAccessFeed, collectionBars,
- * scoreBreakdowns, msIdentity, msNarrative, msTokenCount, sqbRecall5/Ndcg10/
+ * msIdentity, msNarrative, msTokenCount, sqbRecall5/Ndcg10/
  * AvgLat/LastRun, benchmarkGauges, benchmarkTimestamp, benchmarkTableBody,
  * btnSaveGroundTruth, chartTempHistory, heatHistogram). New ids added for the
  * promoted KPI tiles + benchmark dot-plot are filled in the same module.
@@ -35,18 +35,16 @@ export function renderVaultTab(): string {
   // ── Insight strip + promoted KPIs ─────────────────────────────────────────
   const sowhat = `<div class="sowhat" id="vaultSoWhat"></div>`;
 
+  // Hybrid Balance KPI removed — it rendered a two-arm lexical/semantic split
+  // (searchTypeStats), blind to the graph arm. Retrieval-arm mix now lives in the
+  // Retrieval tab (Recall Arms). Remaining three KPIs widen to col-4.
   const kpis = `
   <div class="grid">
-    <div class="col-3">${kpi({
+    <div class="col-4">${kpi({
       label: 'Retrieval Quality', valueId: 'kpiZeroRate', value: '—',
       subId: 'kpiZeroSub', pillId: 'kpiZeroPill',
     })}</div>
-    <div class="col-3">${kpi({
-      label: 'Hybrid Balance', valueId: 'kpiHybridVal', value: '—',
-      subId: 'kpiHybridSub',
-      body: `<div class="stacked-bar stacked-bar--sm" id="kpiHybridBar" role="img" aria-label="Lexical vs semantic score contribution"></div>`,
-    })}</div>
-    <div class="col-3 card card--kpi card--center" style="display:flex;flex-direction:column;align-items:center;justify-content:center;gap:.25rem">
+    <div class="col-4 card card--kpi card--center" style="display:flex;flex-direction:column;align-items:center;justify-content:center;gap:.25rem">
       <div class="card-label" style="justify-content:center">Temperature Balance</div>
       <div class="chart-wrap chart-wrap--sm" style="height:96px;width:100%">
         <svg id="kpiTempGauge" viewBox="0 0 600 140" preserveAspectRatio="xMidYMid meet" role="img" aria-labelledby="kpiTempGaugeLbl"></svg>
@@ -54,7 +52,7 @@ export function renderVaultTab(): string {
       <div class="card-sub" id="kpiTempSub" style="margin-top:0"></div>
       <span id="kpiTempGaugeLbl" style="position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)">Memory temperature balance index</span>
     </div>
-    <div class="col-3">${kpi({
+    <div class="col-4">${kpi({
       label: 'Embedding Coverage', valueId: 'kpiCoverageVal', value: '—',
       subId: 'kpiCoverageSub', pillId: 'kpiCoveragePill',
       body: `<div class="kpi-foot" id="kpiRatioFoot" style="margin-top:.45rem"></div>`,
@@ -252,21 +250,9 @@ export function renderVaultTab(): string {
     </div>
 
     <div class="grid">
-      <div class="col-6 card">
-        <div class="section-title">Search Analytics</div>
-        <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:.75rem;margin-bottom:.75rem">
-          <div><div class="card-label">Lexical-Only</div><div class="card-value card-value--lg mono" id="saLexOnly" style="color:var(--info)">0</div></div>
-          <div><div class="card-label">Semantic-Only</div><div class="card-value card-value--lg mono" id="saSemOnly" style="color:var(--ok)">0</div></div>
-          <div><div class="card-label">Both (Hybrid)</div><div class="card-value card-value--lg mono" id="saBoth" style="color:var(--warn)">0</div></div>
-        </div>
-        <div class="card-label">Average Score Contribution</div>
-        <div class="stacked-bar" id="saContribBar" style="margin-top:.35rem"></div>
-        <div class="chart-legend">
-          <span><i style="background:var(--info)"></i>Lexical</span>
-          <span><i style="background:var(--ok)"></i>Semantic</span>
-        </div>
-      </div>
-      <div class="col-6 card">
+      <!-- Search Analytics card removed — two-arm lexical/semantic split
+           (searchTypeStats), superseded by Retrieval › Recall Arms. -->
+      <div class="col-12 card">
         <div class="section-title">Memory Lifecycle</div>
         <div style="display:grid;grid-template-columns:repeat(2,1fr);gap:.75rem;margin-bottom:.75rem">
           <div><div class="card-label">Total Archived</div><div class="card-value card-value--lg mono" id="mlArchived">0</div></div>
@@ -296,13 +282,12 @@ export function renderVaultTab(): string {
     </div>
 
     <div class="grid">
-      <div class="col-6 card">
+      <!-- Score Breakdown card removed — two-segment lexical/semantic bar
+           (searchScoreBreakdowns) omitted the graph arm; superseded by
+           Retrieval › Recall Arms (3-arm contribution bar). -->
+      <div class="col-12 card">
         <div class="section-title">Collections</div>
         <div id="collectionBars"><div class="empty-msg">No collection data.</div></div>
-      </div>
-      <div class="col-6 card">
-        <div class="section-title">Score Breakdown (Recent Searches)</div>
-        <div id="scoreBreakdowns" style="max-height:260px;overflow-y:auto"><div class="empty-msg">No searches with score data.</div></div>
       </div>
     </div>
 

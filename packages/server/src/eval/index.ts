@@ -109,6 +109,12 @@ interface CliArgs {
   realVault?: string;
   /** Arms for real-vault mode (default lexical,semantic,ppr). */
   arms?: string;
+  /**
+   * Directory to persist the dashboard eval artifacts into (eval-report.json +
+   * eval-history.jsonl). Defaults to `config.dataDir` unless EVAL_OUT / --out
+   * overrides it. The Retrieval tab's Recall-Quality panel reads these files.
+   */
+  out?: string;
 }
 
 function parseArgs(argv: string[]): CliArgs {
@@ -125,6 +131,7 @@ function parseArgs(argv: string[]): CliArgs {
     compare: process.env.EVAL_COMPARE === '1' || process.env.EVAL_COMPARE === 'true',
     realVault: process.env.EVAL_REAL_VAULT || undefined,
     arms: process.env.EVAL_ARMS || undefined,
+    out: process.env.EVAL_OUT || undefined,
   };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -137,11 +144,126 @@ function parseArgs(argv: string[]): CliArgs {
     else if (a.startsWith('--real-vault=')) args.realVault = a.slice('--real-vault='.length);
     else if (a === '--arms') args.arms = argv[++i];
     else if (a.startsWith('--arms=')) args.arms = a.slice('--arms='.length);
+    else if (a === '--out') args.out = argv[++i];
+    else if (a.startsWith('--out=')) args.out = a.slice('--out='.length);
     else if (a === '--k') args.k = parseInt(argv[++i], 10) || 5;
     else if (a.startsWith('--k=')) args.k = parseInt(a.slice('--k='.length), 10) || 5;
     else if (a.startsWith('--dataset=')) args.dataset = a.slice('--dataset='.length);
   }
   return args;
+}
+
+/**
+ * The dashboard eval artifacts. Kept in lockstep with
+ * `dashboard/model/eval-report-reader.ts` (same filenames + arm-row shape).
+ */
+const EVAL_REPORT_FILE = 'eval-report.json';
+const EVAL_HISTORY_FILE = 'eval-history.jsonl';
+
+/** One arm row as persisted to eval-report.json (RetrievalQualityArm shape). */
+interface PersistedArm {
+  arm: Arm;
+  recallAtK: number;
+  pointInTimeAccuracy: number;
+  staleLeakRate: number;
+  mrr: number | null;
+  avgLatencyMs: number | null;
+}
+
+/**
+ * Resolve the output dir the dashboard reads from. Explicit `--out`/EVAL_OUT
+ * wins; otherwise fall back to `config.dataDir`. Imported lazily so a plain
+ * `--smoke` run without persistence never pulls config (which freezes env).
+ */
+async function resolveOutDir(explicit: string | undefined): Promise<string> {
+  if (explicit) return explicit;
+  const { config } = await import('../config.js');
+  return config.dataDir;
+}
+
+/**
+ * Persist the last eval report (arm compare) + append a headline history row.
+ * Best-effort: a write failure logs to stderr and does not fail the eval run.
+ * `arms` is the full compare set (baseline-first); the history row is the
+ * BASELINE arm's headline metrics, so the trend line tracks the untreated
+ * pipeline across runs. Non-baseline single-arm runs still write a report but
+ * use their own arm's headline for history (best available signal).
+ */
+async function persistEvalReport(
+  outDir: string | undefined,
+  mode: 'temporal' | 'real-vault',
+  k: number,
+  arms: PersistedArm[],
+): Promise<void> {
+  if (arms.length === 0) return;
+  try {
+    const fs = await import('node:fs');
+    const dir = await resolveOutDir(outDir);
+    fs.mkdirSync(dir, { recursive: true });
+    const ranAt = Date.now();
+
+    const report = { ranAt, mode, k, arms };
+    const reportPath = path.join(dir, EVAL_REPORT_FILE);
+    const tmp = reportPath + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify(report, null, 2), { mode: 0o600 });
+    fs.renameSync(tmp, reportPath);
+
+    // History row: prefer the baseline arm; else the first arm present.
+    const head = arms.find((a) => a.arm === 'baseline') ?? arms[0];
+    const historyRow = {
+      ranAt,
+      recallAtK: head.recallAtK,
+      pointInTimeAccuracy: head.pointInTimeAccuracy,
+      staleLeakRate: head.staleLeakRate,
+    };
+    fs.appendFileSync(path.join(dir, EVAL_HISTORY_FILE), JSON.stringify(historyRow) + '\n', { mode: 0o600 });
+  } catch (err) {
+    process.stderr.write(
+      `warn: failed to persist eval report: ${err instanceof Error ? err.message : String(err)}\n`,
+    );
+  }
+}
+
+/** Map an EvalReport (temporal harness) → a persisted arm row. */
+function temporalArmRow(arm: Arm, report: EvalReport): PersistedArm {
+  return {
+    arm,
+    recallAtK: report.recallAtK,
+    pointInTimeAccuracy: report.pointInTimeAccuracy,
+    staleLeakRate: report.staleLeakRate,
+    mrr: null,
+    avgLatencyMs: null,
+  };
+}
+
+/**
+ * Map a RealVaultReport → persisted arm rows in the RetrievalQualityArm arm
+ * space. Real-vault has no temporal labels, so PIT/leak are 0 and MRR/latency
+ * carry through. Arm mapping: lexical/semantic are pre-graph pipeline stages →
+ * folded to `baseline`; `ppr` → `ppr`. The multi-hop gold set (wikilink
+ * neighbours — the PPR-relevant signal) is preferred; self-retrieval is the
+ * fallback when multi-hop had no linked notes.
+ */
+function realVaultArmRows(report: import('./real-vault.js').RealVaultReport): PersistedArm[] {
+  const rows = report.multiHop.length > 0 ? report.multiHop : report.selfRetrieval;
+  const byArm = new Map<Arm, PersistedArm>();
+  for (const r of rows) {
+    const arm: Arm = r.arm === 'ppr' ? 'ppr' : 'baseline';
+    // If both lexical and semantic map to baseline, keep the stronger recall.
+    const existing = byArm.get(arm);
+    if (existing && existing.recallAtK >= r.recallAtK) continue;
+    byArm.set(arm, {
+      arm,
+      recallAtK: r.recallAtK,
+      pointInTimeAccuracy: 0,
+      staleLeakRate: 0,
+      mrr: r.mrr,
+      avgLatencyMs: r.avgLatencyMs,
+    });
+  }
+  // baseline-first ordering for a stable report.
+  const order: Arm[] = ['baseline', 'bitemporal', 'ppr', 'ppr-bitemporal'];
+  return order.filter((a) => byArm.has(a)).map((a) => byArm.get(a)!);
 }
 
 /** Resolve the bundled smoke fixture path relative to this module. */
@@ -285,6 +407,14 @@ async function main(): Promise<void> {
     });
     process.stdout.write(JSON.stringify(report, null, 2) + '\n');
     process.stdout.write(formatRealVaultReport(report) + '\n');
+
+    // Persist for the dashboard. Real-vault arms (lexical/semantic/ppr) map onto
+    // the RetrievalQualityArm arm space: lexical/semantic → baseline (the
+    // untreated pipeline), ppr → ppr. PIT/leak don't apply here (0); MRR/latency
+    // carry through. Prefer the multi-hop gold set (the PPR-relevant signal),
+    // else self-retrieval.
+    const rvRows = realVaultArmRows(report);
+    await persistEvalReport(args.out, 'real-vault', report.k, rvRows);
     return;
   }
 
@@ -326,6 +456,14 @@ async function main(): Promise<void> {
     }
     process.stdout.write(perScenarioMatrix(reports) + '\n');
     process.stdout.write(compareTable(baseline, treatments) + '\n');
+
+    // Persist the full arm-compare for the dashboard's Recall-Quality hero.
+    await persistEvalReport(
+      args.out,
+      'temporal',
+      baseline.k,
+      reports.map(({ arm, report }) => temporalArmRow(arm, report)),
+    );
     return;
   }
 
@@ -345,12 +483,16 @@ async function main(): Promise<void> {
     return;
   }
 
-  const armName = args.graph && args.bitemporal ? 'ppr+bitemp'
+  const arm: Arm = args.graph && args.bitemporal ? 'ppr-bitemporal'
     : args.graph ? 'ppr'
     : args.bitemporal ? 'bitemporal'
     : 'baseline';
   process.stdout.write(JSON.stringify(report, null, 2) + '\n');
-  process.stdout.write(humanTable(report, armName) + '\n');
+  process.stdout.write(humanTable(report, ARM_LABEL[arm]) + '\n');
+
+  // Persist the single-arm report for the dashboard. (Skipped above for the
+  // EVAL_REPORT_JSON subprocess mode, which returns before reaching here.)
+  await persistEvalReport(args.out, 'temporal', report.k, [temporalArmRow(arm, report)]);
 }
 
 /** Parse a `--arms lexical,semantic,ppr` list; default all three. */

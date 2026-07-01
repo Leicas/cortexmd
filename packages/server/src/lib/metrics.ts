@@ -487,23 +487,76 @@ export function recordAuthFailure(ip: string, path: string, method: string): voi
 interface SearchScoreEntry {
   timestamp: number;
   query: string;
-  results: Array<{ path: string; lexical: number; semantic: number; fused: number }>;
+  // `graph` is additive (0 when the PPR arm is off) — carried so the new
+  // Retrieval tab's arm views aren't two-arm-blind. Existing consumers ignore it.
+  results: Array<{ path: string; lexical: number; semantic: number; graph: number; fused: number }>;
 }
 
 const recentSearchScores: SearchScoreEntry[] = [];
 const MAX_SEARCH_SCORES = 20;
 
-export function recordSearchScoreBreakdown(query: string, results: Array<{ path: string; lexicalScore: number; semanticScore: number; fusedScore: number }>): void {
+export function recordSearchScoreBreakdown(query: string, results: Array<{ path: string; lexicalScore: number; semanticScore: number; graphScore?: number; fusedScore: number }>): void {
   recentSearchScores.push({
     timestamp: Date.now(),
     query,
-    results: results.slice(0, 5).map(r => ({ path: r.path, lexical: r.lexicalScore, semantic: r.semanticScore, fused: r.fusedScore })),
+    results: results.slice(0, 5).map(r => ({ path: r.path, lexical: r.lexicalScore, semantic: r.semanticScore, graph: r.graphScore ?? 0, fused: r.fusedScore })),
   });
   if (recentSearchScores.length > MAX_SEARCH_SCORES) recentSearchScores.splice(0, recentSearchScores.length - MAX_SEARCH_SCORES);
 }
 
 export function getRecentSearchScores(): SearchScoreEntry[] {
   return recentSearchScores.slice();
+}
+
+// ── Arm-contribution tracking (3-arm: lexical / semantic / graph) ─────────
+//
+// Per-query fused-score SHARES of each recall arm, for the Retrieval tab's
+// "Recall Arms" panel. Distinct from `recordSearchTypeBreakdown` (which is
+// two-arm-blind and being retired): this carries the graph arm honestly, and
+// aggregates over recent queries rather than per-result hit counts. Ring is
+// capped at MAX_RECENT_ARM_BREAKDOWN (mirrors recentSearches).
+
+export interface ArmBreakdownEntry {
+  timestamp: number;
+  query: string;
+  /** Per-query fraction of total fused score contributed by each arm (0–1, sums≈1). */
+  lexical: number;
+  semantic: number;
+  graph: number;
+}
+
+const recentArmBreakdown: ArmBreakdownEntry[] = [];
+const MAX_RECENT_ARM_BREAKDOWN = 30;
+
+/**
+ * Record one query's arm-contribution breakdown from its SearchResult[]. Sums
+ * each arm's RRF contribution across the top results, then normalizes to
+ * fractions of the total so the three shares sum to ~1 (0/0 → all zero). The
+ * graph share is genuinely 0 when the PPR arm was dormant — encoded, not faked.
+ * Additive + best-effort; never throws into the search hot path.
+ */
+export function recordArmBreakdown(
+  query: string,
+  results: Array<{ lexicalScore: number; semanticScore: number; graphScore?: number }>,
+): void {
+  let lex = 0, sem = 0, graph = 0;
+  for (const r of results) {
+    lex += r.lexicalScore > 0 ? r.lexicalScore : 0;
+    sem += r.semanticScore > 0 ? r.semanticScore : 0;
+    const g = r.graphScore ?? 0;
+    graph += g > 0 ? g : 0;
+  }
+  const total = lex + sem + graph;
+  const entry: ArmBreakdownEntry = total > 0
+    ? { timestamp: Date.now(), query, lexical: lex / total, semantic: sem / total, graph: graph / total }
+    : { timestamp: Date.now(), query, lexical: 0, semantic: 0, graph: 0 };
+  recentArmBreakdown.push(entry);
+  if (recentArmBreakdown.length > MAX_RECENT_ARM_BREAKDOWN) recentArmBreakdown.shift();
+}
+
+/** Recent per-query arm-contribution breakdowns, oldest→newest (cap 30). */
+export function getRecentArmBreakdown(): ArmBreakdownEntry[] {
+  return recentArmBreakdown.slice();
 }
 
 export function recordSearchQuery(query: string, resultCount: number, latencyMs: number): void {

@@ -10,6 +10,9 @@
  *   Band 4 — STRUCTURE: entity intelligence (col-8) + knowledge graph (col-4)
  *   Band 5 — HISTORY & AGENTS: collapsed <details>, col-7 / col-5 inside
  *
+ * The former Recall Engine band (co-recall / Rescue@10) was removed — recall
+ * telemetry now lives in the dedicated Retrieval tab.
+ *
  * Built from the shared component vocabulary (`kpi`, `sectionHead`,
  * `.grid`/`.col-*`, `.card--kpi`, `.sowhat`, `.chart-legend`, `.table-wrap`,
  * `drawGauge`/`drawMulti`/`drawChart`) — no ad-hoc styles. Every dynamic id the
@@ -190,54 +193,9 @@ export function renderIntelligenceTab(): string {
     </div>
   </div>`;
 
-  // ── Band 4.5 — RECALL ENGINE: multi-signal recall fusion (v1.10.0) ─────────
-  const recallEngine = `
-  <div class="grid">
-    <div class="col-12 card">
-      ${sectionHead('Recall Engine', `<span id="recallEnginePill"></span>`)}
-      <div class="card-sub" style="margin-top:0;margin-bottom:.75rem">Multi-signal recall fusion — graph-centrality boost, Hebbian co-recall associations (spreading activation), and per-result explainability.</div>
-      <div class="grid" style="grid-template-columns:repeat(4,1fr);margin-bottom:0">
-        <div>
-          <div class="card-label">Co-recall Links</div>
-          <div class="card-value card-value--xl" id="reEdges">0</div>
-          <div class="card-sub" style="margin-top:0">learned associations</div>
-        </div>
-        <div>
-          <div class="card-label">Associated Memories</div>
-          <div class="card-value card-value--xl" id="reNodes">0</div>
-          <div class="card-sub" style="margin-top:0">notes in the graph</div>
-        </div>
-        <div>
-          <div class="card-label">Centrality Weight</div>
-          <div class="card-value card-value--xl" id="reCentralityW">—</div>
-          <div class="card-sub" style="margin-top:0">graph-hub boost</div>
-        </div>
-        <div>
-          <div class="card-label">Co-recall Weight</div>
-          <div class="card-value card-value--xl" id="reCoRecallW">—</div>
-          <div class="card-sub" style="margin-top:0">spreading activation</div>
-        </div>
-      </div>
-      <div class="card-sub" style="margin-top:1rem;margin-bottom:.5rem"><strong>Contradiction resilience</strong> — reproducible Rescue@10 over the Bayesian-validity pipeline (a superseded fact is down-ranked or quarantined; the current fact survives). <a href="https://github.com/Leicas/cortexmd/blob/main/docs/BENCHMARKS.md" target="_blank" rel="noopener">methodology</a></div>
-      <div class="grid" style="grid-template-columns:repeat(3,1fr);margin-bottom:0">
-        <div>
-          <div class="card-label">Rescue@10</div>
-          <div class="card-value card-value--xl" id="reRescue">—</div>
-          <div class="card-sub" style="margin-top:0">current fact stays top-10</div>
-        </div>
-        <div>
-          <div class="card-label">Superseded Demoted</div>
-          <div class="card-value card-value--xl" id="reDemoted">—</div>
-          <div class="card-sub" style="margin-top:0">stale fact down-ranked / dropped</div>
-        </div>
-        <div>
-          <div class="card-label">Scenarios</div>
-          <div class="card-value card-value--xl" id="reRescueCases">—</div>
-          <div class="card-sub" style="margin-top:0">contradiction cases scored</div>
-        </div>
-      </div>
-    </div>
-  </div>`;
+  // ── Band 4.5 — RECALL ENGINE: REMOVED. Recall internals moved to the
+  //    dedicated Retrieval tab (Recall Arms + Recall Quality). Rescue@10 retired
+  //    in favor of the eval report's staleLeakRate. See RetrievalPayload. ───────
 
   // ── Band 5 — HISTORY & AGENTS: collapsed disclosure, col-7 / col-5 ─────────
   const historyAgents = `
@@ -275,5 +233,5 @@ export function renderIntelligenceTab(): string {
     </div>
   </details>`;
 
-  return vitalsKpis + soWhat + vitalsGauge + dreamEngine + findings + structure + recallEngine + historyAgents;
+  return vitalsKpis + soWhat + vitalsGauge + dreamEngine + findings + structure + historyAgents;
 }

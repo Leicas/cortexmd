@@ -290,6 +290,21 @@ export const config = {
   // no `asOf`, both ingestion and recall behave exactly as they do today.
   bitemporalKg: process.env.BITEMPORAL_KG === 'true',
 
+  // Personalized-PageRank graph-recall arm (HippoRAG-2 style). DORMANT by
+  // default — inverted default like `bitemporalKg` (defaults OFF via
+  // `=== 'true'`). When ON (or when a per-call `opts.graph === true` is passed
+  // to hybridSearch), an ADDITIVE third RRF arm runs PPR over a unified
+  // note/entity graph and fuses its rank contribution alongside lexical +
+  // semantic. Because it only ADDS RRF mass, enabling it can re-rank or
+  // introduce results but never drop an existing lexical/semantic hit. With
+  // this flag off AND no `opts.graph`, hybridSearch is byte-identical to today
+  // (the graph arm block is skipped entirely — no graph build, no PPR).
+  pprRecall: process.env.PPR_RECALL === 'true',
+  // Cosine threshold above which two notes get a synonymy edge in the recall
+  // graph (only when embeddings are ready). Bounded per-note kNN keeps it
+  // O(N·fanout), never O(N²).
+  pprSynonymyThreshold: parseFloat(process.env.PPR_SYNONYMY_THRESHOLD ?? '0.8'),
+
   // Automatic linking on store (memory_store / notes_upsert). Conservative +
   // reversible defaults: entity links keep the historical 0.7 confidence gate;
   // similarity backlinks use a higher score floor than the advisory

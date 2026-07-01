@@ -13,6 +13,15 @@ import { isPathIndexable, sourceNameForVault } from './index-allowlist.js';
 import { getVault, pruneStaleVaultTransports } from './vault/registry.js';
 import { listSourceVaultPaths } from './source-vaults.js';
 import { withinWindow } from './bitemporal.js';
+import { extractWikilinks } from './markdown.js';
+import { detectEntities } from './entity-detector.js';
+import { kgAllMentionTriples } from './knowledge-graph.js';
+import {
+  buildRecallGraph,
+  runPPR,
+  extractSeeds,
+  pprRrfContribution,
+} from './graph-recall.js';
 
 export interface SearchOptions {
   scopePaths?: string[];
@@ -34,6 +43,15 @@ export interface SearchOptions {
    * results are byte-identical to today.
    */
   asOf?: string;
+  /**
+   * Enable the Personalized-PageRank graph-recall arm for THIS call. The arm is
+   * active when `config.pprRecall` OR `opts.graph === true`; with neither set
+   * (the normal production path) the arm block is skipped entirely and results
+   * are byte-identical to today. The eval flips this per-call so it can measure
+   * the arm without mutating env. Additive-only: enabling it can re-rank or
+   * introduce results but never drop an existing lexical/semantic hit.
+   */
+  graph?: boolean;
 }
 
 export interface SearchResult {
@@ -43,7 +61,8 @@ export interface SearchResult {
   score: number;           // keep for backward compat (= fusedScore)
   lexicalScore: number;    // RRF contribution from lexical search
   semanticScore: number;   // RRF contribution from semantic search
-  fusedScore: number;      // lexicalScore + semanticScore
+  graphScore: number;      // RRF contribution from the PPR graph arm (0 when the arm is off)
+  fusedScore: number;      // (lexicalScore + semanticScore + graphScore) × collectionBoost
 }
 
 interface DocMeta {
@@ -526,6 +545,7 @@ export function searchNotes(
       score: r.score,
       lexicalScore: r.score,
       semanticScore: 0,
+      graphScore: 0,
       fusedScore: r.score,
     };
   });
@@ -549,6 +569,172 @@ function filterByAsOf<T extends { path: string }>(results: T[], asOf: string): T
 }
 
 /**
+ * Resolve a wikilink target against the current index (docMeta keys). Mirrors
+ * the private `resolveWikilinkTarget` in graph.ts (first-wins basename lookup)
+ * so the PPR arm can derive its note↔note link graph from the in-memory
+ * docMeta WITHOUT a second vault walk. Local to search.ts by design — the
+ * graph.ts resolver is module-private and graph.ts is owned elsewhere.
+ */
+function resolveLinkTargetLocal(
+  target: string,
+  allFiles: Set<string>,
+  basenameLookup: Map<string, string>,
+): string | undefined {
+  const cleaned = target.split('#')[0].trim();
+  if (!cleaned) return undefined;
+  const withMd = cleaned.endsWith('.md') ? cleaned : `${cleaned}.md`;
+  if (allFiles.has(withMd)) return withMd;
+  const found = basenameLookup.get(cleaned.split('/').pop()!);
+  if (found) return found;
+  const normalized = withMd.replace(/\\/g, '/');
+  if (allFiles.has(normalized)) return normalized;
+  return undefined;
+}
+
+/**
+ * Build the note↔note wikilink graph and the title→path index from the current
+ * in-memory docMeta. Cheap (no I/O — reuses already-parsed note bodies) and
+ * only invoked when the graph arm is active.
+ */
+function buildLinkGraphFromDocMeta(): {
+  linkGraph: Map<string, Set<string>>;
+  titleToPath: Map<string, string>;
+} {
+  const allFiles = new Set(docMeta.keys());
+  const basenameLookup = new Map<string, string>();
+  const titleToPath = new Map<string, string>();
+  for (const [p, meta] of docMeta) {
+    const base = p.replace(/\.md$/, '').split('/').pop()!;
+    if (!basenameLookup.has(base)) basenameLookup.set(base, p);
+    // First-wins on title collision (matches basenameLookup semantics).
+    if (meta.title && !titleToPath.has(meta.title)) titleToPath.set(meta.title, p);
+    // Also index the path-derived title so KG subjects (which fall back to the
+    // basename when a note has no explicit title) still resolve.
+    if (!titleToPath.has(base)) titleToPath.set(base, p);
+  }
+
+  const linkGraph = new Map<string, Set<string>>();
+  for (const [p, meta] of docMeta) {
+    const resolved = new Set<string>();
+    for (const target of extractWikilinks(meta.content)) {
+      const t = resolveLinkTargetLocal(target, allFiles, basenameLookup);
+      if (t) resolved.add(t);
+    }
+    linkGraph.set(p, resolved);
+  }
+  return { linkGraph, titleToPath };
+}
+
+/**
+ * Compute the PPR graph-recall arm's RRF contribution for a query.
+ *
+ * Returns `path -> 1/(k+rank+1)` RRF terms, or an EMPTY map on any failure /
+ * no-seed condition — so a caller can unconditionally add it to the fused score
+ * (an empty map contributes 0 to every note, preserving byte-identity). Wrapped
+ * in try/catch exactly like the semantic-arm fallback: any error means the arm
+ * silently contributes nothing.
+ *
+ * Synonymy edges are intentionally NOT built here: they would require an
+ * O(N) embedding kNN sweep on the query hot path. The wikilink + mention
+ * substrate is sufficient for the multi-hop bridges the arm targets; the
+ * `synonymyNeighbors` input of buildRecallGraph remains available for the
+ * offline eval to exercise.
+ */
+function computeGraphArm(query: string, lexicalTopPaths: string[], k: number): Map<string, number> {
+  try {
+    const { linkGraph, titleToPath } = buildLinkGraphFromDocMeta();
+    const mentions = kgAllMentionTriples(); // {subject(title), predicate, object(entity)}
+    const graph = buildRecallGraph({ linkGraph, titleToPath, mentions });
+
+    const detected = detectEntities(query).map((e) => e.name);
+    const seeds = extractSeeds(graph, lexicalTopPaths, detected);
+    if (seeds.length === 0) return new Map();
+
+    const ppr = runPPR(graph, seeds, { limit: lexicalTopPaths.length + 40 });
+    return pprRrfContribution(ppr, k);
+  } catch {
+    return new Map();
+  }
+}
+
+/**
+ * Fuse the lexical results with the PPR graph arm on the embeddings-OFF (or
+ * semantic-fallback) path. Same additive RRF math and post-filters as the
+ * three-arm fused path, minus the semantic term. Only called when the graph
+ * arm is active AND produced a contribution, so the byte-identical
+ * default-path behavior is never affected.
+ */
+function fuseLexicalWithGraph(
+  lexicalResults: SearchResult[],
+  graphContribution: Map<string, number>,
+  k: number,
+  limit: number,
+  opts: SearchOptions,
+): SearchResult[] {
+  const fused = new Map<string, { lexical: number; graph: number }>();
+  lexicalResults.forEach((r, rank) => {
+    const e = fused.get(r.path) ?? { lexical: 0, graph: 0 };
+    e.lexical += 1 / (k + rank + 1);
+    fused.set(r.path, e);
+  });
+  for (const [path, rrf] of graphContribution) {
+    const e = fused.get(path) ?? { lexical: 0, graph: 0 };
+    e.graph += rrf;
+    fused.set(path, e);
+  }
+
+  const {
+    scopePaths, tags, dateFrom, dateTo, type, category, temperature,
+    minHeatScore, importance, excludeArchived = true, collections,
+  } = opts;
+
+  const entries = [...fused.entries()].sort(
+    (a, b) => (b[1].lexical + b[1].graph) - (a[1].lexical + a[1].graph),
+  );
+
+  const results: SearchResult[] = [];
+  for (const [fusedPath, e] of entries) {
+    if (results.length >= limit) break;
+    const meta = docMeta.get(fusedPath);
+    if (!meta) continue;
+    if (excludeArchived && meta.archived === true) continue;
+    if (opts.asOf) {
+      const vf = meta.valid_from ?? meta.date;
+      if (!withinWindow(vf, meta.valid_to, opts.asOf)) continue;
+    }
+    if (collections && collections.length > 0 && !collections.includes(meta.collection)) continue;
+    if (scopePaths && scopePaths.length > 0 && !scopePaths.some(sp => fusedPath.startsWith(sp))) continue;
+    if (tags && tags.length > 0 && !tags.some(t => meta.tags.includes(t))) continue;
+    if (meta.date) {
+      if (dateFrom && meta.date < dateFrom) continue;
+      if (dateTo && meta.date > dateTo) continue;
+    } else if (dateFrom || dateTo) {
+      continue;
+    }
+    if (type && meta.type !== type) continue;
+    if (category && meta.category !== category) continue;
+    if (temperature && meta.temperature !== temperature) continue;
+    if (minHeatScore !== undefined && (meta.heat_score === undefined || meta.heat_score < minHeatScore)) continue;
+    if (importance && meta.importance !== importance) continue;
+
+    const collectionBoost = getCollectionWeight(meta.collection);
+    const boostedScore = (e.lexical + e.graph) * collectionBoost;
+    results.push({
+      path: fusedPath,
+      title: meta.title,
+      snippet: meta.content.slice(0, 200),
+      score: boostedScore,
+      lexicalScore: e.lexical,
+      semanticScore: 0,
+      graphScore: e.graph,
+      fusedScore: boostedScore,
+    });
+  }
+  results.sort((a, b) => b.score - a.score);
+  return results;
+}
+
+/**
  * Hybrid search combining lexical (MiniSearch) and semantic (embeddings) results
  * using Reciprocal Rank Fusion. Falls back to lexical-only if embeddings unavailable.
  */
@@ -569,12 +755,33 @@ export async function hybridSearch(
     lexicalResults = filterByAsOf(lexicalResults, opts.asOf);
   }
 
+  // RRF constant, shared by every arm (lexical, semantic, graph).
+  const k = 60;
+
+  // PPR graph-recall arm (DORMANT by default). Active only when the config flag
+  // OR the per-call opt is set; with NEITHER set this block is skipped entirely
+  // (no graph build, no PPR) and everything below is byte-identical to today.
+  // The contribution is an additive RRF term map (path -> score); an empty map
+  // (no seeds / arm off / failure) adds 0 to every note, so it can only
+  // re-rank or introduce results, never drop one.
+  const graphArmActive = config.pprRecall || opts.graph === true;
+  const graphContribution: Map<string, number> = graphArmActive
+    ? computeGraphArm(query, lexicalResults.map((r) => r.path), k)
+    : new Map();
+
   // Semantic results (if available)
   if (!isEmbeddingsReady()) {
+    // Lexical-only path. When the graph arm is active, fuse its RRF term in
+    // additively so multi-hop notes surface even without embeddings; otherwise
+    // this is byte-identical to today (graphContribution is empty).
+    if (graphArmActive && graphContribution.size > 0) {
+      return fuseLexicalWithGraph(lexicalResults, graphContribution, k, limit, opts);
+    }
     return lexicalResults.slice(0, limit).map(r => ({
       ...r,
       lexicalScore: r.lexicalScore,
       semanticScore: 0,
+      graphScore: 0,
       fusedScore: r.lexicalScore,
       score: r.lexicalScore,
     }));
@@ -584,32 +791,49 @@ export async function hybridSearch(
   try {
     semanticResults = await searchSemantic(query, overFetch);
   } catch {
+    if (graphArmActive && graphContribution.size > 0) {
+      return fuseLexicalWithGraph(lexicalResults, graphContribution, k, limit, opts);
+    }
     return lexicalResults.slice(0, limit);
   }
 
   if (semanticResults.length === 0) {
+    if (graphArmActive && graphContribution.size > 0) {
+      return fuseLexicalWithGraph(lexicalResults, graphContribution, k, limit, opts);
+    }
     return lexicalResults.slice(0, limit);
   }
 
 
-  // RRF fusion
-  const k = 60;
-  const fused = new Map<string, { lexical: number; semantic: number }>();
+  // RRF fusion — three additive arms: lexical + semantic + graph (PPR).
+  const fused = new Map<string, { lexical: number; semantic: number; graph: number }>();
 
   lexicalResults.forEach((r, rank) => {
-    const entry = fused.get(r.path) ?? { lexical: 0, semantic: 0 };
+    const entry = fused.get(r.path) ?? { lexical: 0, semantic: 0, graph: 0 };
     entry.lexical += 1 / (k + rank + 1);
     fused.set(r.path, entry);
   });
 
   semanticResults.forEach((r, rank) => {
-    const entry = fused.get(r.path) ?? { lexical: 0, semantic: 0 };
+    const entry = fused.get(r.path) ?? { lexical: 0, semantic: 0, graph: 0 };
     entry.semantic += 1 / (k + rank + 1);
     fused.set(r.path, entry);
   });
 
+  // Graph arm (additive). graphContribution is empty when the arm is off, so
+  // this loop is a no-op and the fused ordering is byte-identical to today.
+  for (const [path, rrf] of graphContribution) {
+    const entry = fused.get(path) ?? { lexical: 0, semantic: 0, graph: 0 };
+    entry.graph += rrf;
+    fused.set(path, entry);
+  }
+
   // Sort by fused score descending
-  const fusedEntries = [...fused.entries()].sort((a, b) => (b[1].lexical + b[1].semantic) - (a[1].lexical + a[1].semantic));
+  const fusedEntries = [...fused.entries()].sort(
+    (a, b) =>
+      (b[1].lexical + b[1].semantic + b[1].graph) -
+      (a[1].lexical + a[1].semantic + a[1].graph),
+  );
 
   // Apply post-filters and map to SearchResult
   const {
@@ -649,7 +873,7 @@ export async function hybridSearch(
 
     // Apply collection weight boost
     const collectionBoost = getCollectionWeight(meta.collection);
-    const rawFused = fusedEntry.lexical + fusedEntry.semantic;
+    const rawFused = fusedEntry.lexical + fusedEntry.semantic + fusedEntry.graph;
     const boostedScore = rawFused * collectionBoost;
 
     results.push({
@@ -659,6 +883,7 @@ export async function hybridSearch(
       score: boostedScore,
       lexicalScore: fusedEntry.lexical,
       semanticScore: fusedEntry.semantic,
+      graphScore: fusedEntry.graph,
       fusedScore: boostedScore,
     });
   }

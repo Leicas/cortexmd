@@ -47,21 +47,32 @@
  *   npm run eval -- --smoke                          # same, via the npm script
  *   EVAL_EMBEDDINGS=1 npx tsx src/eval/index.ts --smoke  # + real embedding index
  *
- *   BITEMPORAL A/B (the whole point of the feature work):
- *     npx tsx src/eval/index.ts --smoke --bitemporal  # treatment arm only
+ *   TREATMENT ARMS (the point of the feature work):
+ *     npx tsx src/eval/index.ts --smoke --bitemporal  # bitemporal arm only
  *                                                     #   (flag ON + asOf filtering)
- *     npx tsx src/eval/index.ts --smoke --compare     # run BOTH arms, print a
- *                                                     #   baseline-vs-bitemporal delta
+ *     npx tsx src/eval/index.ts --smoke --graph       # PPR graph-recall arm only
+ *                                                     #   (graph:true + KG mentions)
+ *     npx tsx src/eval/index.ts --smoke --compare     # run ALL arms (baseline /
+ *                                                     #   bitemporal / ppr /
+ *                                                     #   ppr+bitemp) + delta +
+ *                                                     #   per-scenario recall matrix
+ *
+ *   REAL-VAULT BENCHMARK (retrieval quality + latency over a local snapshot):
+ *     node scripts/snapshot-vault.mjs --source local --from <vault> --exclude EmailLog
+ *     npx tsx src/eval/index.ts --real-vault .realvault-snapshot --arms lexical,semantic,ppr
  *
  *   NOTE: `npm run eval -- --flag` drops the flags on some platforms (the
  *   Windows npm cmd shim). Env fallbacks cover that case:
  *     EVAL_SMOKE=1 npm run eval
  *     EVAL_DATASET=path.jsonl EVAL_K=10 npm run eval
- *     EVAL_SMOKE=1 EVAL_BITEMPORAL=1 npm run eval     # treatment arm
- *     EVAL_SMOKE=1 EVAL_COMPARE=1 npm run eval        # A/B compare
+ *     EVAL_SMOKE=1 EVAL_BITEMPORAL=1 npm run eval     # bitemporal arm
+ *     EVAL_SMOKE=1 EVAL_GRAPH=1 npm run eval          # PPR graph arm
+ *     EVAL_SMOKE=1 EVAL_COMPARE=1 npm run eval        # all-arm compare
+ *     EVAL_REAL_VAULT=.realvault-snapshot EVAL_ARMS=lexical,ppr npm run eval
  *
  * The default retriever drives the REAL pipeline over a mkdtemp vault and
- * cleans it up afterward; nothing touches your real brain vault.
+ * cleans it up afterward; nothing touches your real brain vault. The real-vault
+ * mode reads (never writes) the snapshot dir you point it at.
  * ============================================================================
  */
 
@@ -81,12 +92,23 @@ interface CliArgs {
   smoke: boolean;
   /** Run with the BITEMPORAL_KG feature ON (as-of recall + supersession). */
   bitemporal: boolean;
+  /** Run with the PPR graph-recall arm ON (per-call graph:true + KG mentions). */
+  graph: boolean;
   /**
-   * Run BOTH arms — baseline (flag OFF, no asOf) and bitemporal (flag ON,
-   * asOf=query ts) — over the same dataset and print the two reports plus a
-   * delta table. Overrides `bitemporal`.
+   * Run the full arm matrix — baseline, bitemporal, ppr, and ppr+bitemporal —
+   * over the same dataset and print each report plus a delta table (baseline is
+   * the reference). Overrides `bitemporal` / `graph`.
    */
   compare: boolean;
+  /**
+   * Real-vault benchmark mode: point at a local snapshot dir and score
+   * retrieval quality (recall@k / MRR / latency) with auto-derived gold sets,
+   * comparable across lexical / +semantic / +ppr arms. Bypasses the temporal
+   * dataset path entirely. Env fallback: EVAL_REAL_VAULT.
+   */
+  realVault?: string;
+  /** Arms for real-vault mode (default lexical,semantic,ppr). */
+  arms?: string;
 }
 
 function parseArgs(argv: string[]): CliArgs {
@@ -99,14 +121,22 @@ function parseArgs(argv: string[]): CliArgs {
     smoke: process.env.EVAL_SMOKE === '1' || process.env.EVAL_SMOKE === 'true',
     dataset: process.env.EVAL_DATASET || undefined,
     bitemporal: process.env.EVAL_BITEMPORAL === '1' || process.env.EVAL_BITEMPORAL === 'true',
+    graph: process.env.EVAL_GRAPH === '1' || process.env.EVAL_GRAPH === 'true',
     compare: process.env.EVAL_COMPARE === '1' || process.env.EVAL_COMPARE === 'true',
+    realVault: process.env.EVAL_REAL_VAULT || undefined,
+    arms: process.env.EVAL_ARMS || undefined,
   };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--smoke') args.smoke = true;
     else if (a === '--bitemporal') args.bitemporal = true;
+    else if (a === '--graph') args.graph = true;
     else if (a === '--compare') args.compare = true;
     else if (a === '--dataset') args.dataset = argv[++i];
+    else if (a === '--real-vault') args.realVault = argv[++i];
+    else if (a.startsWith('--real-vault=')) args.realVault = a.slice('--real-vault='.length);
+    else if (a === '--arms') args.arms = argv[++i];
+    else if (a.startsWith('--arms=')) args.arms = a.slice('--arms='.length);
     else if (a === '--k') args.k = parseInt(argv[++i], 10) || 5;
     else if (a.startsWith('--k=')) args.k = parseInt(a.slice('--k='.length), 10) || 5;
     else if (a.startsWith('--dataset=')) args.dataset = a.slice('--dataset='.length);
@@ -146,12 +176,39 @@ function humanTable(report: EvalReport, arm?: string): string {
 }
 
 /**
- * Side-by-side A/B delta table for `--compare`. Shows each headline metric for
- * the baseline arm (flag OFF, no asOf) next to the bitemporal arm (flag ON,
- * asOf=query ts) and the signed delta. recall@k should hold; pointInTimeAccuracy
- * should rise; staleLeakRate should fall.
+ * The four A/B arms `--compare` runs. Each maps to a distinct combination of
+ * the two independent, composable treatment flags (bitemporal, graph):
+ *   baseline        — both OFF (the reference; recall is byte-identical to today)
+ *   bitemporal      — BITEMPORAL_KG ON, as-of filtering ON
+ *   ppr             — PPR graph-recall arm ON (graph:true + KG mention bridges)
+ *   ppr-bitemporal  — both ON
+ * baseline is always the delta reference so every treatment is measured against
+ * the untreated pipeline.
  */
-function compareTable(baseline: EvalReport, bitemporal: EvalReport): string {
+type Arm = 'baseline' | 'bitemporal' | 'ppr' | 'ppr-bitemporal';
+
+const ARM_LABEL: Record<Arm, string> = {
+  baseline: 'baseline',
+  bitemporal: 'bitemporal',
+  ppr: 'ppr',
+  'ppr-bitemporal': 'ppr+bitemp',
+};
+
+/** The (bitemporal, graph) flag pair each arm sets. */
+function armFlags(arm: Arm): { bitemporal: boolean; graph: boolean } {
+  return {
+    bitemporal: arm === 'bitemporal' || arm === 'ppr-bitemporal',
+    graph: arm === 'ppr' || arm === 'ppr-bitemporal',
+  };
+}
+
+/**
+ * Headline-metric delta table: every treatment arm's three metrics next to the
+ * baseline arm, with signed deltas. recall@k should hold or RISE (the PPR arm
+ * targets multi-hop recall); pointInTimeAccuracy should rise on the bitemporal
+ * arms; staleLeakRate should fall on the bitemporal arms.
+ */
+function compareTable(baseline: EvalReport, treatments: Array<{ arm: Arm; report: EvalReport }>): string {
   const pct = (n: number) => `${(n * 100).toFixed(1)}%`;
   const delta = (b: number, t: number) => {
     const d = (t - b) * 100;
@@ -168,24 +225,76 @@ function compareTable(baseline: EvalReport, bitemporal: EvalReport): string {
   const lines: string[] = [];
   lines.push('');
   lines.push(`A/B compare  (k=${baseline.k}, scenarios=${baseline.nScenarios}, queries=${baseline.nQueries})`);
-  lines.push('─'.repeat(64));
-  lines.push(`  ${'metric'.padEnd(20)} ${'baseline'.padStart(7)}     ${'bitemporal'.padStart(7)}   ${'delta'.padStart(9)}`);
-  lines.push('─'.repeat(64));
-  lines.push(row('recall@k', baseline.recallAtK, bitemporal.recallAtK, 'up'));
-  lines.push(row('pointInTimeAccuracy', baseline.pointInTimeAccuracy, bitemporal.pointInTimeAccuracy, 'up'));
-  lines.push(row('staleLeakRate', baseline.staleLeakRate, bitemporal.staleLeakRate, 'down'));
-  lines.push('─'.repeat(64));
-  lines.push('  ✓ = moved the right way, ✗ = wrong way, · = flat (recall@k should stay ~flat)');
+  for (const { arm, report } of treatments) {
+    lines.push('═'.repeat(64));
+    lines.push(`  ${ARM_LABEL[arm]}  vs baseline`);
+    lines.push('─'.repeat(64));
+    lines.push(row('recall@k', baseline.recallAtK, report.recallAtK, 'up'));
+    lines.push(row('pointInTimeAccuracy', baseline.pointInTimeAccuracy, report.pointInTimeAccuracy, 'up'));
+    lines.push(row('staleLeakRate', baseline.staleLeakRate, report.staleLeakRate, 'down'));
+  }
+  lines.push('═'.repeat(64));
+  lines.push('  ✓ = moved the right way, ✗ = wrong way, · = flat');
+  lines.push('');
+  return lines.join('\n');
+}
+
+/**
+ * Per-scenario recall@k matrix across all arms. This is where the multi-hop
+ * scenarios (person-to-project, service-owner-oncall) become visible: the PPR
+ * arm should lift THOSE rows even when the aggregate barely moves. One column
+ * per arm, one row per scenario, values are recall@k.
+ */
+function perScenarioMatrix(reports: Array<{ arm: Arm; report: EvalReport }>): string {
+  const pct = (n: number) => `${(n * 100).toFixed(0)}%`;
+  const scenarioIds = reports[0]?.report.perScenario.map((s) => s.id) ?? [];
+  const idW = Math.max(8, ...scenarioIds.map((id) => id.length));
+  const colW = 11;
+  const lines: string[] = [];
+  lines.push('');
+  lines.push('Per-scenario recall@k by arm  (multi-hop scenarios show the PPR lift)');
+  lines.push('─'.repeat(idW + 2 + reports.length * (colW + 1)));
+  lines.push(
+    `  ${'scenario'.padEnd(idW)} ${reports.map((r) => ARM_LABEL[r.arm].padStart(colW)).join(' ')}`,
+  );
+  lines.push('─'.repeat(idW + 2 + reports.length * (colW + 1)));
+  for (const id of scenarioIds) {
+    const cells = reports.map((r) => {
+      const row = r.report.perScenario.find((s) => s.id === id);
+      return (row ? pct(row.recallAtK) : '—').padStart(colW);
+    });
+    lines.push(`  ${id.padEnd(idW)} ${cells.join(' ')}`);
+  }
   lines.push('');
   return lines.join('\n');
 }
 
 async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
+
+  // Real-vault benchmark mode — a different measurement entirely (retrieval
+  // quality + latency over a local snapshot, no temporal labels). Bypasses the
+  // JSONL dataset path. See eval/real-vault.ts.
+  if (args.realVault) {
+    const { runRealVaultBenchmark, formatRealVaultReport } = await import('./real-vault.js');
+    const arms = parseArms(args.arms);
+    const report = await runRealVaultBenchmark({
+      vaultDir: args.realVault,
+      k: args.k,
+      arms,
+    });
+    process.stdout.write(JSON.stringify(report, null, 2) + '\n');
+    process.stdout.write(formatRealVaultReport(report) + '\n');
+    return;
+  }
+
   const datasetPath = args.smoke ? smokeFixturePath() : args.dataset;
   if (!datasetPath) {
     process.stderr.write(
-      'Usage: eval --dataset <path.jsonl> [--k N] [--bitemporal | --compare] | eval --smoke\n',
+      'Usage:\n' +
+        '  eval --dataset <path.jsonl> [--k N] [--bitemporal | --graph | --compare]\n' +
+        '  eval --smoke [--bitemporal | --graph | --compare]\n' +
+        '  eval --real-vault <dir> [--k N] [--arms lexical,semantic,ppr]\n',
     );
     process.exit(2);
     return;
@@ -194,27 +303,39 @@ async function main(): Promise<void> {
   const dataset = await loadDataset(datasetPath);
 
   if (args.compare) {
-    // Run both arms over the SAME dataset, each in its OWN child process. A
-    // single process cannot host both arms: config.ts / vault / search / the KG
-    // module read env (vault path, data dir, BITEMPORAL_KG flag) at module-load
-    // and cache it for the process lifetime, so a second in-process run would
-    // reuse the first arm's frozen config (and its already-cleaned temp vault).
-    // Separate processes give each arm a clean module graph + isolated vault.
-    const baseline = await runArmSubprocess('baseline', datasetPath, args.k);
-    const bitemporal = await runArmSubprocess('bitemporal', datasetPath, args.k);
+    // Run every arm over the SAME dataset, each in its OWN child process. A
+    // single process cannot host multiple arms: config.ts / vault / search / the
+    // KG module read env (vault path, data dir, BITEMPORAL_KG flag) at
+    // module-load and cache it for the process lifetime, so a second in-process
+    // run would reuse the first arm's frozen config (and its already-cleaned
+    // temp vault). Separate processes give each arm a clean module graph +
+    // isolated vault. baseline is the delta reference.
+    const arms: Arm[] = ['baseline', 'bitemporal', 'ppr', 'ppr-bitemporal'];
+    const reports: Array<{ arm: Arm; report: EvalReport }> = [];
+    for (const arm of arms) {
+      reports.push({ arm, report: await runArmSubprocess(arm, datasetPath, args.k) });
+    }
 
-    process.stdout.write(
-      JSON.stringify({ baseline, bitemporal }, null, 2) + '\n',
-    );
-    process.stdout.write(humanTable(baseline, 'baseline') + '\n');
-    process.stdout.write(humanTable(bitemporal, 'bitemporal') + '\n');
-    process.stdout.write(compareTable(baseline, bitemporal) + '\n');
+    const byArm = Object.fromEntries(reports.map((r) => [r.arm, r.report]));
+    const baseline = byArm.baseline;
+    const treatments = reports.filter((r) => r.arm !== 'baseline');
+
+    process.stdout.write(JSON.stringify(byArm, null, 2) + '\n');
+    for (const { arm, report } of reports) {
+      process.stdout.write(humanTable(report, ARM_LABEL[arm]) + '\n');
+    }
+    process.stdout.write(perScenarioMatrix(reports) + '\n');
+    process.stdout.write(compareTable(baseline, treatments) + '\n');
     return;
   }
 
   // Single-arm run: default retriever = REAL cortexmd pipeline over an isolated
-  // temp vault. `--bitemporal` flips the feature on for this run.
-  const report = await runHarness(dataset, { k: args.k, bitemporal: args.bitemporal });
+  // temp vault. `--bitemporal` / `--graph` flip the respective features on.
+  const report = await runHarness(dataset, {
+    k: args.k,
+    bitemporal: args.bitemporal,
+    graph: args.graph,
+  });
 
   // `--compare` spawns this entrypoint per arm and needs to parse the report
   // back out of stdout. In that internal mode emit ONLY a single fenced JSON
@@ -224,8 +345,23 @@ async function main(): Promise<void> {
     return;
   }
 
+  const armName = args.graph && args.bitemporal ? 'ppr+bitemp'
+    : args.graph ? 'ppr'
+    : args.bitemporal ? 'bitemporal'
+    : 'baseline';
   process.stdout.write(JSON.stringify(report, null, 2) + '\n');
-  process.stdout.write(humanTable(report, args.bitemporal ? 'bitemporal' : 'baseline') + '\n');
+  process.stdout.write(humanTable(report, armName) + '\n');
+}
+
+/** Parse a `--arms lexical,semantic,ppr` list; default all three. */
+function parseArms(raw: string | undefined): Array<'lexical' | 'semantic' | 'ppr'> {
+  const valid = new Set(['lexical', 'semantic', 'ppr']);
+  if (!raw) return ['lexical', 'semantic', 'ppr'];
+  const arms = raw
+    .split(',')
+    .map((s) => s.trim().toLowerCase())
+    .filter((s) => valid.has(s)) as Array<'lexical' | 'semantic' | 'ppr'>;
+  return arms.length > 0 ? arms : ['lexical', 'semantic', 'ppr'];
 }
 
 /** Sentinel prefixing the one machine-readable report line in EVAL_REPORT_JSON mode. */
@@ -239,14 +375,16 @@ const REPORT_MARKER = '@@EVAL_REPORT@@ ';
  * single `@@EVAL_REPORT@@ {json}` line (EVAL_REPORT_JSON=1); we parse that.
  */
 async function runArmSubprocess(
-  arm: 'baseline' | 'bitemporal',
+  arm: Arm,
   datasetPath: string,
   k: number,
 ): Promise<EvalReport> {
   const { spawn } = await import('node:child_process');
   const selfPath = fileURLToPath(import.meta.url);
   const argv = [selfPath, '--dataset', datasetPath, '--k', String(k)];
-  if (arm === 'bitemporal') argv.push('--bitemporal');
+  const { bitemporal, graph } = armFlags(arm);
+  if (bitemporal) argv.push('--bitemporal');
+  if (graph) argv.push('--graph');
 
   // Inherit the parent's Node exec args (crucially, the tsx loader `--require`
   // / `--import` when the parent was launched via tsx) so the child can load
@@ -268,12 +406,16 @@ async function runArmSubprocess(
         ...process.env,
         EVAL_REPORT_JSON: '1',
         // Don't let the parent's mode env leak into the child and re-trigger
-        // compare / cross-contaminate the arm selection.
+        // compare / cross-contaminate the arm selection. The child's arm is set
+        // purely by the explicit --bitemporal / --graph argv flags above.
         EVAL_COMPARE: '',
         EVAL_BITEMPORAL: '',
+        EVAL_GRAPH: '',
         EVAL_SMOKE: '',
         EVAL_DATASET: '',
         EVAL_K: '',
+        EVAL_REAL_VAULT: '',
+        EVAL_ARMS: '',
       },
       stdio: ['ignore', 'pipe', 'inherit'],
     });

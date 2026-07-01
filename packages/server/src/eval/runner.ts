@@ -43,6 +43,17 @@ export interface RunHarnessOptions {
    * Ignored when an explicit `retriever` (e.g. the unit-test mock) is injected.
    */
   bitemporal?: boolean;
+  /**
+   * Enable the Personalized-PageRank graph-recall arm for this run (the "ppr"
+   * treatment arm). When true the real retriever (a) turns the KG on at ingest
+   * and bootstraps `mentions_*` triples after each scenario's notes are indexed
+   * (so entity router nodes exist to bridge multi-hop recall), and (b) passes
+   * `graph: true` to {@link hybridSearch} so the PPR arm engages per-call
+   * WITHOUT mutating env. When false the arm is never invoked and recall is
+   * byte-identical to today. Composes with {@link bitemporal}: both flags on =
+   * the PPR+bitemporal arm. Ignored when an explicit `retriever` is injected.
+   */
+  graph?: boolean;
 }
 
 /**
@@ -106,7 +117,10 @@ export async function runHarness(dataset: Dataset, opts: RunHarnessOptions = {})
   const k = opts.k ?? 5;
   const retriever: LifecycleRetriever =
     (opts.retriever as LifecycleRetriever | undefined) ??
-    (await createRealRetriever(dataset, k, { bitemporal: opts.bitemporal ?? false }));
+    (await createRealRetriever(dataset, k, {
+      bitemporal: opts.bitemporal ?? false,
+      graph: opts.graph ?? false,
+    }));
   try {
     const results: QueryResult[] = [];
     for (const scenario of dataset) {
@@ -169,6 +183,12 @@ export interface LifecycleRetriever {
 export interface RealRetrieverOptions {
   /** Enable the BITEMPORAL_KG treatment arm (see {@link createRealRetriever}). */
   bitemporal?: boolean;
+  /**
+   * Enable the PPR graph-recall treatment arm. Turns the KG on, bootstraps
+   * `mentions_*` triples after each scenario's notes are indexed, and passes
+   * `graph: true` to hybridSearch. See {@link createRealRetriever}.
+   */
+  graph?: boolean;
 }
 
 export async function createRealRetriever(
@@ -177,6 +197,7 @@ export async function createRealRetriever(
   opts: RealRetrieverOptions = {},
 ): Promise<LifecycleRetriever> {
   const bitemporal = opts.bitemporal ?? false;
+  const graphArm = opts.graph ?? false;
   const tmpRoot = await mkdtemp(path.join(os.tmpdir(), 'cortexmd-eval-'));
   const brainVault = path.join(tmpRoot, 'brain');
   const dataDir = path.join(tmpRoot, 'data');
@@ -196,9 +217,13 @@ export async function createRealRetriever(
   delete process.env.VAULT_RO_HAPLY;
   // Bitemporal arm needs the KG on (supersession writes go through KG-core) and
   // the feature flag flipped ON — both read at module-load, so set them here
-  // BEFORE the dynamic imports. Baseline arm leaves the flag OFF and the KG off,
-  // exactly as the pre-existing harness did.
-  process.env.ENABLE_KG = bitemporal ? 'true' : 'false';
+  // BEFORE the dynamic imports. The PPR graph arm ALSO needs the KG on so that
+  // `kgAllMentionTriples()` (which computeGraphArm reads to build the entity
+  // router nodes) returns the `mentions_*` triples bootstrapped per scenario.
+  // Baseline arm leaves the flag OFF and the KG off, exactly as the pre-existing
+  // harness did.
+  const needsKg = bitemporal || graphArm;
+  process.env.ENABLE_KG = needsKg ? 'true' : 'false';
   process.env.BITEMPORAL_KG = bitemporal ? 'true' : 'false';
   process.env.AUTO_LINK = 'false';
   process.env.AUTO_SEED_KG = 'false';
@@ -210,10 +235,11 @@ export async function createRealRetriever(
   const search = await import('../lib/search.js');
   const embeddings = useEmbeddings ? await import('../lib/embeddings.js') : null;
 
-  // Bitemporal-only imports: init the KG so isKgInitialized() passes, and pull
-  // the batch supersession pass. Both are no-ops on the baseline arm (not even
-  // imported), keeping that path unchanged.
-  const kg = bitemporal ? await import('../lib/knowledge-graph.js') : null;
+  // KG import: needed by the bitemporal arm (supersession + as-of) AND the PPR
+  // graph arm (mention-triple bootstrap). Not even imported on the baseline arm,
+  // keeping that path unchanged. Bitemporal-only pulls the batch supersession
+  // pass.
+  const kg = needsKg ? await import('../lib/knowledge-graph.js') : null;
   const bitemp = bitemporal ? await import('../lib/bitemporal.js') : null;
   if (kg) {
     kg.initKnowledgeGraph();
@@ -226,12 +252,19 @@ export async function createRealRetriever(
   let scenarioSeq = 0;
 
   const retriever = (async ({ query, ts, k }) => {
-    // Bitemporal arm: pass the query's point-in-time `ts` as `asOf` so as-of
-    // recall filtering engages (its ONLY trigger). Baseline arm passes no
-    // `asOf`, so recall is byte-identical to today.
-    const searchOpts = bitemporal
-      ? { limit: k, type: 'memory' as const, asOf: ts }
-      : { limit: k, type: 'memory' as const };
+    // Compose the two independent treatment arms onto the base opts:
+    //   - bitemporal: pass the query's point-in-time `ts` as `asOf` so as-of
+    //     recall filtering engages (its ONLY trigger);
+    //   - graph (PPR): pass `graph: true` so hybridSearch runs the additive PPR
+    //     arm for THIS call (no env mutation — the per-call flag path).
+    // With neither arm on, opts are exactly `{ limit, type }` and recall is
+    // byte-identical to the pre-existing baseline.
+    const searchOpts: Parameters<typeof search.hybridSearch>[1] = {
+      limit: k,
+      type: 'memory' as const,
+    };
+    if (bitemporal) searchOpts.asOf = ts;
+    if (graphArm) searchOpts.graph = true;
     const results = await search.hybridSearch(query, searchOpts);
     const docMeta = search.getDocMeta();
     return results.map((r) => {
@@ -285,6 +318,28 @@ export async function createRealRetriever(
     // AFTER supersession so DocMeta reflects the stamped valid_to/superseded_by
     // windows the as-of filter reads.
     await search.rebuildIndex();
+    // PPR graph arm: bootstrap the KG from the freshly indexed docMeta so the
+    // `mentions_*` triples exist. computeGraphArm() reads these via
+    // kgAllMentionTriples() to build the entity router nodes that bridge the
+    // multi-hop scenarios (person→project, service→owner→oncall). Bootstrap runs
+    // AFTER rebuildIndex so getDocMeta() is populated; it is idempotent
+    // (kgAddTriple upserts) so re-running per scenario is safe. No-op unless the
+    // graph arm is on (kg is only imported then).
+    if (graphArm && kg) {
+      const kgDocs = new Map<
+        string,
+        { title: string; content: string; collection: string; tags: string[] }
+      >();
+      for (const [p, meta] of search.getDocMeta()) {
+        kgDocs.set(p, {
+          title: meta.title,
+          content: meta.content,
+          collection: meta.collection,
+          tags: meta.tags ?? [],
+        });
+      }
+      kg.kgBootstrap(kgDocs);
+    }
     // Build the real embedding index over the same docs when enabled.
     if (embeddings) {
       const docs = new Map<string, { title: string; content: string }>();

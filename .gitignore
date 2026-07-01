@@ -38,3 +38,6 @@ desktop.ini
 
 # local restore audit log — never commit (contains private vault paths)
 dream-restore-manifest.txt
+
+# real-vault benchmark snapshot — private notes, never commit
+.realvault-snapshot/

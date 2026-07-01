@@ -412,6 +412,31 @@ export function kgSearch(query: string, limit = 20): TripleRow[] {
 }
 
 /**
+ * All ACTIVE entity-mention triples as {subject, predicate, object} rows.
+ *
+ * Pure, read-only, additive. Used by the PPR graph-recall arm to build
+ * note↔entity bridge edges (subject = note *title*, object = entity name).
+ * Only `mentions_person` / `mentions_org` / `mentions_project` predicates are
+ * returned, and only non-invalidated (valid_to IS NULL) triples — so a
+ * superseded mention doesn't create a stale bridge. KG-off safe: returns an
+ * empty array when the graph isn't initialized rather than throwing, so the
+ * recall arm degrades to wikilink-only edges.
+ */
+export function kgAllMentionTriples(): Array<{ subject: string; predicate: string; object: string }> {
+  if (!isKgInitialized()) return [];
+  try {
+    const d = getDb();
+    return d.prepare(
+      `SELECT subject, predicate, object FROM triples
+       WHERE predicate IN ('mentions_person', 'mentions_org', 'mentions_project')
+         AND valid_to IS NULL`,
+    ).all() as Array<{ subject: string; predicate: string; object: string }>;
+  } catch {
+    return [];
+  }
+}
+
+/**
  * Repair the knowledge graph database.
  * Runs PRAGMA integrity_check; if corrupt, backs up and recreates.
  */

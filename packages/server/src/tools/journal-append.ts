@@ -3,7 +3,7 @@ import { z } from 'zod';
 import { appendJournalEntry } from '../lib/journal.js';
 import { wrapToolHandler } from '../lib/tool-wrapper.js';
 import { sanitizeContent } from '../lib/sanitize.js';
-import { findSimilarNotes } from '../lib/similar-notes.js';
+import { searchNotes } from '../lib/search.js';
 
 export function register(server: McpServer): void {
   server.tool(
@@ -39,16 +39,34 @@ Include [[wiki-links]] to connect entries to the knowledge graph. Example: "Sync
 
       const result = await appendJournalEntry(entryText, source);
 
-      // Find similar notes based on the journal entry content
-      const { similarNotes, suggestion } = await findSimilarNotes(entryText, result.path);
-
       const responseData: Record<string, unknown> = {
         path: result.path,
         lineRef: result.lineRef,
       };
-      if (similarNotes.length > 0) {
-        responseData.similarNotes = similarNotes;
-        responseData.suggestion = suggestion;
+
+      // Best-effort similar-notes hint. Use lexical-only search (synchronous,
+      // no query embedding or LLM rerank) so the append returns immediately
+      // rather than blocking on an embed+rerank round-trip just for a hint.
+      // The `similarNotes`/`suggestion` fields stay present when there are hits
+      // so consumers see the same response shape.
+      try {
+        const query = entryText.slice(0, 500).replace(/^---[\s\S]*?---\s*/, '');
+        if (query.trim().length >= 10) {
+          const hits = searchNotes(query, { limit: 10 })
+            .filter((r) => r.path !== result.path && r.score >= 0.005)
+            .slice(0, 5);
+          if (hits.length > 0) {
+            responseData.similarNotes = hits.map((r) => ({
+              path: r.path,
+              title: r.title,
+              score: Math.round(r.score * 1000) / 1000,
+              snippet: r.snippet.slice(0, 150),
+            }));
+            responseData.suggestion = `Found ${hits.length} similar note${hits.length > 1 ? 's' : ''} -- consider consolidating or linking related content.`;
+          }
+        }
+      } catch {
+        // Non-critical: journal append must not fail on a missing/empty search index.
       }
 
       return {

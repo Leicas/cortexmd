@@ -68,10 +68,20 @@ For deeper wing/room/drawer breakdown, use vault_taxonomy. For graph details, us
       // Embeddings
       const embeddingInfo = getEmbeddingStats();
 
-      // Active agents
+      // Active agents. This is auxiliary awareness data, not core status, so it
+      // must never block the overview: listAgents fans its diary reads out in
+      // parallel (and short-TTL caches), but we still cap the wait so a slow
+      // vault filesystem can't stall the whole call — on timeout we return an
+      // empty roster rather than hanging.
       let agents: Array<{ name: string; lastActive: string; entryCount: number }> = [];
       try {
-        agents = await listAgents();
+        const AGENTS_TIMEOUT_MS = 750;
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const timeout = new Promise<typeof agents>((resolve) => {
+          timer = setTimeout(() => resolve([]), AGENTS_TIMEOUT_MS);
+        });
+        agents = await Promise.race([listAgents(), timeout]);
+        if (timer) clearTimeout(timer);
       } catch {
         // diary listing is optional
       }

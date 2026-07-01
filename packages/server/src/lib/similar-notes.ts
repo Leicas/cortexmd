@@ -21,12 +21,16 @@ export interface SimilarNotesResult {
  * @param excludePath  Path to exclude from results (the note just created/updated)
  * @param limit      Max number of similar notes to return (default 5)
  * @param minScore   Minimum fused score threshold to avoid noise (default 0.005)
+ * @param rerank     Whether to apply the LLM reranking pass. Defaults to false:
+ *                   internal similarity enrichment does not need (and should not
+ *                   pay for) an LLM rerank. Callers may pass true to opt back in.
  */
 export async function findSimilarNotes(
   text: string,
   excludePath: string,
   limit = 5,
   minScore = 0.005,
+  rerank = false,
 ): Promise<SimilarNotesResult> {
   try {
     // Use a truncated version of the content as the query to keep it focused
@@ -35,7 +39,7 @@ export async function findSimilarNotes(
       return { similarNotes: [], suggestion: null };
     }
 
-    const results = await hybridSearch(queryText, { limit: limit + 5 });
+    const results = await hybridSearch(queryText, { limit: limit + 5, rerank });
 
     const similarNotes: SimilarNote[] = results
       .filter(r => r.path !== excludePath && r.fusedScore >= minScore)

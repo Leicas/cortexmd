@@ -278,7 +278,7 @@ function renderDetail(el, ctx, d, dv) {
 }
 
 function renderToolTable(el, ctx, tc) {
-  var fmt = ctx.fmt, esc = ctx.esc;
+  var fmt = ctx.fmt, esc = ctx.esc, d = ctx.data || {};
   var entries = [];
   for (var k in tc) { if (Object.prototype.hasOwnProperty.call(tc, k)) entries.push([k, tc[k]]); }
   entries.sort(function (a, b) {
@@ -291,6 +291,7 @@ function renderToolTable(el, ctx, tc) {
       case 'max': va = a[1].maxLatency; vb = b[1].maxLatency; break;
       case 'errors': va = a[1].count ? a[1].errors / a[1].count : 0; vb = b[1].count ? b[1].errors / b[1].count : 0; break;
       case 'last': va = a[1].lastCalled || 0; vb = b[1].lastCalled || 0; break;
+      case 'status': va = regRank(regStateOf(ctx, a[0])); vb = regRank(regStateOf(ctx, b[0])); break;
       default: va = a[1].count; vb = b[1].count;
     }
     return sortDir * ((va || 0) - (vb || 0));
@@ -298,7 +299,7 @@ function renderToolTable(el, ctx, tc) {
   var tbody = ctx.$('toolTableBody');
   if (!tbody) return;
   if (!entries.length) {
-    tbody.innerHTML = '<tr><td colspan="7" class="empty-msg" style="text-align:center">No tool calls recorded</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="8" class="empty-msg" style="text-align:center">No tool calls recorded</td></tr>';
     return;
   }
   // Max avg-latency across tools → relative bar width.
@@ -310,8 +311,12 @@ function renderToolTable(el, ctx, tc) {
     var errRate = m.count ? (m.errors / m.count) * 100 : 0;
     var errState = errRate === 0 ? 'var(--ok)' : errRate <= 5 ? 'var(--warn)' : 'var(--err)';
     var barW = Math.max(2, (m.avgLatency / maxAvg) * 56);
-    return '<tr>'
-      + '<td>' + esc(name) + '</td>'
+    var reg = regOf(ctx, name);
+    var expanded = expandedTools[name] === true;
+    var mainRow = '<tr class="tool-row" data-tool="' + esc(name) + '" tabindex="0" role="button"'
+      + ' aria-expanded="' + (expanded ? 'true' : 'false') + '" style="cursor:pointer"'
+      + ' title="' + esc(regTitle(reg)) + '">'
+      + '<td><span class="tool-caret" aria-hidden="true">' + (expanded ? '▾' : '▸') + '</span> ' + esc(name) + '</td>'
       + '<td class="num">' + fmt.fmt(m.count) + '</td>'
       + '<td class="num ' + fmt.latClass(m.avgLatency) + '">'
         + '<span class="cell-bar" style="width:' + barW.toFixed(0) + 'px"></span> ' + fmt.fmtMs(m.avgLatency) + '</td>'
@@ -319,6 +324,104 @@ function renderToolTable(el, ctx, tc) {
       + '<td class="num ' + fmt.latClass(m.maxLatency) + '">' + fmt.fmtMs(m.maxLatency) + '</td>'
       + '<td class="num"><span class="cell-dot" style="background:' + errState + '"></span>' + errRate.toFixed(errRate < 10 ? 1 : 0) + '%</td>'
       + '<td>' + fmt.fmtAgo(m.lastCalled) + '</td>'
+      + '<td>' + regPillHtml(reg) + '</td>'
       + '</tr>';
+    var detailRow = expanded
+      ? '<tr class="tool-detail-row"><td colspan="8">' + toolDetailHtml(ctx, d, name, reg) + '</td></tr>'
+      : '';
+    return mainRow + detailRow;
   }).join('');
+
+  // Delegate expand/collapse once per render (idempotent: replaces prior body).
+  tbody.querySelectorAll('tr.tool-row').forEach(function (row) {
+    function toggle() {
+      var name = row.getAttribute('data-tool');
+      if (!name) return;
+      expandedTools[name] = !expandedTools[name];
+      if (ctx.data && ctx.data.toolCalls) renderToolTable(el, ctx, ctx.data.toolCalls);
+    }
+    row.addEventListener('click', toggle);
+    row.addEventListener('keydown', function (ev) {
+      if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); toggle(); }
+    });
+  });
+}
+
+// ── Per-tool regression signal (from ctx.data.derived.toolRegressions) ────────
+
+// Which tool rows are currently expanded (persists across SSE re-renders).
+var expandedTools = {};
+
+function regOf(ctx, name) {
+  var dv = (ctx.data && ctx.data.derived) || {};
+  var regs = dv.toolRegressions || {};
+  return regs[name] || null;
+}
+
+function regStateOf(ctx, name) {
+  var r = regOf(ctx, name);
+  return (r && r.state) || 'ok';
+}
+
+function regRank(state) {
+  return state === 'bad' ? 2 : state === 'warn' ? 1 : 0;
+}
+
+function regLabel(reg) {
+  if (!reg) return 'ok';
+  if (reg.state === 'bad') return 'regressed';
+  if (reg.state === 'warn') return 'watch';
+  return 'ok';
+}
+
+function regTitle(reg) {
+  if (!reg) return 'No baseline yet';
+  var parts = [];
+  if (reg.baselineP95 > 0) parts.push('p95 ' + Math.round(reg.p95) + 'ms vs baseline ' + Math.round(reg.baselineP95) + 'ms (' + reg.ratio + 'x)');
+  else parts.push('p95 ' + Math.round(reg.p95) + 'ms · no baseline');
+  if (reg.tailRatio) parts.push('tail max/p95 ' + reg.tailRatio + 'x');
+  return parts.join(' · ');
+}
+
+function regPillHtml(reg) {
+  var state = (reg && reg.state) || 'ok';
+  return '<span class="pill pill--' + state + '"><span class="dot" aria-hidden="true"></span>' + regLabel(reg) + '</span>';
+}
+
+/** Recent failing calls + errors for one tool, from existing SSE buffers. */
+function toolDetailHtml(ctx, d, name, reg) {
+  var esc = ctx.esc, fmt = ctx.fmt;
+  var lines = [];
+  lines.push('<div class="tool-detail-head">' + esc(name) + ' — ' + esc(regTitle(reg)) + '</div>');
+
+  // Recent failing calls for this tool (recentToolCalls carries per-call detail).
+  var fails = (d.recentToolCalls || []).filter(function (c) {
+    return c && c.tool === name && c.status === 'error';
+  }).slice(-6).reverse();
+  // Fall back to recentErrors (which always carry a message) for this tool.
+  var errs = (d.recentErrors || []).filter(function (e) { return e && e.tool === name; }).slice(-6).reverse();
+
+  if (!fails.length && !errs.length) {
+    lines.push('<div class="empty-msg" style="padding:.35rem 0">No recent failing calls recorded.</div>');
+  } else {
+    var seen = {};
+    var items = [];
+    fails.forEach(function (c) {
+      var key = c.timestamp + ':' + (c.detail || '');
+      if (seen[key]) return; seen[key] = true;
+      items.push({ ts: c.timestamp, dur: c.durationMs, msg: c.detail || 'error' });
+    });
+    errs.forEach(function (e) {
+      var key = e.timestamp + ':' + (e.message || '');
+      if (seen[key]) return; seen[key] = true;
+      items.push({ ts: e.timestamp, dur: null, msg: e.message || 'error' });
+    });
+    items.sort(function (a, b) { return (b.ts || 0) - (a.ts || 0); });
+    lines.push(items.slice(0, 6).map(function (it) {
+      return '<div class="error-item"><span class="e-ts">' + esc(fmt.fmtTime(it.ts)) + '</span>'
+        + (it.dur != null ? '<span class="e-tool">' + esc(fmt.fmtMs(it.dur)) + '</span>' : '')
+        + '<span class="e-msg">' + esc(fmt.truncate(it.msg, 160)) + '</span></div>';
+    }).join(''));
+  }
+  return lines.join('');
 }

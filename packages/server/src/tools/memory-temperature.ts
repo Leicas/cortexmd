@@ -1,9 +1,9 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
-import { readNote, writeNote, listFiles, resolveSafePathForRead } from '../lib/vault.js';
+import { readNote, writeNote, resolveSafePathForRead } from '../lib/vault.js';
 import { parseFrontmatter, stringifyFrontmatter } from '../lib/frontmatter.js';
 import { buildLinkGraph } from '../lib/graph.js';
-import { searchNotes } from '../lib/search.js';
+import { getDocMeta } from '../lib/search.js';
 import { appendJournalEntry } from '../lib/journal.js';
 import { wrapToolHandler } from '../lib/tool-wrapper.js';
 import { decayMemories, autoArchiveColdMemories } from '../lib/memory-lifecycle.js';
@@ -16,6 +16,32 @@ interface ScoredNote {
   title: string;
   heatScore: number;
   temperature: 'hot' | 'warm' | 'cold';
+}
+
+/**
+ * Bounded-concurrency map. Runs `worker` over `items` with at most `limit`
+ * in flight at once. Order of completion is not guaranteed.
+ */
+async function runWithConcurrency<T>(
+  items: T[],
+  limit: number,
+  worker: (item: T) => Promise<void>,
+): Promise<void> {
+  let next = 0;
+  const size = Math.min(limit, items.length);
+  const runners: Promise<void>[] = [];
+  for (let w = 0; w < size; w++) {
+    runners.push(
+      (async () => {
+        while (true) {
+          const i = next++;
+          if (i >= items.length) break;
+          await worker(items[i]);
+        }
+      })(),
+    );
+  }
+  await Promise.all(runners);
 }
 
 export function register(server: McpServer): void {
@@ -46,36 +72,51 @@ export function register(server: McpServer): void {
         }
       }
 
-      // Find open tasks for cross-referencing
+      const docMeta = getDocMeta();
+
+      // Find open tasks for cross-referencing. Candidate task paths come from
+      // the in-memory docMeta index (meta.type === 'task') instead of a
+      // separate full-vault search; we then read only those (bounded pool) to
+      // confirm status, rather than reading up to 200 search hits serially.
       const openTaskPaths = new Set<string>();
-      try {
-        const taskResults = searchNotes('task', { limit: 200 });
-        for (const r of taskResults) {
-          try {
-            const { content } = await readNote(r.path);
-            const { data } = parseFrontmatter(content);
-            if (data.type === 'task' && data.status === 'open') {
-              openTaskPaths.add(r.path);
-            }
-          } catch {
-            // skip
-          }
-        }
-      } catch {
-        // search index not ready
+      const taskCandidates: string[] = [];
+      for (const [p, meta] of docMeta) {
+        if (meta.type === 'task') taskCandidates.push(p);
       }
+      await runWithConcurrency(taskCandidates, 16, async (p) => {
+        try {
+          const { content } = await readNote(p);
+          const { data } = parseFrontmatter(content);
+          if (data.type === 'task' && data.status === 'open') {
+            openTaskPaths.add(p);
+          }
+        } catch {
+          // skip
+        }
+      });
 
       // Scan notes in the vault. When scope === 'memories' we keep the legacy
       // behaviour (only Memories/*). When scope === 'vault' we walk the whole
       // vault so every collection gets a concrete temperature + heat_score.
-      const files = await listFiles('.');
-      const scored: ScoredNote[] = [];
+      // The candidate set is derived from docMeta (in-memory) rather than a
+      // fresh listFiles walk; heat scoring still needs frontmatter fields not
+      // carried in meta (last_updated, access_count, status), so we read those
+      // notes with a bounded-concurrency pool instead of a serial loop, and
+      // batch the frontmatter writes at the end.
+      const scanPaths: string[] = [];
+      for (const [f, meta] of docMeta) {
+        const collection = meta.collection ?? classifyPath(f);
+        if (scope === 'memories' && collection !== 'memories') continue;
+        scanPaths.push(f);
+      }
 
-      for (const f of files) {
-        if (scope === 'memories' && classifyPath(f) !== 'memories') continue;
+      const scored: ScoredNote[] = [];
+      const pendingWrites: Array<{ path: string; content: string }> = [];
+
+      await runWithConcurrency(scanPaths, 16, async (f) => {
         try {
           const { content } = await readNote(f);
-          const { data } = parseFrontmatter(content);
+          const { data, body } = parseFrontmatter(content);
 
           // Get file modification time as fallback for notes without last_updated
           let fileMtimeMs: number | undefined;
@@ -105,20 +146,31 @@ export function register(server: McpServer): void {
 
           scored.push({ path: f, title, heatScore: score, temperature });
 
-          // Optionally write frontmatter
+          // Defer the frontmatter write so all disk writes are batched after
+          // the scan pool drains.
           if (writeFrontmatter) {
             if (data.temperature !== temperature || data.heat_score !== score) {
               data.temperature = temperature;
               data.heat_score = score;
               data.last_temp_refresh = new Date().toISOString().slice(0, 10);
-              const { body } = parseFrontmatter(content);
               const updated = stringifyFrontmatter(data, body);
-              await writeNote(f, updated);
+              pendingWrites.push({ path: f, content: updated });
             }
           }
         } catch {
           // skip unreadable files
         }
+      });
+
+      // Batched frontmatter writes (bounded concurrency).
+      if (pendingWrites.length > 0) {
+        await runWithConcurrency(pendingWrites, 16, async (w) => {
+          try {
+            await writeNote(w.path, w.content);
+          } catch {
+            // skip unwritable files
+          }
+        });
       }
 
       // Count by temperature

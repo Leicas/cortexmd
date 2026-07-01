@@ -26,6 +26,13 @@ export interface SearchOptions {
   importance?: string;
   excludeArchived?: boolean;
   collections?: string[];
+  /**
+   * Whether to apply the LLM reranking pass. When omitted (undefined), the
+   * global reranker setting (isRerankerEnabled) decides — preserving existing
+   * behavior. Set to `false` to force-skip reranking on this call even when the
+   * reranker is globally enabled (e.g. internal similarity lookups).
+   */
+  rerank?: boolean;
 }
 
 export interface SearchResult {
@@ -210,7 +217,9 @@ export async function rebuildIndex(): Promise<void> {
           : await readFile(absPath, 'utf-8');
         const { data, body } = parseFrontmatter(content);
 
-        const tags: string[] = Array.isArray(data.tags) ? data.tags : [];
+        // Coerce every tag element to a string so numeric YAML tags (e.g. `2024`)
+        // can never propagate into docMeta.tags and crash tag tooling downstream.
+        const tags: string[] = (Array.isArray(data.tags) ? data.tags : []).map(String);
         const title =
           data.title ?? relPath.replace(/\.md$/, '').split('/').pop() ?? relPath;
         const date = data.date ?? data.created ?? undefined;
@@ -525,11 +534,24 @@ export async function hybridSearch(
   const limit = opts.limit ?? 20;
   const overFetch = limit * 2;
 
+  const embeddingsReady = isEmbeddingsReady();
+
+  // Lexical (sync) and semantic (async, includes query-embed) are independent.
+  // Kick off the semantic query concurrently so its embedding forward pass
+  // overlaps the lexical search instead of running strictly after it.
+  const semanticPromise = embeddingsReady
+    ? searchSemantic(query, overFetch)
+    : null;
+  // Guard against an unhandled rejection if the synchronous lexical call below
+  // throws before we reach the await. The real error is still handled at the
+  // await (this attached catch does not consume it there).
+  if (semanticPromise) semanticPromise.catch(() => {});
+
   // Lexical results (always available)
   const lexicalResults = searchNotes(query, { ...opts, limit: overFetch });
 
   // Semantic results (if available)
-  if (!isEmbeddingsReady()) {
+  if (!semanticPromise) {
     return lexicalResults.slice(0, limit).map(r => ({
       ...r,
       lexicalScore: r.lexicalScore,
@@ -541,7 +563,7 @@ export async function hybridSearch(
 
   let semanticResults: Array<{ path: string; score: number }>;
   try {
-    semanticResults = await searchSemantic(query, overFetch);
+    semanticResults = await semanticPromise;
   } catch {
     return lexicalResults.slice(0, limit);
   }
@@ -619,8 +641,10 @@ export async function hybridSearch(
   // Re-sort after collection boost (may change ordering)
   results.sort((a, b) => b.score - a.score);
 
-  // LLM reranking pass (if enabled)
-  if (isRerankerEnabled() && results.length > 1) {
+  // LLM reranking pass (if enabled). A caller may force-skip via opts.rerank
+  // === false even when the reranker is globally enabled; when opts.rerank is
+  // undefined the global setting decides (preserves existing behavior).
+  if (opts.rerank !== false && isRerankerEnabled() && results.length > 1) {
     try {
       const candidates = results.map((r, i) => ({
         index: i,

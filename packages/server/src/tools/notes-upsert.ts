@@ -16,6 +16,7 @@ import { autoLinkEntities, selectAutoRelated, seedEntityKg } from '../lib/auto-l
 import { inferNoteCategory } from '../lib/categorize.js';
 import { captureCodeRefs } from '../lib/code-nav/refs.js';
 import { config } from '../config.js';
+import type { SimilarNote } from '../lib/similar-notes.js';
 
 /**
  * If the body contains `[[code:slug:relpath:name]]` wiki-links, capture them
@@ -150,6 +151,7 @@ async function enrichWithAutoLinks(
   notePath: string,
   data: Record<string, any>,
   body: string,
+  similarNotes: SimilarNote[],
 ): Promise<string> {
   if (!config.autoLink) return body;
   let augmented = body;
@@ -175,8 +177,8 @@ async function enrichWithAutoLinks(
   }
 
   // Similarity backlinks → strippable `## Related (auto)` + `auto_related`.
+  // Similar notes are computed once by the caller and reused for the response.
   try {
-    const { similarNotes } = await findSimilarNotes(body, notePath);
     const autoRelated = selectAutoRelated(similarNotes).filter((l) => !augmented.includes(l));
     if (autoRelated.length > 0) {
       augmented += `\n\n## Related (auto)\n${autoRelated.map((l) => `- ${l}`).join('\n')}`;
@@ -187,6 +189,25 @@ async function enrichWithAutoLinks(
   }
 
   return augmented;
+}
+
+/**
+ * Post-write side effects that must NOT block the caller on the critical path:
+ * temperature bump, journal entry, search re-index, and graph update. Any of
+ * these can involve disk I/O or embedding work; we fire them after writeNote has
+ * already returned the etag. Never throws (each step is best-effort).
+ */
+function schedulePostWrite(notePath: string, finalContent: string): void {
+  void (async () => {
+    try {
+      await updateLastUpdatedAndTemperature(notePath);
+      await appendJournalEntry(`Updated note: [[${notePath}]]`);
+      await indexNote(notePath);
+      updateGraphForNote(notePath, finalContent);
+    } catch {
+      // Non-critical: post-write enrichment failures must not surface to the caller.
+    }
+  })();
 }
 
 export function register(server: McpServer): void {
@@ -211,12 +232,37 @@ Use wiki-links in content to build the knowledge graph: [[Note Name]] links to a
 
       let finalContent: string;
 
+      // Compute similar notes ONCE per upsert (no LLM rerank — internal
+      // enrichment/suggestion work should not pay for a reranker pass). The
+      // same result feeds both the auto-link enrichment and the response.
+      const { similarNotes, suggestion } = await findSimilarNotes(noteContent, notePath);
+
+      /**
+       * Build the tool response from the etag + already-computed similar notes.
+       * Shared by every branch so the response schema stays identical.
+       */
+      const buildResponse = (etag: string, content: string) => {
+        const responseData: Record<string, unknown> = { path: notePath, updated: true, etag };
+        if (similarNotes.length > 0) {
+          responseData.similarNotes = similarNotes;
+          responseData.suggestion = suggestion;
+        }
+        addEntitySuggestions(responseData, content, notePath);
+        return {
+          content: [
+            { type: "text" as const, text: JSON.stringify(responseData) },
+          ],
+        };
+      };
+
       if (mergeMode === "replace") {
         // For new notes, ensure frontmatter has an id and a concrete category.
-        const { data, body } = parseFrontmatter(noteContent);
-        ensureId(data);
+        const parsed = parseFrontmatter(noteContent);
+        const body = parsed.body;
+        let data = parsed.data;
+        data = ensureId(data);
         ensureCategory(data, body, notePath);
-        const enrichedBody = await enrichWithAutoLinks(notePath, data, body);
+        const enrichedBody = await enrichWithAutoLinks(notePath, data, body, similarNotes);
         maybeAttachCodeRefs(data, enrichedBody);
         finalContent = stringifyFrontmatter(data, enrichedBody);
         await writeNote(notePath, finalContent, ifMatch);
@@ -227,31 +273,19 @@ Use wiki-links in content to build the knowledge graph: [[Note Name]] links to a
           existing = result.content;
         } catch {
           // Note doesn't exist yet; treat content as a new note
-          const { data, body } = parseFrontmatter(noteContent);
-          ensureId(data);
+          const parsed = parseFrontmatter(noteContent);
+          const body = parsed.body;
+          let data = parsed.data;
+          data = ensureId(data);
           ensureCategory(data, body, notePath);
-          const enrichedBody = await enrichWithAutoLinks(notePath, data, body);
+          const enrichedBody = await enrichWithAutoLinks(notePath, data, body, similarNotes);
           maybeAttachCodeRefs(data, enrichedBody);
           finalContent = stringifyFrontmatter(data, enrichedBody);
           await writeNote(notePath, finalContent);
-          await updateLastUpdatedAndTemperature(notePath);
           const etag = computeEtag(finalContent);
-          await appendJournalEntry(`Updated note: [[${notePath}]]`);
-          await indexNote(notePath);
-          updateGraphForNote(notePath, finalContent);
-
-          const { similarNotes, suggestion } = await findSimilarNotes(noteContent, notePath);
-          const responseData: Record<string, unknown> = { path: notePath, updated: true, etag };
-          if (similarNotes.length > 0) {
-            responseData.similarNotes = similarNotes;
-            responseData.suggestion = suggestion;
-          }
-          addEntitySuggestions(responseData, finalContent, notePath);
-          return {
-            content: [
-              { type: "text", text: JSON.stringify(responseData) },
-            ],
-          };
+          // Post-write work is fire-and-forget so the caller isn't blocked.
+          schedulePostWrite(notePath, finalContent);
+          return buildResponse(etag, finalContent);
         }
         finalContent = appendToContent(existing, noteContent);
         await writeNote(notePath, finalContent);
@@ -265,41 +299,25 @@ Use wiki-links in content to build the knowledge graph: [[Note Name]] links to a
           const result = await readNote(notePath);
           existing = result.content;
         } catch {
-          const { data, body } = parseFrontmatter(noteContent);
-          ensureId(data);
+          const parsed = parseFrontmatter(noteContent);
+          const body = parsed.body;
+          let data = parsed.data;
+          data = ensureId(data);
           ensureCategory(data, body, notePath);
-          const enrichedBody = await enrichWithAutoLinks(notePath, data, body);
+          const enrichedBody = await enrichWithAutoLinks(notePath, data, body, similarNotes);
           maybeAttachCodeRefs(data, enrichedBody);
           finalContent = stringifyFrontmatter(data, enrichedBody);
           await writeNote(notePath, finalContent);
-          await updateLastUpdatedAndTemperature(notePath);
           const etag = computeEtag(finalContent);
-          await appendJournalEntry(`Updated note: [[${notePath}]]`);
-          await indexNote(notePath);
-          updateGraphForNote(notePath, finalContent);
-
-          const { similarNotes, suggestion } = await findSimilarNotes(noteContent, notePath);
-          const responseData: Record<string, unknown> = { path: notePath, updated: true, etag };
-          if (similarNotes.length > 0) {
-            responseData.similarNotes = similarNotes;
-            responseData.suggestion = suggestion;
-          }
-          addEntitySuggestions(responseData, finalContent, notePath);
-          return {
-            content: [
-              { type: "text", text: JSON.stringify(responseData) },
-            ],
-          };
+          // Post-write work is fire-and-forget so the caller isn't blocked.
+          schedulePostWrite(notePath, finalContent);
+          return buildResponse(etag, finalContent);
         }
         finalContent = mergeSection(existing, sectionTitle, noteContent);
         await writeNote(notePath, finalContent);
       }
 
-      await updateLastUpdatedAndTemperature(notePath);
       const etag = computeEtag(finalContent);
-      await appendJournalEntry(`Updated note: [[${notePath}]]`);
-      await indexNote(notePath);
-      updateGraphForNote(notePath, finalContent);
 
       // Seed the KG from the merged content so existing-note append/section
       // merges still grow the temporal graph (no body mutation here — that's
@@ -315,19 +333,11 @@ Use wiki-links in content to build the knowledge graph: [[Note Name]] links to a
         }
       }
 
-      const { similarNotes, suggestion } = await findSimilarNotes(finalContent, notePath);
-      const responseData: Record<string, unknown> = { path: notePath, updated: true, etag };
-      if (similarNotes.length > 0) {
-        responseData.similarNotes = similarNotes;
-        responseData.suggestion = suggestion;
-      }
-      addEntitySuggestions(responseData, finalContent, notePath);
+      // Post-write work (temperature, journal, re-index, graph) is fire-and-forget
+      // so the caller gets the etag without waiting on enrichment/indexing.
+      schedulePostWrite(notePath, finalContent);
 
-      return {
-        content: [
-          { type: "text", text: JSON.stringify(responseData) },
-        ],
-      };
+      return buildResponse(etag, finalContent);
     })
   );
 }

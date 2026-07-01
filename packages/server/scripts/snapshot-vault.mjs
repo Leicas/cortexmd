@@ -1,4 +1,3 @@
-#!/usr/bin/env node
 /**
  * ============================================================================
  * snapshot-vault.mjs — build a LOCAL, gitignored subset of a vault for the

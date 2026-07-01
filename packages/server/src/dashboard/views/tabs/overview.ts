@@ -123,6 +123,7 @@ export function renderOverviewTab(): string {
               <th data-col="max" class="num">Max Latency <span class="sort-arrow"></span></th>
               <th data-col="errors" class="num">Err Rate <span class="sort-arrow"></span></th>
               <th data-col="last">Last Called <span class="sort-arrow"></span></th>
+              <th data-col="status">Status <span class="sort-arrow"></span></th>
             </tr>
           </thead>
           <tbody id="toolTableBody"></tbody>

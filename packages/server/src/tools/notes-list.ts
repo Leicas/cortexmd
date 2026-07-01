@@ -4,6 +4,7 @@ import { listFiles, readNote } from '../lib/vault.js';
 import { parseFrontmatter } from '../lib/frontmatter.js';
 import { wrapToolHandler } from '../lib/tool-wrapper.js';
 import { sanitizePath } from '../lib/sanitize.js';
+import { getDocMeta } from '../lib/search.js';
 
 interface NoteEntry {
   path: string;
@@ -14,6 +15,40 @@ interface NoteEntry {
   tags: string[];
   created?: string;
   updated?: string;
+}
+
+/**
+ * Bounded-concurrency map. Runs `worker` over `items` with at most `limit`
+ * in flight at once. Preserves input order in the result.
+ */
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  limit: number,
+  worker: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let next = 0;
+  const runners: Promise<void>[] = [];
+  const size = Math.min(limit, items.length);
+  for (let w = 0; w < size; w++) {
+    runners.push(
+      (async () => {
+        while (true) {
+          const i = next++;
+          if (i >= items.length) break;
+          results[i] = await worker(items[i], i);
+        }
+      })(),
+    );
+  }
+  await Promise.all(runners);
+  return results;
+}
+
+function coerceDate(raw: unknown): string | undefined {
+  if (raw instanceof Date) return raw.toISOString();
+  if (typeof raw === 'string') return raw;
+  return undefined;
 }
 
 export function register(server: McpServer): void {
@@ -68,53 +103,134 @@ export function register(server: McpServer): void {
 
       const files = await listFiles(directory, pattern);
 
-      // Cap how many files we read frontmatter for
+      // Cap how many files we consider
       const cap = Math.min(files.length, 500);
-      const entries: NoteEntry[] = [];
+      const docMeta = getDocMeta();
+
+      // Phase 1: serve title/type/temperature/heat_score/tags from the
+      // in-memory docMeta index and apply filters there — no disk I/O. Files
+      // missing from the index fall back to a disk read (rare: unindexed).
+      interface Candidate {
+        path: string;
+        title: string;
+        type?: string;
+        temperature?: string;
+        heat_score?: number;
+        tags: string[];
+        // created is available from meta.date; updated is not carried in meta,
+        // so it is resolved from disk in phase 2 only for surviving candidates.
+        created?: string;
+      }
+
+      const candidates: Candidate[] = [];
+      const diskFallbackPaths: string[] = [];
 
       for (let i = 0; i < cap; i++) {
         const filePath = files[i];
-        try {
-          const { content } = await readNote(filePath);
-          const { data } = parseFrontmatter(content);
-
-          const tags: string[] = Array.isArray(data.tags) ? data.tags : [];
-          const noteType = data.type as string | undefined;
-          const noteTemperature = data.temperature as string | undefined;
-          const heatScore = typeof data.heat_score === 'number' ? data.heat_score : undefined;
-
-          // Apply filters
-          if (filterType && noteType !== filterType) continue;
-          if (filterTemperature && noteTemperature !== filterTemperature) continue;
-          if (filterTags && filterTags.length > 0) {
-            if (!filterTags.some((t) => tags.includes(t))) continue;
-          }
-
-          const title =
-            (data.title as string) ??
-            filePath.replace(/\.md$/, '').split('/').pop() ??
-            filePath;
-
-          // Coerce dates to strings — gray-matter may parse them as Date objects
-          const rawCreated = data.created;
-          const rawUpdated = data.last_updated ?? data.updated;
-          const created = rawCreated instanceof Date ? rawCreated.toISOString() : typeof rawCreated === 'string' ? rawCreated : undefined;
-          const updated = rawUpdated instanceof Date ? rawUpdated.toISOString() : typeof rawUpdated === 'string' ? rawUpdated : undefined;
-
-          entries.push({
-            path: filePath,
-            title,
-            type: noteType,
-            temperature: noteTemperature,
-            heat_score: heatScore,
-            tags,
-            created,
-            updated,
-          });
-        } catch {
-          // skip unreadable files
+        const meta = docMeta.get(filePath);
+        if (!meta) {
+          // Not indexed — defer to a full disk read below.
+          diskFallbackPaths.push(filePath);
+          continue;
         }
+
+        const tags = meta.tags ?? [];
+        const noteType = meta.type;
+        const noteTemperature = meta.temperature;
+
+        // Apply filters using the cached fields.
+        if (filterType && noteType !== filterType) continue;
+        if (filterTemperature && noteTemperature !== filterTemperature) continue;
+        if (filterTags && filterTags.length > 0) {
+          if (!filterTags.some((t) => tags.includes(t))) continue;
+        }
+
+        candidates.push({
+          path: filePath,
+          title: meta.title,
+          type: noteType,
+          temperature: noteTemperature,
+          heat_score: meta.heat_score,
+          tags,
+          // meta.date === frontmatter date ?? created
+          created: coerceDate(meta.date),
+        });
       }
+
+      const entries: NoteEntry[] = [];
+
+      // Phase 1b: files absent from the index — full disk read (parse
+      // frontmatter for every field), applying the same filters.
+      if (diskFallbackPaths.length > 0) {
+        await mapWithConcurrency(diskFallbackPaths, 16, async (filePath) => {
+          try {
+            const { content } = await readNote(filePath);
+            const { data } = parseFrontmatter(content);
+
+            const tags: string[] = Array.isArray(data.tags) ? data.tags : [];
+            const noteType = data.type as string | undefined;
+            const noteTemperature = data.temperature as string | undefined;
+            const heatScore = typeof data.heat_score === 'number' ? data.heat_score : undefined;
+
+            if (filterType && noteType !== filterType) return;
+            if (filterTemperature && noteTemperature !== filterTemperature) return;
+            if (filterTags && filterTags.length > 0) {
+              if (!filterTags.some((t) => tags.includes(t))) return;
+            }
+
+            const title =
+              (data.title as string) ??
+              filePath.replace(/\.md$/, '').split('/').pop() ??
+              filePath;
+
+            const created = coerceDate(data.created);
+            const updated = coerceDate(data.last_updated ?? data.updated);
+
+            entries.push({
+              path: filePath,
+              title,
+              type: noteType,
+              temperature: noteTemperature,
+              heat_score: heatScore,
+              tags,
+              created,
+              updated,
+            });
+          } catch {
+            // skip unreadable files
+          }
+        });
+      }
+
+      // Phase 2: resolve the `updated` timestamp (not carried in docMeta) for
+      // surviving candidates only, in parallel with bounded concurrency. This
+      // reads far fewer files than the old per-file serial loop, since filters
+      // have already pruned the set.
+      const resolved = await mapWithConcurrency(candidates, 16, async (c) => {
+        let created = c.created;
+        let updated: string | undefined;
+        try {
+          const { content } = await readNote(c.path);
+          const { data } = parseFrontmatter(content);
+          updated = coerceDate(data.last_updated ?? data.updated);
+          // Prefer frontmatter created if meta.date was empty.
+          if (created === undefined) created = coerceDate(data.created);
+        } catch {
+          // meta-only values stand if the file is unreadable
+        }
+        const entry: NoteEntry = {
+          path: c.path,
+          title: c.title,
+          type: c.type,
+          temperature: c.temperature,
+          heat_score: c.heat_score,
+          tags: c.tags,
+          created,
+          updated,
+        };
+        return entry;
+      });
+      entries.push(...resolved);
 
       // Sort
       entries.sort((a, b) => {

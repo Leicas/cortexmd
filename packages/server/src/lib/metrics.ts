@@ -67,6 +67,22 @@ export interface CodeNavStatsSnapshot {
   perRepo: Array<{ slug: string; symbols: number; files: number; lastIndexedAt: number | null }>;
 }
 
+/**
+ * Compact, bounded per-tool telemetry rollup that survives a restart. Unlike
+ * `ToolMetrics` (which carries an unbounded-ish latency array pruned to 100),
+ * this is fixed-size per tool: a handful of numbers. It is persisted verbatim
+ * and re-seeded on boot so per-tool p50/p95/max baselines are known immediately,
+ * before enough live calls accumulate to recompute them.
+ */
+export interface ToolRollup {
+  count: number;
+  errCount: number;
+  p50: number;
+  p95: number;
+  max: number;
+  lastCalledTs: number;
+}
+
 export interface SearchTypeStats {
   lexicalOnlyHits: number;
   semanticOnlyHits: number;
@@ -82,6 +98,12 @@ export interface MetricsSnapshot {
   errorResponses: number;
   activeSessionsCount: number;
   toolCalls: Record<string, ToolMetrics>;
+  /**
+   * Persisted per-tool baseline rollups (last saved snapshot). Additive field
+   * used by the dashboard to flag regressions of the live p95 against the
+   * baseline that survived the last restart. Empty until seeded from disk.
+   */
+  toolBaselines: Record<string, ToolRollup>;
   requestsPerMinute: number;
   indexedNotes: number;
   lastIndexRebuild: number;
@@ -204,6 +226,33 @@ const requestsByCategory: RequestsByCategory = {
 };
 
 const toolCalls: Record<string, ToolMetrics> = {};
+
+// Compact per-tool rollups. `toolBaselines` is the snapshot seeded from disk on
+// boot (the regression baseline); `toolRollups` is the live rollup recomputed
+// from the current latency window and is what gets persisted.
+const toolBaselines: Record<string, ToolRollup> = {};
+const toolRollups: Record<string, ToolRollup> = {};
+
+/** Percentile (0–1) of an already-sorted ascending array. Empty → 0. */
+function percentileSorted(sorted: number[], q: number): number {
+  if (sorted.length === 0) return 0;
+  const idx = Math.floor(sorted.length * q);
+  return sorted[Math.min(idx, sorted.length - 1)];
+}
+
+/** Recompute the compact rollup for one tool from its ToolMetrics entry. */
+function updateToolRollup(name: string, tc: ToolMetrics): void {
+  const sorted = [...tc.latencies].sort((a, b) => a - b);
+  toolRollups[name] = {
+    count: tc.count,
+    errCount: tc.errors,
+    p50: percentileSorted(sorted, 0.5),
+    p95: percentileSorted(sorted, 0.95),
+    max: tc.maxLatency,
+    lastCalledTs: tc.lastCalled ?? 0,
+  };
+}
+
 const recentActivity: Array<{ timestamp: number; tool: string; status: string; duration: number }> = [];
 const recentErrors: Array<{ timestamp: number; tool: string; message: string }> = [];
 
@@ -243,6 +292,7 @@ export function getMetrics(): MetricsSnapshot {
     errorResponses,
     activeSessionsCount,
     toolCalls: { ...toolCalls },
+    toolBaselines: { ...toolBaselines },
     requestsPerMinute: requestTimestamps.length,
     indexedNotes,
     lastIndexRebuild,
@@ -315,6 +365,9 @@ export function recordToolCall(toolName: string, durationMs: number, error?: str
 
   recentActivity.push({ timestamp: Date.now(), tool: toolName, status, duration: durationMs });
   if (recentActivity.length > MAX_RECENT_ACTIVITY) recentActivity.shift();
+
+  // Keep the compact rollup in lockstep so it is ready to persist at any flush.
+  updateToolRollup(toolName, tc);
 }
 
 /**
@@ -580,6 +633,8 @@ interface PersistedMetrics {
     errors: number;
     lastCalled?: number;
   }>;
+  /** Compact per-tool baseline rollups (bounded, no latency arrays). */
+  toolRollups?: Record<string, Partial<ToolRollup>>;
   codeNavSavings?: unknown;
 }
 
@@ -622,6 +677,20 @@ export function initMetricsFromDisk(dataDir: string): void {
         }
       }
     }
+    if (persisted.toolRollups && typeof persisted.toolRollups === 'object') {
+      for (const [name, data] of Object.entries(persisted.toolRollups)) {
+        if (data && typeof data === 'object') {
+          toolBaselines[name] = {
+            count: typeof data.count === 'number' ? data.count : 0,
+            errCount: typeof data.errCount === 'number' ? data.errCount : 0,
+            p50: typeof data.p50 === 'number' ? data.p50 : 0,
+            p95: typeof data.p95 === 'number' ? data.p95 : 0,
+            max: typeof data.max === 'number' ? data.max : 0,
+            lastCalledTs: typeof data.lastCalledTs === 'number' ? data.lastCalledTs : 0,
+          };
+        }
+      }
+    }
     if (persisted.codeNavSavings) {
       restoreCodeNavSavings(persisted.codeNavSavings);
     }
@@ -629,6 +698,7 @@ export function initMetricsFromDisk(dataDir: string): void {
     logger.info('Loaded persisted metrics', {
       totalRequests,
       toolCount: Object.keys(toolCalls).length,
+      baselineCount: Object.keys(toolBaselines).length,
     });
   } catch {
     logger.warn('Failed to parse persisted metrics, starting fresh');
@@ -650,11 +720,18 @@ export function getMetricsForPersistence(): object {
     };
   }
 
+  // Compact per-tool rollups: fixed-size numeric summaries, no latency arrays.
+  const persistedRollups: Record<string, ToolRollup> = {};
+  for (const [name, r] of Object.entries(toolRollups)) {
+    persistedRollups[name] = { ...r };
+  }
+
   return {
     totalRequests,
     requestsByCategory: { ...requestsByCategory },
     errorResponses,
     toolCalls: persistedToolCalls,
+    toolRollups: persistedRollups,
     codeNavSavings: getCodeNavSavingsForPersistence(),
     savedAt: Date.now(),
   };

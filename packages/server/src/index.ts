@@ -895,8 +895,8 @@ app.post('/api/notes-upsert', apiKeyMiddleware, async (req: Request, res: Respon
 
     const notePath = sanitizePath(rawPath);
     const noteContent = sanitizeContent(rawContent);
-    const { data, body: noteBody } = parseFrontmatter(noteContent);
-    ensureId(data);
+    let { data, body: noteBody } = parseFrontmatter(noteContent);
+    data = ensureId(data);
     if (!data.last_updated) data.last_updated = new Date().toISOString().slice(0, 10);
     const finalContent = stringifyFrontmatter(data, noteBody);
     await writeNote(notePath, finalContent, body.ifMatch);

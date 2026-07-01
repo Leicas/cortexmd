@@ -6,9 +6,35 @@ import { parseFrontmatter, stringifyFrontmatter } from '../lib/frontmatter.js';
 import { wrapToolHandler } from '../lib/tool-wrapper.js';
 import { sanitizePath } from '../lib/sanitize.js';
 import { inferNoteCategory } from '../lib/categorize.js';
-import { indexNote } from '../lib/search.js';
+import { indexNote, getDocMeta } from '../lib/search.js';
 import { logger } from '../lib/logger.js';
 import { config } from '../config.js';
+
+/**
+ * Bounded-concurrency map. Runs `worker` over `items` with at most `limit`
+ * in flight at once. Order of completion is not guaranteed.
+ */
+async function runWithConcurrency<T>(
+  items: T[],
+  limit: number,
+  worker: (item: T) => Promise<void>,
+): Promise<void> {
+  let next = 0;
+  const size = Math.min(limit, items.length);
+  const runners: Promise<void>[] = [];
+  for (let w = 0; w < size; w++) {
+    runners.push(
+      (async () => {
+        while (true) {
+          const i = next++;
+          if (i >= items.length) break;
+          await worker(items[i]);
+        }
+      })(),
+    );
+  }
+  await Promise.all(runners);
+}
 
 interface PlanEntry {
   path: string;
@@ -118,34 +144,51 @@ Typical usage:
         throw new Error(`listFiles failed for scope "${scope}": ${err instanceof Error ? err.message : String(err)}`);
       }
 
+      const docMeta = getDocMeta();
+
+      // Phase A: build the plan from the in-memory docMeta index (no disk
+      // reads). `inferNoteCategory` is a cheap pure heuristic that only needs
+      // the frontmatter + body, both of which are carried in meta. Files that
+      // are not indexed fall back to a disk read for their frontmatter/body.
       for (const notePath of files) {
         if (limit !== undefined && result.plan.length >= limit) break;
         result.scanned++;
 
-        let content: string;
-        let etag: string;
-        try {
-          const read = await readNote(notePath);
-          content = read.content;
-          etag = read.etag;
-        } catch (err) {
-          result.errors.push({
-            path: notePath,
-            error: `read: ${err instanceof Error ? err.message : String(err)}`,
-          });
-          continue;
-        }
-
         let data: Record<string, any>;
         let body: string;
-        try {
-          ({ data, body } = parseFrontmatter(content));
-        } catch (err) {
-          result.errors.push({
-            path: notePath,
-            error: `parse: ${err instanceof Error ? err.message : String(err)}`,
-          });
-          continue;
+        const meta = docMeta.get(notePath);
+        if (meta) {
+          // Reconstruct the fields inferNoteCategory reads from cached meta.
+          data = {
+            category: meta.category,
+            type: meta.type,
+            tags: meta.tags,
+            title: meta.title,
+            temperature: meta.temperature,
+          };
+          body = meta.content ?? '';
+        } else {
+          // Unindexed: fall back to a disk read + parse.
+          let content: string;
+          try {
+            const read = await readNote(notePath);
+            content = read.content;
+          } catch (err) {
+            result.errors.push({
+              path: notePath,
+              error: `read: ${err instanceof Error ? err.message : String(err)}`,
+            });
+            continue;
+          }
+          try {
+            ({ data, body } = parseFrontmatter(content));
+          } catch (err) {
+            result.errors.push({
+              path: notePath,
+              error: `parse: ${err instanceof Error ? err.message : String(err)}`,
+            });
+            continue;
+          }
         }
 
         const existing = typeof data.category === 'string' ? data.category.trim() : '';
@@ -180,31 +223,59 @@ Typical usage:
         };
         result.plan.push(entry);
         result.planned++;
+      }
 
-        if (!dryRun) {
+      // Phase B: apply the plan. Each note is (re-)read fresh for an ETag-safe
+      // write, mutated, and written using a bounded-concurrency pool instead of
+      // a serial loop. Re-indexing is deferred and batched after the pool
+      // drains so we index each changed path exactly once, off the write path.
+      if (!dryRun) {
+        const changedPaths: string[] = [];
+        const failedPaths = new Set<string>();
+
+        await runWithConcurrency(result.plan, 16, async (entry) => {
+          const notePath = entry.path;
           if (!isInRwVault(notePath)) {
             result.errors.push({
               path: notePath,
               error: 'skipped: path is in a read-only vault',
             });
-            result.planned--;
-            result.plan.pop();
-            continue;
+            failedPaths.add(notePath);
+            return;
           }
           try {
-            data.category = newCategory;
+            // Re-read for a fresh ETag + authoritative body/frontmatter.
+            const { content, etag } = await readNote(notePath);
+            const { data, body } = parseFrontmatter(content);
+            data.category = entry.newCategory;
             const updated = stringifyFrontmatter(data, body);
             await writeNote(notePath, updated, etag);
-            await indexNote(notePath);
             result.applied++;
+            changedPaths.push(notePath);
           } catch (err) {
             result.errors.push({
               path: notePath,
               error: `write: ${err instanceof Error ? err.message : String(err)}`,
             });
-            // Undo the plan entry since the apply failed.
-            result.planned--;
-            result.plan.pop();
+            failedPaths.add(notePath);
+          }
+        });
+
+        // Drop plan entries whose apply failed, keeping planned in sync.
+        if (failedPaths.size > 0) {
+          result.plan = result.plan.filter((e) => !failedPaths.has(e.path));
+          result.planned = result.plan.length;
+        }
+
+        // Batched, deferred re-index of the notes we actually changed.
+        for (const p of changedPaths) {
+          try {
+            await indexNote(p);
+          } catch (err) {
+            logger.warn('notes_categorize: re-index failed', {
+              path: p,
+              error: err instanceof Error ? err.message : String(err),
+            });
           }
         }
       }

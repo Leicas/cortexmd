@@ -105,6 +105,9 @@ export interface Threshold {
 export const THRESHOLDS: Record<string, Threshold> = {
   errorRatePct:        { good: 1,    warn: 5,    direction: 'lower'  },
   latencyTailRatio:    { good: 2,    warn: 3,    direction: 'lower'  },
+  // Per-tool regression: current p95 ÷ persisted-baseline p95 (a multiplier).
+  // ≤1.5x of baseline is fine, ≤2.5x is a warning, above that is a regression.
+  toolP95Regression:   { good: 1.5,  warn: 2.5,  direction: 'lower'  },
   topSessionShare:     { good: 0.5,  warn: 0.8,  direction: 'lower'  },
   zeroResultRate:      { good: 0.1,  warn: 0.25, direction: 'lower'  },
   staleRatio:          { good: 0.15, warn: 0.35, direction: 'lower'  },
@@ -137,6 +140,21 @@ function obj(v: unknown): Dict { return v && typeof v === 'object' ? (v as Dict)
 function arr(v: unknown): unknown[] { return Array.isArray(v) ? v : []; }
 function num(v: unknown): number { return typeof v === 'number' && isFinite(v) ? v : 0; }
 
+/**
+ * Per-tool latency-regression signal. `ratio` is current p95 ÷ baseline p95
+ * (0 when there is no usable baseline), classified via `toolP95Regression`.
+ * A tool also flags `bad` when its own tail (max ÷ p95) breaches
+ * `latencyTailRatio`, so a spiky tool is caught even with no prior baseline.
+ */
+export interface ToolRegression {
+  tool: string;
+  p95: number;
+  baselineP95: number;
+  ratio: number;
+  tailRatio: number;
+  state: PillState;
+}
+
 export interface DerivedSignals {
   // Operations
   errorRatePct: number;
@@ -144,6 +162,7 @@ export interface DerivedSignals {
   rpmTrend: Trend;
   latencyTrend: Trend;
   latencyTailRatio: number;
+  toolRegressions: Record<string, ToolRegression>;
   requestMix: { health: number; mcp: number; oauth: number; dashboard: number; other: number };
   activeSessions: number;
   topSessionShare: number;
@@ -195,6 +214,27 @@ export function computeDerived(payload: Dict): DerivedSignals {
       (t) => num(t.count),
     ) * 100,
   ) / 100;
+
+  // Per-tool regression flags: compare each tool's live p95 against the
+  // persisted baseline p95 (from `toolBaselines`, seeded on restart). A tool
+  // is `bad` if its p95 blew past the baseline OR its own max/p95 tail is heavy.
+  const toolBaselines = obj(payload.toolBaselines);
+  const toolRegressions: Record<string, ToolRegression> = {};
+  for (const [name, raw] of Object.entries(toolCalls)) {
+    const t = obj(raw);
+    const p95 = num(t.p95Latency);
+    const maxLat = num(t.maxLatency);
+    const base = obj(toolBaselines[name]);
+    const baselineP95 = num(base.p95);
+    const regRatio = baselineP95 > 0 ? Math.round((p95 / baselineP95) * 100) / 100 : 0;
+    const tailRatio = p95 > 0 ? Math.round((maxLat / p95) * 100) / 100 : 0;
+    // Worst of the two signals wins; missing baseline → ratio contributes 'ok'.
+    const regState = baselineP95 > 0 ? pillState(regRatio, 'toolP95Regression') : 'ok';
+    const tailState = pillState(tailRatio, 'latencyTailRatio');
+    const rank: Record<PillState, number> = { ok: 0, warn: 1, bad: 2 };
+    const state = rank[tailState] > rank[regState] ? tailState : regState;
+    toolRegressions[name] = { tool: name, p95, baselineP95, ratio: regRatio, tailRatio, state };
+  }
 
   // Sessions: active in the last 60s + concentration of requests.
   const sessions = arr(payload.sessions) as Array<Dict>;
@@ -258,6 +298,7 @@ export function computeDerived(payload: Dict): DerivedSignals {
     rpmTrend,
     latencyTrend,
     latencyTailRatio,
+    toolRegressions,
     requestMix,
     activeSessions,
     topSessionShare,

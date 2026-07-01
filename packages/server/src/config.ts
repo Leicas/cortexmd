@@ -375,7 +375,7 @@ export const config = {
   rerankerBaseUrl: process.env.RERANKER_BASE_URL ?? '',
   rerankerModel: process.env.RERANKER_MODEL ?? '',
   rerankerApiKey: process.env.RERANKER_API_KEY ?? '',
-  rerankerTimeoutMs: parseInt(process.env.RERANKER_TIMEOUT_MS ?? '10000', 10),
+  rerankerTimeoutMs: parseInt(process.env.RERANKER_TIMEOUT_MS ?? '1500', 10),
   anthropicApiKey: process.env.ANTHROPIC_API_KEY ?? '',
 
   // Memory stack identity file

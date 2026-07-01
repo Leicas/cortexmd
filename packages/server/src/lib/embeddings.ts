@@ -412,12 +412,16 @@ export async function embedText(
   // Truncate to ~256 tokens (~1024 chars)
   const truncated = text.slice(0, 1024);
 
+  // Normalize the cache key (not the embedded text) to raise hit rate:
+  // case/whitespace variants of the same query share one cached vector.
+  const cacheKey = truncated.toLowerCase().trim().replace(/\s+/g, ' ');
+
   if (opts?.cache) {
-    const hit = queryEmbedCache.get(truncated);
+    const hit = queryEmbedCache.get(cacheKey);
     if (hit) {
       // Refresh recency: re-insert moves the key to the end of the Map.
-      queryEmbedCache.delete(truncated);
-      queryEmbedCache.set(truncated, hit);
+      queryEmbedCache.delete(cacheKey);
+      queryEmbedCache.set(cacheKey, hit);
       return hit;
     }
   }
@@ -436,7 +440,7 @@ export async function embedText(
   const vec = Array.from(output.data as Float32Array);
 
   if (opts?.cache) {
-    queryEmbedCache.set(truncated, vec);
+    queryEmbedCache.set(cacheKey, vec);
     if (queryEmbedCache.size > QUERY_EMBED_CACHE_MAX) {
       // Evict least-recently-used (oldest insertion order).
       const oldest = queryEmbedCache.keys().next().value;

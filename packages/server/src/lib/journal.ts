@@ -202,12 +202,30 @@ export async function listAgentNames(): Promise<string[]> {
   return [...names];
 }
 
+// Short-TTL cache for listAgents — the agent roster changes slowly and the
+// call fans out over every diary file, so a few seconds of staleness is a good
+// trade for keeping callers (e.g. vault_status) off the serial-read hot path.
+let listAgentsCache: {
+  ts: number;
+  value: Array<{ name: string; lastActive: string; entryCount: number }>;
+} | null = null;
+const LIST_AGENTS_TTL_MS = 5_000;
+
 /**
  * List all agents that have diary files, with metadata.
+ *
+ * `lastActive` is derived purely from filenames (no body reads). `entryCount`
+ * requires counting entry lines, so per-agent diary reads are fanned out with
+ * `Promise.all` rather than awaited serially. Results are memoised for a short
+ * TTL so repeated status calls do not re-scan every diary.
  */
 export async function listAgents(): Promise<
   Array<{ name: string; lastActive: string; entryCount: number }>
 > {
+  if (listAgentsCache && Date.now() - listAgentsCache.ts < LIST_AGENTS_TTL_MS) {
+    return listAgentsCache.value;
+  }
+
   const baseDir = 'Ops/Agent Diaries';
 
   let agentDirs: string[];
@@ -230,19 +248,21 @@ export async function listAgents(): Promise<
     agentFiles.set(name, existing);
   }
 
-  const agents: Array<{ name: string; lastActive: string; entryCount: number }> = [];
+  // Fan out the per-agent entry counts in parallel instead of a serial loop.
+  const agents = await Promise.all(
+    [...agentFiles].map(async ([name, files]) => {
+      // Most recent file = last active date (from filename, no body read).
+      files.sort((a, b) => b.localeCompare(a));
+      const latestFile = files[0];
+      const dateMatch = latestFile.match(/(\d{4}-\d{2}-\d{2})\.md$/);
+      const lastActive = dateMatch ? dateMatch[1] : 'unknown';
 
-  for (const [name, files] of agentFiles) {
-    // Most recent file = last active date
-    files.sort((a, b) => b.localeCompare(a));
-    const latestFile = files[0];
-    const dateMatch = latestFile.match(/(\d{4}-\d{2}-\d{2})\.md$/);
-    const lastActive = dateMatch ? dateMatch[1] : 'unknown';
+      const { total } = await readAgentDiary(name);
+      return { name, lastActive, entryCount: total };
+    }),
+  );
 
-    const { total } = await readAgentDiary(name);
-    agents.push({ name, lastActive, entryCount: total });
-  }
-
+  listAgentsCache = { ts: Date.now(), value: agents };
   return agents;
 }
 

@@ -929,9 +929,10 @@ fn sum_indexed_counts(paths: &[PathBuf]) -> Result<(i64, i64, i64)> {
 // ── hud-line ───────────────────────────────────────────────────────────────
 
 /// Heartbeat file the daemon touches on every loop tick. `--ensure-daemon`
-/// uses the file's mtime as the liveness signal: fresh → already running,
-/// stale/missing → spawn a fresh daemon. Avoids needing a PID-aliveness
-/// syscall (libc::kill on Unix, OpenProcess on Windows).
+/// uses the file's mtime as a cheap staleness signal (fresh → skip the spawn
+/// without touching the lock). The authoritative single-instance guard is the
+/// exclusive lock file (see `try_acquire_hud_lock`); the heartbeat alone races
+/// when several session-start hooks fire concurrently against a stale mtime.
 fn hud_heartbeat_path() -> Option<PathBuf> {
     let dir = dirs::cache_dir().or_else(dirs::data_dir)?;
     crate::auth::migrate_legacy_app_dir(&dir);
@@ -963,6 +964,48 @@ fn hud_daemon_is_fresh(stale_after: std::time::Duration) -> bool {
     let Ok(modified) = meta.modified() else { return false };
     let Ok(age) = SystemTime::now().duration_since(modified) else { return false };
     age <= stale_after
+}
+
+/// Lock file guarding "at most one hud-line daemon per machine". Lives next
+/// to the heartbeat so both share the migrated app dir.
+fn hud_lock_path() -> Option<PathBuf> {
+    Some(hud_heartbeat_path()?.with_file_name("hud-line.lock"))
+}
+
+enum HudLock {
+    /// We hold the exclusive lock. Keep the `File` alive for the daemon's
+    /// lifetime — the OS releases the lock when the process dies, even on a
+    /// crash, so no PID-aliveness validation is needed.
+    Held(std::fs::File),
+    /// A live process already holds the lock.
+    Contended,
+    /// Locking is unusable here (path unresolved, open/lock error on this
+    /// filesystem) — callers fall back to the heartbeat-only guard rather
+    /// than refusing to run.
+    Unavailable,
+}
+
+/// Try to take the exclusive daemon lock without blocking. On success the
+/// file is stamped with our PID (diagnostics only — the lock itself is the
+/// liveness signal).
+fn try_acquire_hud_lock() -> HudLock {
+    let Some(path) = hud_lock_path() else { return HudLock::Unavailable };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let file = match std::fs::OpenOptions::new().create(true).write(true).open(&path) {
+        Ok(f) => f,
+        Err(_) => return HudLock::Unavailable,
+    };
+    match file.try_lock() {
+        Ok(()) => {
+            let _ = file.set_len(0);
+            let _ = (&file).write_all(std::process::id().to_string().as_bytes());
+            HudLock::Held(file)
+        }
+        Err(std::fs::TryLockError::WouldBlock) => HudLock::Contended,
+        Err(std::fs::TryLockError::Error(_)) => HudLock::Unavailable,
+    }
 }
 
 /// Re-spawn ourselves as a detached background process running the regular
@@ -1262,6 +1305,22 @@ pub fn cmd_hud_line(args: HudLineArgs, index_fn: impl Fn(IndexArgs) -> Result<()
             eprintln!("[hud-line] daemon already running (heartbeat fresh) — nothing to do.");
             return Ok(());
         }
+        // Heartbeat stale — but a daemon may still be alive (slow tick, or the
+        // heartbeat raced another launcher). The lock is authoritative.
+        match try_acquire_hud_lock() {
+            HudLock::Contended => {
+                eprintln!("[hud-line] daemon already running (lock held) — nothing to do.");
+                return Ok(());
+            }
+            HudLock::Held(f) => {
+                // Release before spawning so the child can take it. Two
+                // launchers can still both reach spawn here; the child-side
+                // lock below guarantees only one daemon survives.
+                let _ = f.unlock();
+                drop(f);
+            }
+            HudLock::Unavailable => {}
+        }
         match spawn_hud_daemon(&args) {
             Ok(pid) => {
                 // Touch the heartbeat now so a racing session-start that fires
@@ -1276,6 +1335,29 @@ pub fn cmd_hud_line(args: HudLineArgs, index_fn: impl Fn(IndexArgs) -> Result<()
         }
         return Ok(());
     }
+
+    // Single-instance guard: hold the exclusive lock for the daemon's whole
+    // lifetime. Concurrent session-start hooks may each spawn a child past the
+    // launcher's heartbeat check; every child but the lock winner exits here,
+    // so `--ensure-daemon` can never accumulate duplicate daemons. `--once` is
+    // a one-shot foreground poll and must not be blocked by a running daemon.
+    let _hud_lock = if !args.once {
+        match try_acquire_hud_lock() {
+            HudLock::Held(f) => Some(f),
+            HudLock::Contended => {
+                eprintln!("[hud-line] another daemon instance holds the lock — exiting.");
+                return Ok(());
+            }
+            HudLock::Unavailable => {
+                eprintln!(
+                    "[hud-line] instance lock unavailable — falling back to heartbeat-only guard."
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     // The HUD line is optional: when claude-hud isn't installed we still run the
     // daemon, because it doubles as the proxy-indexing consumer — the only

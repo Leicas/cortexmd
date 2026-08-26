@@ -253,10 +253,11 @@ pub struct HudLineArgs {
     /// Run a single update then exit (useful for cron-style invocations).
     #[arg(long)]
     pub once: bool,
-    /// Idempotent launcher mode: if a daemon is already running (heartbeat is
-    /// fresh), exit silently; otherwise spawn a detached daemon and exit. Use
-    /// this from a SessionStart hook so each session re-arms the daemon
-    /// without ever stacking duplicates.
+    /// Idempotent launcher mode: if a daemon is already running (fresh
+    /// heartbeat, or the instance lock is held), exit silently; otherwise
+    /// spawn a detached daemon and exit. The daemon holds an exclusive lock
+    /// file for its lifetime, so concurrent SessionStart hooks can never
+    /// stack duplicates.
     #[arg(long)]
     pub ensure_daemon: bool,
     /// Override the claude-hud config.json path. By default the daemon probes

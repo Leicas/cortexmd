@@ -5,9 +5,17 @@ use std::path::Path;
 use std::process::Command;
 
 fn run_git(cwd: &Path, args: &[&str]) -> Result<String> {
-    let out = Command::new("git")
-        .args(args)
-        .current_dir(cwd)
+    let mut cmd = Command::new("git");
+    cmd.args(args).current_dir(cwd);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        // The hud-line daemon runs detached (no console), so a console child
+        // like git.exe would otherwise spawn a visible terminal window.
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    let out = cmd
         .output()
         .with_context(|| format!("failed to invoke git {:?}", args))?;
     if !out.status.success() {

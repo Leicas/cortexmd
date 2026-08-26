@@ -2117,11 +2117,19 @@ pub fn cmd_bench(args: BenchArgs) -> Result<()> {
             std::fs::create_dir_all(dest.parent().unwrap())
                 .with_context(|| format!("create {}", dest.parent().unwrap().display()))?;
             eprintln!("[bench] cloning {} (shallow) → {}", url, dest.display());
-            let st = ProcessCommand::new("git")
+            let mut clone_cmd = ProcessCommand::new("git");
+            clone_cmd
                 .args(["clone", "--depth=1", "--single-branch", &url])
-                .arg(&dest)
-                .status()
-                .context("spawn git clone")?;
+                .arg(&dest);
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt as _;
+                // Inherited stdio still reaches the parent console; the flag
+                // only prevents a new terminal window when none is attached.
+                const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+                clone_cmd.creation_flags(CREATE_NO_WINDOW);
+            }
+            let st = clone_cmd.status().context("spawn git clone")?;
             if !st.success() {
                 anyhow::bail!("git clone failed (status {:?})", st.code());
             }

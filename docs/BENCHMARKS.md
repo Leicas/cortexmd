@@ -58,9 +58,9 @@ embedding geometry:
 2. **Validity.** `computeValidity` returns `validity = α / (α + β)`. Recall
    classifies a note **quarantined** at validity ≤ 0.40 (excluded entirely) and
    **stale** at 0.40–0.60 (ranked, but ×0.5 via `VALIDITY_STALE_RANK_PENALTY`).
-3. **Read path.** Successful recalls bump α, so a fact that keeps proving useful
-   recovers. The superseded note is never deleted — history is preserved — it
-   just stops winning.
+3. **Read path.** Recall filters or down-ranks low-validity notes. Displaying a
+   result does not bump α: retrieval alone cannot confirm that a claim is true.
+   A superseded note remains available as historical evidence.
 
 So one contradiction makes the old fact *stale* (halved); a second
 *quarantines* it. The current fact survives both — that's the 1.000.

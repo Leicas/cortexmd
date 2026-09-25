@@ -15,8 +15,6 @@ import {
   autoArchiveColdMemories,
   applyAutoConsolidation,
   findROIDemotionCandidates,
-  findAutoPromoteCandidates,
-  applyPromotion,
   AUTO_CONSOLIDATE_MIN_GROUP_SIZE,
   AUTO_CONSOLIDATE_MIN_SHARED_TAGS,
   type ROIDemotionCandidate,
@@ -132,7 +130,7 @@ export interface DreamReport {
   /** Memories with negative ROI flagged for review/demotion (token-savior parity). */
   roiDemotions: ROIDemotionCandidate[];
 
-  /** Observations promoted to canonical facts (≥5 hits in 30 days). */
+  /** Reserved for explicit evidence-backed promotion; dream leaves it empty. */
   promotions: Array<PromotionCandidate & { applied: boolean }>;
 
   /**
@@ -174,9 +172,9 @@ export interface DreamOptions {
   autoArchive?: boolean;
   /**
    * Auto-apply high-confidence consolidation groups (≥5 notes, ≥3 shared tags)
-   * by MERGING them into one note and DELETING the originals. Default: false —
-   * this is destructive, so the dream only surfaces groups as suggestions
-   * unless a caller explicitly opts in. (Protected notes — CRM/entities/
+   * by creating a derived note and archiving originals at stable paths.
+   * Default: false; the dream surfaces groups as suggestions unless opted in.
+   * (Protected notes — CRM/entities/
    * canonical/important — are never candidates regardless; see
    * isProtectedFromConsolidation.)
    */
@@ -200,8 +198,8 @@ export interface DreamOptions {
   scope?: 'memories' | 'vault';
 
   /**
-   * Reconcile clusters of related cold notes into project notes (fold each
-   * source's body into Projects/<slug>.md, then delete the originals). Runs
+   * Reconcile clusters of related cold notes into project notes with links to
+   * the original sources. Runs
    * alongside the existing tag-consolidation path. Default: true.
    */
   reconcileProjects?: boolean;
@@ -584,7 +582,7 @@ export async function runDreamCycle(options: DreamOptions = {}): Promise<DreamRe
     daysBack = 7,
     autoDecay = true,
     autoArchive = true,        // P2.a: default changed from false → true
-    autoConsolidate = false,   // destructive (merge+delete) — opt-in only
+    autoConsolidate = false,   // source-preserving but still an opt-in write
     dryRun = false,            // P2.a: when true, no mutations are applied
     runLlm,                    // P2.c: undefined → auto-detect from config
     maxThemes = 5,
@@ -698,9 +696,10 @@ export async function runDreamCycle(options: DreamOptions = {}): Promise<DreamRe
       };
     });
 
-    // Auto-apply the eligible groups when requested and not dryRun
+    // Auto-apply eligible groups only within the remaining budget.
     if (autoConsolidate && !dryRun) {
       for (const group of consolidationGroups) {
+        if (overBudget('consolidation-apply')) break;
         if (!group.autoApplyEligible) continue;
         try {
           const result = await applyAutoConsolidation({
@@ -734,7 +733,7 @@ export async function runDreamCycle(options: DreamOptions = {}): Promise<DreamRe
 
   // 6.6. Project reconciliation — cluster related cold notes by shared
   // entity/tag overlap and LINK them into a project note (never delete).
-  // Additive to the destructive tag-consolidation above. Respects dryRun.
+  // Additive to tag consolidation above. Respects dryRun.
   let projectReconciliations: ProjectReconciliation[] = [];
   if (reconcileProjects && !overBudget('reconciliation')) {
     try {
@@ -743,6 +742,7 @@ export async function runDreamCycle(options: DreamOptions = {}): Promise<DreamRe
         minClusterSize: reconcileMinClusterSize,
       });
       for (const cluster of clusters) {
+        if (overBudget('reconciliation-apply')) break;
         try {
           const result = await reconcileClusterIntoProject(cluster, dryRun);
           if (result) projectReconciliations.push(result);
@@ -758,7 +758,7 @@ export async function runDreamCycle(options: DreamOptions = {}): Promise<DreamRe
     }
   }
 
-  // 6.5. ROI demotion + auto-promotion (token-savior parity)
+  // 6.5. ROI demotion; promotion needs evidence and is not automatic.
   let roiDemotions: ROIDemotionCandidate[] = [];
   if (!overBudget('roi-demotion')) {
     try {
@@ -768,28 +768,16 @@ export async function runDreamCycle(options: DreamOptions = {}): Promise<DreamRe
     }
   }
 
-  let promotions: Array<PromotionCandidate & { applied: boolean }> = [];
-  if (!overBudget('promotion')) {
-    try {
-      const candidates = await findAutoPromoteCandidates();
-      for (const c of candidates) {
-        let applied = false;
-        if (!dryRun) {
-          applied = await applyPromotion(c);
-        }
-        promotions.push({ ...c, applied });
-      }
-    } catch (err) {
-      logger.warn('Dream cycle: auto-promotion failed', { error: String(err) });
-    }
-  }
+  // Repeated retrieval is salience, not corroboration. Dream must never turn
+  // observations into asserted facts merely because they were displayed.
+  const promotions: Array<PromotionCandidate & { applied: boolean }> = [];
 
   // 7. Health metrics
   const health = computeHealth();
 
   // 8. LLM block — always present, even when skipped
   const llm = await runLlmSynthesis({
-    runLlm,
+    runLlm: overBudget('llm-synthesis') ? false : runLlm,
     dryRun,
     themes,
     orphans,
@@ -860,6 +848,10 @@ async function runLlmSynthesis(input: {
   // Caller explicitly disabled
   if (input.runLlm === false) {
     return { ran: false, skipReason: 'disabled-by-caller' };
+  }
+
+  if (input.dryRun) {
+    return { ran: false, skipReason: 'dry-run' };
   }
 
   // Config missing

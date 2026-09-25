@@ -1,7 +1,7 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { v4 as uuidv4 } from 'uuid';
-import { writeNote } from '../lib/vault.js';
+import { writeNote, createNote } from '../lib/vault.js';
 import { stringifyFrontmatter } from '../lib/frontmatter.js';
 import { indexNote, searchNotes, getDocMeta } from '../lib/search.js';
 import { updateGraphForNote } from '../lib/graph.js';
@@ -145,10 +145,12 @@ Categories: observation, decision, insight, conversation, fact, preference, plan
       // memories keep going to Memories/.
       const isEmailCapture = (tags ?? []).includes('matrimail');
       const baseDir = isEmailCapture ? 'EmailLog' : 'Memories';
-      const notePath = `${baseDir}/${category}/${subdir}${today}-${slug}.md`;
+      const memoryId = uuidv4();
+      const notePath = `${baseDir}/${category}/${subdir}${today}-${slug}${isEmailCapture ? '' : `-${memoryId.slice(0, 8)}`}.md`;
 
       // Dedup check: search for existing memories with similar title in the same category
-      try {
+      if (!skipDedupe) {
+        try {
         const dedupQuery = title + ' ' + content.slice(0, 50);
         const dedupResults = searchNotes(dedupQuery, {
           scopePaths: [`Memories/${category}/`],
@@ -169,8 +171,9 @@ Categories: observation, decision, insight, conversation, fact, preference, plan
             };
           }
         }
-      } catch {
-        // Index may not be ready — skip dedup check
+        } catch {
+          // Index may not be ready — skip dedup check
+        }
       }
 
       // Semantic duplicate detection via embeddings
@@ -258,17 +261,8 @@ Categories: observation, decision, insight, conversation, fact, preference, plan
         }
       }
 
-      // Bayesian validity: each detected contradiction is a soft β-bump
-      // against the existing memory's trust score. Fire-and-forget.
-      if (config.memoryValidity && contradictions.length > 0) {
-        for (const c of contradictions) {
-          updateValidity(c.path, 'failure').catch(() => undefined);
-        }
-      }
-
-      // Auto-link detected entities so the memory joins the graph instead of
-      // landing as an orphan. Resolve each high-confidence entity to its note
-      // (creating a stub under Entities/ when none exists yet).
+      // Link high-confidence entities only when an existing note resolves
+      // uniquely; an inferred name alone must not create a false graph edge.
       let highConfidence: DetectedEntity[] = [];
       try {
         highConfidence = detectEntities(content).filter((e) => e.confidence > config.autoLinkMinConfidence);
@@ -278,9 +272,6 @@ Categories: observation, decision, insight, conversation, fact, preference, plan
       // Skip auto-linking/KG-seeding for email captures — they'd spawn a node
       // per sender. Curated memories still get linked + seeded into the graph.
       const entityLinks = isEmailCapture || !config.autoLink ? [] : autoLinkEntities(highConfidence);
-      if (!isEmailCapture) {
-        seedEntityKg(title, highConfidence, notePath);
-      }
 
       // Persist the (otherwise discarded) similarity signal as strippable
       // `## Related (auto)` backlinks. Computed before the body is built so the
@@ -291,7 +282,7 @@ Categories: observation, decision, insight, conversation, fact, preference, plan
 
       // Build frontmatter
       const frontmatter: Record<string, unknown> = {
-        id: uuidv4(),
+        id: memoryId,
         type: 'memory',
         category,
         title,
@@ -300,6 +291,7 @@ Categories: observation, decision, insight, conversation, fact, preference, plan
         heat_score: 10,
         access_count: 1,
         last_accessed: today,
+        last_decayed: now.toISOString(),
         created: today,
         last_updated: today,
       };
@@ -354,11 +346,19 @@ Categories: observation, decision, insight, conversation, fact, preference, plan
       }
 
       const noteContent = stringifyFrontmatter(frontmatter, body);
-      await writeNote(notePath, noteContent);
+      await createNote(notePath, noteContent);
 
       // Update index and graph incrementally
       await indexNote(notePath);
       updateGraphForNote(notePath, noteContent);
+      if (config.memoryValidity) {
+        for (const conflict of contradictions) {
+          updateValidity(conflict.path, 'failure').catch(() => undefined);
+        }
+      }
+      if (!isEmailCapture) {
+        seedEntityKg(title, highConfidence, notePath);
+      }
 
       // Bitemporal supersession pass (DORMANT unless config.bitemporalKg). When
       // enabled, derives single-valued facts from this memory, closes any

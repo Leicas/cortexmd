@@ -3,9 +3,8 @@
  *
  * Centralizes the three "make the graph grow on write" behaviors that used to
  * be either missing or copy-pasted:
- *   1. autoLinkEntities  — detected entities → `[[Canonical Name]]` wiki-links,
- *      resolving aliases to their canonical registry name so "GH" and "GitHub"
- *      collapse onto one node.
+ *   1. autoLinkEntities  — detected entities → path-qualified wiki links when
+ *      a unique note exists, resolving registry aliases to canonical names.
  *   2. selectAutoRelated — high-scoring `findSimilarNotes` neighbors → strippable
  *      `[[path]]` backlinks (the similarity signal was previously computed on
  *      every store and thrown away).
@@ -22,14 +21,15 @@ import { registerEntity, findEntity } from './entity-registry.js';
 import { kgAddTriple, isKgInitialized } from './knowledge-graph.js';
 import type { DetectedEntity } from './entity-detector.js';
 import type { SimilarNote } from './similar-notes.js';
+import { getDocMeta } from './search.js';
+import { buildLinkLookup, resolveWikilink } from './link-resolver.js';
 
 type EntityType = 'person' | 'project' | 'organization';
 
 /**
  * Resolve a detected surface form to its canonical registry name (collapsing
  * aliases). Returns the input unchanged when the registry has no match. Uses the
- * canonical NAME (never the registry's notePath, which can be stale) so the
- * basename-resolving graph still links to the right note. Never throws.
+ * canonical name for display and lookup. Never throws.
  */
 export function resolveCanonical(name: string): string {
   try {
@@ -42,27 +42,32 @@ export function resolveCanonical(name: string): string {
 }
 
 /**
- * Resolve detected entities to bare `[[Canonical Name]]` wiki-links so a stored
- * note connects into the graph instead of orphaning. Links by canonical name so
- * the graph resolves to the real note by basename. Also keeps the registry's
- * name/type/occurrence fresh. Never throws.
+ * Resolve detected entities to existing, unambiguous path-qualified wiki
+ * links. Keep registry name/type/occurrence fresh; omit unresolved links.
  */
 export function autoLinkEntities(
   entities: Array<{ name: string; type: EntityType }>,
 ): string[] {
   const links: string[] = [];
   const seen = new Set<string>();
+  const lookup = buildLinkLookup(getDocMeta().keys());
   for (const e of entities) {
     const raw = e.name.trim();
     if (!raw) continue;
     const canonical = resolveCanonical(raw).trim() || raw;
-    const link = `[[${canonical}]]`;
-    if (!seen.has(link)) {
+    let registryPath: string | undefined;
+    try { registryPath = findEntity(raw)?.notePath; } catch { /* registry unavailable */ }
+    const target = registryPath && lookup.paths.has(registryPath)
+      ? registryPath
+      : resolveWikilink(canonical, lookup);
+    // Do not emit an ambiguous or nonexistent wiki link as though it were
+    // connected to an entity note.
+    const link = target ? `[[${target}|${canonical}]]` : undefined;
+    if (link && !seen.has(link)) {
       seen.add(link);
       links.push(link);
     }
-    // Keep the registry fresh, but don't record a notePath from here — it can be
-    // stale and point at the wrong note.
+    // Keep the registry fresh; only existing indexed paths are emitted above.
     try {
       registerEntity(e.name, e.type, { tier: 'detected' });
     } catch {

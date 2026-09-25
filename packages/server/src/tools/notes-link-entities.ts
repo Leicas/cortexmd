@@ -6,6 +6,9 @@ import { appendJournalEntry } from '../lib/journal.js';
 import { wrapToolHandler } from '../lib/tool-wrapper.js';
 import { sanitizePath, sanitizeContent } from '../lib/sanitize.js';
 import { isKgInitialized, kgAddTriple } from '../lib/knowledge-graph.js';
+import { mergeSection } from '../lib/markdown.js';
+import { indexNote } from '../lib/search.js';
+import { updateGraphForNote } from '../lib/graph.js';
 
 interface EntitySpec {
   path: string;
@@ -18,9 +21,7 @@ export function register(server: McpServer): void {
     "notes_link_entities",
     `Link person, org, and project entities together by updating their frontmatter with cross-references and evidence.
 
-This tool creates structured relationships in the knowledge graph by adding cross-reference arrays (people_links, org_links, project_links) to each entity's frontmatter. Use it whenever you discover a connection between entities — e.g., a person works at an org, a person contributes to a project, or an org sponsors a project. Provide at least two of personPath/orgPath/projectPath. Each entity's note will be updated with links to the others, and evidence entries document why the link exists. These frontmatter links complement in-content [[wiki-links]] and make relationships queryable via search filters.
-
-Link syntax reminder: in note body content, use [[Note Name]] for simple links, [[Note Name|alias]] for display text, [[Note Name#Section]] for heading links. This tool handles frontmatter cross-refs; for in-content links, use notes_upsert.`,
+This tool adds path-qualified wiki links to a managed section in each note body, records structured cross-references in frontmatter, and stores supporting evidence. Provide at least two of personPath/orgPath/projectPath.`,
     {
       personPath: z.string().optional().describe("Vault-relative path to the person note (e.g. CRM/people/John Doe.md)"),
       orgPath: z.string().optional().describe("Vault-relative path to the org note (e.g. CRM/orgs/Acme Corp.md)"),
@@ -59,7 +60,7 @@ Link syntax reminder: in note body content, use [[Note Name]] for simple links, 
       }
 
       for (const entity of entities) {
-        const { content } = await readNote(entity.path);
+        const { content, etag } = await readNote(entity.path);
         const { data, body } = parseFrontmatter(content);
 
         // Add cross-reference links
@@ -84,8 +85,15 @@ Link syntax reminder: in note body content, use [[Note Name]] for simple links, 
           }
         }
 
-        const updated = stringifyFrontmatter(data, body);
-        await writeNote(entity.path, updated);
+        const linked = ['people_links', 'org_links', 'project_links']
+          .flatMap((field) => Array.isArray(data[field]) ? data[field] as string[] : [])
+          .filter((target) => target !== entity.path);
+        const managedBody = mergeSection(body, 'Related entities (managed)',
+          [...new Set(linked)].sort().map((target) => `- [[${target}]]`).join('\n'));
+        const updated = stringifyFrontmatter(data, managedBody);
+        await writeNote(entity.path, updated, etag);
+        await indexNote(entity.path);
+        updateGraphForNote(entity.path, updated);
         updatedPaths.push(entity.path);
       }
 

@@ -26,6 +26,7 @@ const {
   kgStats,
   kgSearch,
   kgSupersede,
+  kgEvidence,
 } = await import('../knowledge-graph.js');
 
 const dbPath = join(tmpDir, 'knowledge-graph.sqlite');
@@ -75,6 +76,16 @@ describe('knowledge-graph', () => {
     expect(first.id).toBe(second.id);
     expect(first.created).toBe(true);
     expect(second.created).toBe(false);
+  });
+
+  it('retains independent evidence and does not reopen an invalidated assertion', () => {
+    const first = kgAddTriple('Alice', 'works_at', 'Haply', { validFrom: '2026-01-01', source: 'note-a.md' });
+    kgAddTriple('Alice', 'works_at', 'Haply', { validFrom: '2026-02-01', source: 'note-b.md' });
+    expect(kgEvidence(first.id).map((e) => e.source)).toEqual(['note-a.md', 'note-b.md']);
+    kgInvalidateTriple('Alice', 'works_at', 'Haply', '2026-03-01');
+    kgAddTriple('Alice', 'works_at', 'Haply', { source: 'replayed-note.md' });
+    expect(kgQueryEntity('Alice', 'outgoing').triples[0].valid_to).toBe('2026-03-01');
+    expect(kgEvidence(first.id).map((e) => e.source)).toContain('replayed-note.md');
   });
 
   it('should query entity triples (both directions by default)', () => {
@@ -184,6 +195,16 @@ describe('knowledge-graph', () => {
   // --- Supersession primitive (close-and-link, never delete) ---
 
   describe('kgSupersede', () => {
+    it('preserves both historical A intervals when a fact changes A to B and back to A', () => {
+      const first = kgAddTriple('team office', 'office_location', 'Building A', { validFrom: '2026-01-01' });
+      kgSupersede('team office', 'office_location', 'Building B', '2026-03-01');
+      const again = kgSupersede('team office', 'office_location', 'Building A', '2026-06-01');
+      expect(again.newId).not.toBe(first.id);
+      expect(kgQueryEntity('team office', 'outgoing', '2026-02-01').triples.map((t) => t.object)).toEqual(['Building A']);
+      expect(kgQueryEntity('team office', 'outgoing', '2026-04-01').triples.map((t) => t.object)).toEqual(['Building B']);
+      expect(kgQueryEntity('team office', 'outgoing', '2026-07-01').triples.map((t) => t.object)).toEqual(['Building A']);
+      expect(kgQueryEntity('team office', 'outgoing').triples.filter((t) => t.object === 'Building A')).toHaveLength(2);
+    });
     it('closes the prior rival and links both directions', () => {
       const first = kgAddTriple('team office', 'office_location', 'Building A', {
         validFrom: '2026-01-01',

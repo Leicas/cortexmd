@@ -58,9 +58,21 @@ export function initKnowledgeGraph(): void {
     CREATE INDEX IF NOT EXISTS idx_triples_subject ON triples(subject);
     CREATE INDEX IF NOT EXISTS idx_triples_object  ON triples(object);
     CREATE INDEX IF NOT EXISTS idx_triples_validity ON triples(valid_from, valid_to);
+
+    CREATE TABLE IF NOT EXISTS triple_evidence (
+      triple_id TEXT NOT NULL,
+      source TEXT NOT NULL,
+      confidence REAL NOT NULL,
+      first_seen TEXT NOT NULL,
+      last_seen TEXT NOT NULL,
+      PRIMARY KEY (triple_id, source)
+    );
+    CREATE INDEX IF NOT EXISTS idx_triple_evidence_source ON triple_evidence(source);
   `);
 
   migrateBitemporalColumns(db);
+  db.exec(`INSERT OR IGNORE INTO triple_evidence (triple_id, source, confidence, first_seen, last_seen)
+    SELECT id, source, confidence, created, created FROM triples WHERE source IS NOT NULL`);
 
   logger.info('Knowledge graph initialized', { dbPath });
 }
@@ -122,6 +134,19 @@ export interface AddTripleOpts {
   source?: string;
 }
 
+function recordTripleEvidence(d: BetterSqlite3.Database, id: string, source: string | null, confidence: number, now: string): void {
+  if (!source) return;
+  d.prepare(`INSERT INTO triple_evidence (triple_id, source, confidence, first_seen, last_seen)
+    VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT(triple_id, source) DO UPDATE SET
+      confidence = excluded.confidence, last_seen = excluded.last_seen`).run(id, source, confidence, now, now);
+}
+
+export function kgEvidence(id: string): Array<{ source: string; confidence: number; first_seen: string; last_seen: string }> {
+  return getDb().prepare('SELECT source, confidence, first_seen, last_seen FROM triple_evidence WHERE triple_id = ? ORDER BY first_seen, source')
+    .all(id) as Array<{ source: string; confidence: number; first_seen: string; last_seen: string }>;
+}
+
 export function kgAddTriple(
   subject: string,
   predicate: string,
@@ -139,23 +164,22 @@ export function kgAddTriple(
   ensureEntity(subject);
   ensureEntity(object);
 
-  // Upsert: if triple already exists, update validity/confidence/source but keep created timestamp
-  const existing = d.prepare('SELECT id FROM triples WHERE id = ?').get(id) as { id: string } | undefined;
+  // Additional observations add evidence without replacing the first source
+  // or reopening a closed validity window.
+  const existing = d.prepare(
+    'SELECT id FROM triples WHERE subject = ? AND predicate = ? AND object = ? ORDER BY (invalidated_at IS NULL AND valid_to IS NULL) DESC, valid_from DESC LIMIT 1',
+  ).get(subject, predicate, object) as { id: string } | undefined;
 
   if (existing) {
-    // Re-opening an existing triple clears any prior transaction-time closure so
-    // the row is live again (invalidated_at = NULL). superseded_by/supersedes are
-    // left untouched — they are managed exclusively by kgSupersede.
-    d.prepare(
-      `UPDATE triples SET valid_from = ?, valid_to = NULL, confidence = ?, source = ?, invalidated_at = NULL WHERE id = ?`,
-    ).run(validFrom, confidence, source, id);
-    return { id, created: false };
+    recordTripleEvidence(d, existing.id, source, confidence, now);
+    return { id: existing.id, created: false };
   }
 
   d.prepare(
     `INSERT INTO triples (id, subject, predicate, object, valid_from, confidence, source, created, recorded_at)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(id, subject, predicate, object, validFrom, confidence, source, now, now);
+  recordTripleEvidence(d, id, source, confidence, now);
 
   return { id, created: true };
 }
@@ -167,7 +191,6 @@ export function kgInvalidateTriple(
   ended?: string,
 ): boolean {
   const d = getDb();
-  const id = tripleId(subject, predicate, object);
   const validTo = ended ?? todayISO();
   const now = nowISO();
 
@@ -175,8 +198,8 @@ export function kgInvalidateTriple(
   // closure (invalidated_at). Additive: existing callers are unaffected — the
   // return contract (did we close a live triple?) is identical to before.
   const result = d
-    .prepare('UPDATE triples SET valid_to = ?, invalidated_at = ? WHERE id = ? AND valid_to IS NULL')
-    .run(validTo, now, id);
+    .prepare('UPDATE triples SET valid_to = ?, invalidated_at = ? WHERE subject = ? AND predicate = ? AND object = ? AND valid_to IS NULL')
+    .run(validTo, now, subject, predicate, object);
   return result.changes > 0;
 }
 
@@ -189,7 +212,8 @@ export function kgInvalidateTriple(
  *   - valid_to        = eventTime   (event-time window ends when the new fact begins)
  *   - invalidated_at  = now         (transaction-time closure)
  *   - superseded_by   = newId       (forward link to the replacement)
- * and the new triple is inserted/re-opened with `supersedes` pointing back at
+ * and the new triple is inserted (or an already-active interval reused) with
+ * `supersedes` pointing back at
  * the first rival it replaced. History is preserved: superseded rows remain
  * SELECT-able, just marked closed and linked.
  *
@@ -206,7 +230,7 @@ export function kgSupersede(
   opts?: { source?: string; confidence?: number },
 ): { newId: string; supersededIds: string[] } {
   const d = getDb();
-  const newId = tripleId(subject, predicate, newObject);
+  const baseId = tripleId(subject, predicate, newObject);
   const now = nowISO();
   const confidence = opts?.confidence ?? 1.0;
   const source = opts?.source ?? null;
@@ -220,30 +244,31 @@ export function kgSupersede(
     const rivals = d
       .prepare(
         `SELECT id FROM triples
-         WHERE subject = ? AND predicate = ? AND object != ? AND invalidated_at IS NULL`,
+         WHERE subject = ? AND predicate = ? AND object != ? AND invalidated_at IS NULL AND valid_to IS NULL`,
       )
       .all(subject, predicate, newObject) as Array<{ id: string }>;
     const supersededIds = rivals.map((r) => r.id);
     const firstRival = supersededIds.length > 0 ? supersededIds[0] : null;
 
-    // 2. Insert or re-open the new (superseding) triple.
-    const existing = d.prepare('SELECT id FROM triples WHERE id = ?').get(newId) as
-      | { id: string }
-      | undefined;
-    if (existing) {
-      d.prepare(
-        `UPDATE triples
-         SET valid_from = ?, valid_to = NULL, confidence = ?, source = ?,
-             invalidated_at = NULL, supersedes = COALESCE(?, supersedes)
-         WHERE id = ?`,
-      ).run(eventTime, confidence, source, firstRival, newId);
-    } else {
+    // A→B→A creates a new assertion interval instead of reopening the old
+    // A row and erasing its historical end date.
+    const active = d.prepare(
+      'SELECT id FROM triples WHERE subject = ? AND predicate = ? AND object = ? AND invalidated_at IS NULL AND valid_to IS NULL ORDER BY valid_from DESC LIMIT 1',
+    ).get(subject, predicate, newObject) as { id: string } | undefined;
+    const earlier = d.prepare(
+      'SELECT id FROM triples WHERE subject = ? AND predicate = ? AND object = ? LIMIT 1',
+    ).get(subject, predicate, newObject) as { id: string } | undefined;
+    const newId = active?.id ?? (earlier
+      ? createHash('md5').update(`${subject}\0${predicate}\0${newObject}\0${eventTime}\0${source ?? now}`).digest('hex')
+      : baseId);
+    if (!active) {
       d.prepare(
         `INSERT INTO triples
            (id, subject, predicate, object, valid_from, confidence, source, created, recorded_at, supersedes)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ).run(newId, subject, predicate, newObject, eventTime, confidence, source, now, now, firstRival);
     }
+    recordTripleEvidence(d, newId, source, confidence, now);
 
     // 3. Close each rival. Only stamp valid_to when it is still open so a
     //    manually-ended fact isn't clobbered; always link superseded_by and

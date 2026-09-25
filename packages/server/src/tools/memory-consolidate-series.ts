@@ -1,12 +1,13 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
-import { readNote, writeNote, deleteNote } from '../lib/vault.js';
+import { readNote, writeNote, createNote } from '../lib/vault.js';
 import { parseFrontmatter, stringifyFrontmatter } from '../lib/frontmatter.js';
-import { getDocMeta, indexNote, removeFromIndex } from '../lib/search.js';
+import { getDocMeta, indexNote } from '../lib/search.js';
 import { appendJournalEntry } from '../lib/journal.js';
 import { wrapToolHandler } from '../lib/tool-wrapper.js';
 import { recordConsolidation } from '../lib/metrics.js';
 import { logger } from '../lib/logger.js';
+import { invalidateGraphCache } from '../lib/graph.js';
 
 /**
  * Compute ISO week number (1-53) for a date. Folds all older series entries
@@ -41,7 +42,7 @@ function slugifyTag(tag: string): string {
 export function register(server: McpServer): void {
   server.tool(
     'memory_consolidate_series',
-    "Fold older memory notes in a tagged time-series (e.g. cron logs, heartbeat notes, email recaps) into a single rolling weekly summary at Memories/consolidated/{tag}-{YYYY-Www}.md. Keeps the most recent N notes untouched. Default dryRun=true returns a plan with counts and target paths; dryRun=false performs the fold (append to the weekly file, delete originals). Safe by default.",
+    "Fold older tagged memories into a rolling weekly summary at Memories/consolidated/{tag}-{YYYY-Www}.md. The originals remain at their paths and are archived with a link to the summary. Default dryRun=true returns a plan.",
     {
       tag: z.string().min(1).describe("Required. Tag that identifies the series (e.g. 'cron-run', 'email-recap')."),
       titleTemplate: z.string().optional().describe("Optional regex applied to note titles for additional matching (e.g. '^Cron run '). Combined with tag match (both must pass)."),
@@ -70,6 +71,7 @@ export function register(server: McpServer): void {
       type Candidate = { path: string; title: string; dateMs: number; tags: string[] };
       const matches: Candidate[] = [];
       for (const [p, meta] of dm) {
+        if (meta.archived === true) continue;
         if (!meta.tags.includes(tag)) continue;
         if (titleRegex && !titleRegex.test(meta.title)) continue;
         // Skip already-consolidated targets to prevent folding a rolling note into itself
@@ -137,22 +139,24 @@ export function register(server: McpServer): void {
       }
 
       // 3. Apply the fold
-      const applied: Array<{ targetPath: string; folded: number; deleted: number; errors: string[] }> = [];
+      const applied: Array<{ targetPath: string; folded: number; archived: number; errors: string[] }> = [];
       let totalFolded = 0;
-      let totalDeleted = 0;
+      let totalArchived = 0;
 
       for (const [bucketKey, group] of weekGroups) {
         const targetPath = `Memories/consolidated/${bucketKey}.md`;
         const errors: string[] = [];
         let folded = 0;
-        let deleted = 0;
+        let archived = 0;
 
         // Read existing target if present; otherwise create fresh frontmatter
         let existingData: Record<string, any> = {};
         let existingBody = '';
         let existingSources: string[] = [];
+        let targetEtag: string | undefined;
         try {
-          const { content } = await readNote(targetPath);
+          const { content, etag } = await readNote(targetPath);
+          targetEtag = etag;
           const parsed = parseFrontmatter(content);
           existingData = parsed.data;
           existingBody = parsed.body;
@@ -167,6 +171,12 @@ export function register(server: McpServer): void {
         const chunks: string[] = [];
         const foldedSources: string[] = [];
         for (const src of group) {
+          if (existingSources.includes(src.path)) {
+            // A prior run may have committed the summary but failed before
+            // archiving this source. Resume that last step on retry.
+            foldedSources.push(src.path);
+            continue;
+          }
           try {
             const { content } = await readNote(src.path);
             const { data, body } = parseFrontmatter(content);
@@ -182,8 +192,8 @@ export function register(server: McpServer): void {
           }
         }
 
-        if (chunks.length === 0) {
-          applied.push({ targetPath, folded: 0, deleted: 0, errors });
+        if (chunks.length === 0 && foldedSources.length === 0) {
+          applied.push({ targetPath, folded: 0, archived: 0, errors });
           continue;
         }
 
@@ -192,6 +202,7 @@ export function register(server: McpServer): void {
 
         const newData: Record<string, any> = {
           ...existingData,
+          type: 'memory',
           title: existingData.title || `${tag} — ${bucketKey}`,
           category: existingData.category || 'insight',
           tags: Array.from(new Set([...(Array.isArray(existingData.tags) ? existingData.tags : []), tag, 'consolidated-series'])).sort(),
@@ -202,41 +213,50 @@ export function register(server: McpServer): void {
         };
         if (!existingData.created) newData.created = todayStr;
 
-        const separator = existingBody.trim() ? '\n\n---\n\n' : '\n';
-        const appendedBlock = `## Fold ${todayStr} (${chunks.length} entries)\n\n${chunks.join('\n---\n\n')}`;
-        const mergedBody = `${existingBody.trimEnd()}${separator}${appendedBlock}\n`;
+        if (chunks.length > 0) {
+          const separator = existingBody.trim() ? '\n\n---\n\n' : '\n';
+          const appendedBlock = `## Fold ${todayStr} (${chunks.length} entries)\n\n${chunks.join('\n---\n\n')}`;
+          const mergedBody = `${existingBody.trimEnd()}${separator}${appendedBlock}\n`;
 
-        try {
-          const finalContent = stringifyFrontmatter(newData, mergedBody);
-          await writeNote(targetPath, finalContent);
-          await indexNote(targetPath);
-        } catch (err) {
-          errors.push(`write ${targetPath}: ${err instanceof Error ? err.message : String(err)}`);
-          applied.push({ targetPath, folded, deleted: 0, errors });
-          continue;
+          try {
+            const finalContent = stringifyFrontmatter(newData, mergedBody);
+            if (targetEtag) await writeNote(targetPath, finalContent, targetEtag);
+            else await createNote(targetPath, finalContent);
+            await indexNote(targetPath);
+            invalidateGraphCache();
+          } catch (err) {
+            errors.push(`write ${targetPath}: ${err instanceof Error ? err.message : String(err)}`);
+            applied.push({ targetPath, folded, archived: 0, errors });
+            continue;
+          }
         }
 
-        // Delete originals only once the summary write succeeded
+        // Archive originals only once the summary write succeeded. Stable
+        // source paths keep the summary's wiki links and full evidence valid.
         for (const src of group) {
           if (!foldedSources.includes(src.path)) continue;
           try {
-            await deleteNote(src.path);
-            removeFromIndex(src.path);
-            deleted++;
+            const { content, etag } = await readNote(src.path);
+            const { data, body } = parseFrontmatter(content);
+            data.archived = true;
+            data.consolidated_into = targetPath;
+            await writeNote(src.path, stringifyFrontmatter(data, body), etag);
+            await indexNote(src.path);
+            archived++;
           } catch (err) {
-            errors.push(`delete ${src.path}: ${err instanceof Error ? err.message : String(err)}`);
+            errors.push(`archive ${src.path}: ${err instanceof Error ? err.message : String(err)}`);
           }
         }
 
         recordConsolidation(folded);
-        applied.push({ targetPath, folded, deleted, errors });
+        applied.push({ targetPath, folded, archived, errors });
         totalFolded += folded;
-        totalDeleted += deleted;
+        totalArchived += archived;
       }
 
       try {
         await appendJournalEntry(
-          `Series consolidation (tag=${tag}): folded ${totalFolded} notes into ${applied.length} weekly summaries, deleted ${totalDeleted} originals`,
+          `Series consolidation (tag=${tag}): folded ${totalFolded} notes into ${applied.length} weekly summaries; originals archived in place`,
         );
       } catch (err) {
         logger.warn('memory_consolidate_series: journal append failed', {
@@ -256,7 +276,7 @@ export function register(server: McpServer): void {
             totalMatches: matches.length,
             kept: toKeep.map((k) => k.path),
             totalFolded,
-            totalDeleted,
+            totalArchived,
             results: applied,
           }, null, 2),
         }],

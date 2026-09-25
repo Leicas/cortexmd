@@ -4,6 +4,7 @@ import { listSourceVaultPaths } from './source-vaults.js';
 import { extractWikilinks } from './markdown.js';
 import { classifyPath } from './collections.js';
 import { isKgInitialized, kgQueryEntity } from './knowledge-graph.js';
+import { buildLinkLookup, resolveWikilink } from './link-resolver.js';
 
 // ── Types ────────────────────────────────────────────────────────────────
 
@@ -48,8 +49,6 @@ let cachedGraph: Map<string, Set<string>> | null = null;
 let cachedReverseGraph: Map<string, string[]> | null = null;
 
 /** Cached basename lookup for wikilink resolution */
-let cachedBasenameLookup: Map<string, string> | null = null;
-
 /** Cached set of all known file paths */
 let cachedAllFiles: Set<string> | null = null;
 
@@ -71,17 +70,7 @@ export async function buildLinkGraph(): Promise<Map<string, string[]>> {
     }
   }
 
-  // Build a lookup: basename (without .md) -> full relative path
-  const basenameLookup = new Map<string, string>();
-  for (const f of allFiles) {
-    const base = f.replace(/\.md$/, '').split('/').pop()!;
-    // First match wins (could be ambiguous, but simple heuristic)
-    if (!basenameLookup.has(base)) {
-      basenameLookup.set(base, f);
-    }
-  }
-
-  const allFilesSet = new Set(allFiles);
+  const lookup = buildLinkLookup(allFiles);
 
   for (const filePath of allFiles) {
     try {
@@ -89,7 +78,7 @@ export async function buildLinkGraph(): Promise<Map<string, string[]>> {
       const links = extractWikilinks(content);
 
       const resolved = links
-        .map((target) => resolveWikilinkTarget(target, allFilesSet, basenameLookup))
+        .map((target) => resolveWikilink(target, lookup, filePath))
         .filter((t): t is string => t !== undefined);
 
       graph.set(filePath, resolved);
@@ -117,16 +106,7 @@ export async function buildAndCacheGraph(): Promise<void> {
     }
   }
 
-  // Build basename lookup
-  const basenameLookup = new Map<string, string>();
-  for (const f of allFiles) {
-    const base = f.replace(/\.md$/, '').split('/').pop()!;
-    if (!basenameLookup.has(base)) {
-      basenameLookup.set(base, f);
-    }
-  }
-
-  const allFilesSet = new Set(allFiles);
+  const lookup = buildLinkLookup(allFiles);
   const graph = new Map<string, Set<string>>();
 
   for (const filePath of allFiles) {
@@ -135,7 +115,7 @@ export async function buildAndCacheGraph(): Promise<void> {
       const links = extractWikilinks(content);
 
       const resolved = links
-        .map((target) => resolveWikilinkTarget(target, allFilesSet, basenameLookup))
+        .map((target) => resolveWikilink(target, lookup, filePath))
         .filter((t): t is string => t !== undefined);
 
       graph.set(filePath, new Set(resolved));
@@ -145,8 +125,7 @@ export async function buildAndCacheGraph(): Promise<void> {
   }
 
   cachedGraph = graph;
-  cachedBasenameLookup = basenameLookup;
-  cachedAllFiles = allFilesSet;
+  cachedAllFiles = lookup.paths;
 
   // Pre-compute reverse graph (backlinks) to avoid rebuilding on every query
   cachedReverseGraph = buildReverseGraph(graph);
@@ -175,16 +154,16 @@ function buildReverseGraph(graph: Map<string, Set<string>>): Map<string, string[
  * Extracts wikilinks from the provided content and replaces that node's edges.
  */
 export function updateGraphForNote(filePath: string, content: string): void {
-  if (!cachedGraph || !cachedAllFiles || !cachedBasenameLookup) {
+  if (!cachedGraph || !cachedAllFiles) {
     // Cache not initialized yet; nothing to update
     return;
   }
 
-  // Add the file to the known files set and basename lookup
-  cachedAllFiles.add(filePath);
-  const base = filePath.replace(/\.md$/, '').split('/').pop()!;
-  if (!cachedBasenameLookup.has(base)) {
-    cachedBasenameLookup.set(base, filePath);
+  // A new target may resolve old dangling links, or make a bare basename
+  // ambiguous. Rebuild before the next graph read instead of keeping stale edges.
+  if (!cachedAllFiles.has(filePath)) {
+    invalidateGraphCache();
+    return;
   }
 
   // Remove old edges from the reverse graph before updating
@@ -201,8 +180,9 @@ export function updateGraphForNote(filePath: string, content: string): void {
 
   // Extract and resolve wikilinks from the new content
   const links = extractWikilinks(content);
+  const lookup = buildLinkLookup(cachedAllFiles);
   const resolved = links
-    .map((target) => resolveWikilinkTarget(target, cachedAllFiles!, cachedBasenameLookup!))
+    .map((target) => resolveWikilink(target, lookup, filePath))
     .filter((t): t is string => t !== undefined);
 
   // Replace the node's edges in the cached graph
@@ -227,7 +207,6 @@ export function updateGraphForNote(filePath: string, content: string): void {
 export function invalidateGraphCache(): void {
   cachedGraph = null;
   cachedReverseGraph = null;
-  cachedBasenameLookup = null;
   cachedAllFiles = null;
 }
 
@@ -279,34 +258,6 @@ export function getGraphStats(): {
 }
 
 /**
- * Resolve a wikilink target string to a vault-relative file path.
- */
-function resolveWikilinkTarget(
-  target: string,
-  allFiles: Set<string>,
-  basenameLookup: Map<string, string>,
-): string | undefined {
-  // Normalize: strip heading/block refs
-  const cleaned = target.split('#')[0].trim();
-  if (!cleaned) return undefined;
-
-  // Try exact match with .md
-  const withMd = cleaned.endsWith('.md') ? cleaned : `${cleaned}.md`;
-  if (allFiles.has(withMd)) return withMd;
-
-  // Try basename lookup
-  const baseName = cleaned.split('/').pop()!;
-  const found = basenameLookup.get(baseName);
-  if (found) return found;
-
-  // Try with forward slashes normalized
-  const normalized = withMd.replace(/\\/g, '/');
-  if (allFiles.has(normalized)) return normalized;
-
-  return undefined;
-}
-
-/**
  * Scan all vault .md files and report wiki-links whose targets do not resolve.
  * Returns {sourcePath, brokenTarget, line?} entries.
  *
@@ -326,16 +277,7 @@ export async function findBrokenLinks(): Promise<BrokenLink[]> {
     }
   }
 
-  // Build basename lookup: basename (without .md) -> full relative path
-  const basenameLookup = new Map<string, string>();
-  for (const f of allFiles) {
-    const base = f.replace(/\.md$/, '').split('/').pop()!;
-    if (!basenameLookup.has(base)) {
-      basenameLookup.set(base, f);
-    }
-  }
-
-  const allFilesSet = new Set(allFiles);
+  const lookup = buildLinkLookup(allFiles);
   const broken: BrokenLink[] = [];
   const wikilinkRegex = /\[\[([^\]|]+)(?:\|[^\]]*)?\]\]/g;
 
@@ -351,7 +293,7 @@ export async function findBrokenLinks(): Promise<BrokenLink[]> {
         while ((match = wikilinkRegex.exec(line)) !== null) {
           const target = match[1].trim();
           if (!target) continue;
-          const resolved = resolveWikilinkTarget(target, allFilesSet, basenameLookup);
+          const resolved = resolveWikilink(target, lookup, filePath);
           if (resolved === undefined) {
             broken.push({
               sourcePath: filePath,

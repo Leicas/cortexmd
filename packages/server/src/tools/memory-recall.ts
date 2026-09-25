@@ -13,7 +13,6 @@ import { config } from '../config.js';
 import { projectCodeRefsFromBody } from '../lib/code-nav/projection.js';
 import {
   computeValidity,
-  updateValidity,
   VALIDITY_STALE_RANK_PENALTY,
 } from '../lib/memory.js';
 
@@ -218,15 +217,25 @@ export function register(server: McpServer): void {
       // Over-fetch to allow for post-filtering
       const overFetchLimit = limit * 3;
       const searchStart = Date.now();
-      const searchResults = await hybridSearch(query, {
+      const searchOptions = {
+        type: 'memory',
         tags,
         dateFrom,
         dateTo,
-        // Pass-through only — when undefined (the normal call) hybridSearch does
-        // zero bitemporal filtering and behaves exactly as today.
-        asOf,
+        // With temporal memory enabled, ordinary recall asks for what is true
+        // now. Explicit asOf still supports historical recall.
+        asOf: asOf ?? (config.bitemporalKg ? new Date().toISOString() : undefined),
         limit: overFetchLimit,
-      });
+      };
+      const activeResults = await hybridSearch(query, searchOptions);
+      // Search the archived tier when active notes do not fill the request.
+      // This recovers unique old details and source evidence without making
+      // archival noise displace active candidates on every query.
+      const searchResults = activeResults.length < limit
+        ? [...new Map((await hybridSearch(query, {
+            ...searchOptions, excludeArchived: false, limit: limit * 10,
+          })).concat(activeResults).map((r) => [r.path, r])).values()]
+        : activeResults;
 
       // Post-filter and re-score
       const relatedSet = relatedTo ? new Set(relatedTo) : undefined;
@@ -238,6 +247,8 @@ export function register(server: McpServer): void {
         category: string;
         temperature: string;
         importance: string;
+        archived?: boolean;
+        consolidatedInto?: string;
         score: number;
         lexicalScore: number;
         semanticScore: number;
@@ -355,7 +366,8 @@ export function register(server: McpServer): void {
           ? centralityBoost(inboundLinks, config.recallCentralityWeight)
           : 1.0;
 
-        const finalScore = result.score * tempBoost * impBoost * relBoost * recencyBoost * contextBoost * validityPenalty * centBoost;
+        const sourcePenalty = meta.archived ? 0.35 : 1;
+        const finalScore = result.score * tempBoost * impBoost * relBoost * recencyBoost * contextBoost * validityPenalty * centBoost * sourcePenalty;
 
         scored.push({
           path: result.path,
@@ -363,6 +375,8 @@ export function register(server: McpServer): void {
           category: noteCategory,
           temperature: noteTemperature,
           importance: noteImportance,
+          archived: meta.archived,
+          consolidatedInto: meta.consolidated_into,
           score: finalScore,
           lexicalScore: result.lexicalScore,
           semanticScore: result.semanticScore,
@@ -462,8 +476,8 @@ export function register(server: McpServer): void {
       // data dir (never mutates user notes).
       recordCoRecall(results.map((r) => r.path));
 
-      // Task 2: Fire-and-forget access tracking for top results.
-      // Also bumps Bayesian validity α (memory was useful) when enabled.
+      // Access is a salience signal. Surfacing a result is not evidence that
+      // its claim is true, so recall must not increase validity here.
       const today = new Date().toISOString().slice(0, 10);
       for (let i = 0; i < results.length; i++) {
         if (includeContent || i < 3) {
@@ -471,7 +485,7 @@ export function register(server: McpServer): void {
           // Fire-and-forget — do not await
           (async () => {
             try {
-              const { content: noteContent } = await readNote(resultPath);
+              const { content: noteContent, etag } = await readNote(resultPath);
               const { data, body } = parseFrontmatter(noteContent);
               const currentCount = typeof data.access_count === 'number' ? data.access_count : 0;
               const currentAccessed = data.last_accessed as string | undefined;
@@ -479,20 +493,18 @@ export function register(server: McpServer): void {
               data.access_count = currentCount + 1;
               data.last_accessed = today;
               const updated = stringifyFrontmatter(data, body);
-              await writeNote(resultPath, updated);
+              await writeNote(resultPath, updated, etag);
             } catch {
               // ignore — best-effort tracking
             }
           })();
-          if (config.memoryValidity) {
-            updateValidity(resultPath, 'success').catch(() => undefined);
-          }
         }
       }
 
       // Human-readable summary first, then structured JSON
       const summary = `Found ${results.length} memories:\n` +
         results.map((r, i) => `${i + 1}. [${r.temperature}] ${r.title} (${r.category}, score: ${r.score.toFixed(1)})` +
+          (r.consolidatedInto ? ` — archived source for ${r.consolidatedInto}` : r.archived ? ' — archived memory' : '') +
           (r.signals ? ` — ${r.signals.reason}` : '')).join('\n');
 
       const recalledPaths = results.map(r => r.path);

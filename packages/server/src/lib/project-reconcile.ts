@@ -292,7 +292,7 @@ export async function reconcileClusterIntoProject(
       }
     } else {
       // Non-destructive: link to each source; the originals stay put.
-      const lines = newEntries.map((s) => `- [[${s.title}]] <!-- link:${s.path} -->`);
+      const lines = newEntries.map((s) => `- [[${s.path}|${s.title}]] <!-- link:${s.path} -->`);
       const header = '## Related memories';
       if (projBody.includes(header)) {
         projBody = projBody.replace(header, `${header}\n${lines.join('\n')}`);

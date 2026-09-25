@@ -1,9 +1,11 @@
-import { listFiles, readNote, writeNote, resolveSafePathForRead } from './vault.js';
+import { listFiles, readNote, writeNote, createNote, resolveSafePathForRead } from './vault.js';
+import { createHash } from 'node:crypto';
 import { parseFrontmatter, stringifyFrontmatter } from './frontmatter.js';
 import { getDocMeta, indexNote } from './search.js';
 import { louvain, type WeightedEdge } from './community.js';
 import { recordConsolidation } from './metrics.js';
 import { logger } from './logger.js';
+import { invalidateGraphCache } from './graph.js';
 import { lstat } from 'node:fs/promises';
 
 /**
@@ -114,10 +116,9 @@ const DEFAULT_IMPORTANCE_DECAY_MULTIPLIER = 1.0;
 
 /**
  * Decay heat scores of memories that haven't been accessed recently.
- * - >7 days since last_accessed: subtract 1 (min 0)
- * - >30 days since last_accessed: subtract 2 (min 0)
- * The base decay amount is multiplied by category-specific and
- * importance-specific multipliers before being applied.
+ * Decay is proportional to elapsed whole days after days 7/30, rather than
+ * the number of scheduler invocations. Legacy notes without last_decayed are
+ * anchored on their first refresh to avoid double-decaying old heat scores.
  * Recomputes temperature from the new score.
  *
  * Uses docMeta from the search index to pre-filter candidates,
@@ -141,14 +142,14 @@ export async function decayMemories(): Promise<{ decayed: number }> {
 
   for (const f of candidates) {
     try {
-      const { content } = await readNote(f);
+      const { content, etag } = await readNote(f);
       const { data, body } = parseFrontmatter(content);
 
       const heatScore = typeof data.heat_score === 'number' ? data.heat_score : undefined;
       if (heatScore === undefined || heatScore <= 0) continue;
 
       let accessedDate: number;
-      const lastAccessed = data.last_accessed || data.last_updated || data.updated;
+      const lastAccessed = data.last_accessed || data.last_updated || data.updated || data.decay_origin_at;
       if (lastAccessed) {
         accessedDate = new Date(lastAccessed).getTime();
       } else {
@@ -163,16 +164,21 @@ export async function decayMemories(): Promise<{ decayed: number }> {
       }
       if (isNaN(accessedDate)) continue;
 
-      const daysSince = (now - accessedDate) / (1000 * 60 * 60 * 24);
-
-      let baseDecay: number;
-      if (daysSince > 30) {
-        baseDecay = 2;
-      } else if (daysSince > 7) {
-        baseDecay = 1;
-      } else {
-        continue; // no decay needed
+      const previous = typeof data.last_decayed === 'string' ? new Date(data.last_decayed).getTime() : NaN;
+      if (!Number.isFinite(previous)) {
+        data.last_decayed = new Date(now).toISOString();
+        if (!lastAccessed) data.decay_origin_at = new Date(accessedDate).toISOString();
+        await writeNote(f, stringifyFrontmatter(data, body), etag);
+        await indexNote(f);
+        continue;
       }
+      const dayMs = 24 * 60 * 60 * 1000;
+      const unitsAt = (instant: number): number => {
+        const days = Math.floor(Math.max(0, (instant - accessedDate) / dayMs));
+        return Math.max(0, Math.min(days, 30) - 7) + 2 * Math.max(0, days - 30);
+      };
+      const baseDecay = unitsAt(now) - unitsAt(previous);
+      if (baseDecay <= 0) continue;
 
       // Apply category-specific multiplier
       const noteCategory = typeof data.category === 'string' ? data.category : '';
@@ -192,9 +198,11 @@ export async function decayMemories(): Promise<{ decayed: number }> {
 
       data.heat_score = newScore;
       data.temperature = temperature;
+      data.last_decayed = new Date(now).toISOString();
 
       const updated = stringifyFrontmatter(data, body);
-      await writeNote(f, updated);
+      await writeNote(f, updated, etag);
+      await indexNote(f);
       decayed++;
     } catch {
       // skip unreadable files
@@ -326,20 +334,21 @@ export async function applyAutoConsolidation(group: {
   const todayStr = new Date().toISOString().slice(0, 10);
 
   // Read all sources
-  type Src = { path: string; title: string; data: Record<string, any>; body: string };
+  type Src = { path: string; title: string; data: Record<string, any>; body: string; etag: string };
   const sources: Src[] = [];
   for (const p of group.paths) {
     try {
-      const { content } = await readNote(p);
+      const { content, etag } = await readNote(p);
       const { data, body } = parseFrontmatter(content);
       const title = data.title || p.replace(/\.md$/, '').split('/').pop() || p;
-      sources.push({ path: p, title, data, body });
+      sources.push({ path: p, title, data, body, etag });
     } catch (err) {
       errors.push(`read ${p}: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 
-  if (sources.length === 0) {
+  if (sources.length < 2 || sources.length !== new Set(group.paths).size || new Set(sources.map((s) => s.path)).size !== sources.length) {
+    errors.push('at least two distinct, readable sources are required');
     return { consolidatedPath: '', archived: [], errors };
   }
 
@@ -349,7 +358,8 @@ export async function applyAutoConsolidation(group: {
     .replace(/[^a-z0-9]+/g, '-')
     .replace(/^-+|-+$/g, '')
     .slice(0, 80) || 'auto';
-  const consolidatedPath = `Memories/consolidated/${todayStr}-${slug}.md`;
+  const sourceKey = createHash('sha256').update(sources.map((s) => s.path).sort().join('\n')).digest('hex').slice(0, 12);
+  const consolidatedPath = `Memories/consolidated/${todayStr}-${slug}-${sourceKey}.md`;
 
   // Merge tags / related / sources
   const allTags = new Set<string>(group.commonTags);
@@ -367,6 +377,7 @@ export async function applyAutoConsolidation(group: {
   }
 
   const data: Record<string, any> = {
+    type: 'memory',
     title: group.suggestedTitle,
     category: 'insight',
     tags: [...allTags].sort(),
@@ -396,8 +407,12 @@ export async function applyAutoConsolidation(group: {
     `## Source Memories\n${digest}\n`;
 
   try {
-    await writeNote(consolidatedPath, stringifyFrontmatter(data, body));
+    for (const source of sources) {
+      if ((await readNote(source.path)).etag !== source.etag) throw new Error(`source changed: ${source.path}`);
+    }
+    await createNote(consolidatedPath, stringifyFrontmatter(data, body));
     await indexNote(consolidatedPath);
+    invalidateGraphCache();
   } catch (err) {
     errors.push(`write ${consolidatedPath}: ${err instanceof Error ? err.message : String(err)}`);
     return { consolidatedPath, archived: [], errors };
@@ -415,7 +430,7 @@ export async function applyAutoConsolidation(group: {
       src.data.consolidated_into = consolidatedPath;
       src.data.archived = true;
       src.data.archived_at = todayStr;
-      await writeNote(src.path, stringifyFrontmatter(src.data, src.body));
+      await writeNote(src.path, stringifyFrontmatter(src.data, src.body), src.etag);
       await indexNote(src.path);
       archived.push(src.path);
     } catch (err) {

@@ -6,6 +6,24 @@ import { config } from '../config.js';
 import { listSourceVaultPaths } from './source-vaults.js';
 import { computeEtag } from './hash.js';
 
+// The server is the brain vault's sole writer. Serialize writes to one path so
+// an If-Match check and its write cannot interleave with another tool call.
+const noteWriteLocks = new Map<string, Promise<void>>();
+
+async function withNoteWriteLock<T>(resolved: string, action: () => Promise<T>): Promise<T> {
+  const previous = noteWriteLocks.get(resolved) ?? Promise.resolve();
+  let release!: () => void;
+  const current = new Promise<void>((resolve) => { release = resolve; });
+  noteWriteLocks.set(resolved, current);
+  await previous;
+  try {
+    return await action();
+  } finally {
+    release();
+    if (noteWriteLocks.get(resolved) === current) noteWriteLocks.delete(resolved);
+  }
+}
+
 /**
  * The dynamic READ containment set: the brain vault plus the runtime-merged
  * source vaults (env + persisted). Reads may resolve into any of these. WRITES
@@ -429,41 +447,49 @@ export async function writeNote(
     await assertNoSymlinkEscape(resolved, vault);
   }
 
-  // Optimistic concurrency check
-  if (ifMatch) {
-    try {
-      const existing = await readFile(resolved, 'utf-8');
-      const existingEtag = computeEtag(existing);
-      if (existingEtag !== ifMatch) {
-        throw Object.assign(
-          new Error(
-            `ETag mismatch: expected ${ifMatch}, got ${existingEtag}. The file has been modified.`,
-          ),
-          { code: 'CONFLICT', status: 409 },
-        );
+  return withNoteWriteLock(resolved, async () => {
+    // Optimistic concurrency check
+    if (ifMatch) {
+      try {
+        const existing = await readFile(resolved, 'utf-8');
+        const existingEtag = computeEtag(existing);
+        if (existingEtag !== ifMatch) {
+          throw Object.assign(
+            new Error(`ETag mismatch: expected ${ifMatch}, got ${existingEtag}. The file has been modified.`),
+            { code: 'CONFLICT', status: 409 },
+          );
+        }
+      } catch (err: any) {
+        if (err.code === 'CONFLICT') throw err;
+        if (err.code === 'ENOENT') {
+          throw Object.assign(
+            new Error(`File does not exist, but an If-Match ETag was provided: ${notePath}`),
+            { code: 'CONFLICT', status: 409 },
+          );
+        }
+        throw err;
       }
-    } catch (err: any) {
-      if (err.code === 'CONFLICT') throw err;
-      // File doesn't exist yet — that's fine for a new write, but ifMatch
-      // implies the caller expected it to exist.
-      if (err.code === 'ENOENT') {
-        throw Object.assign(
-          new Error(
-            `File does not exist, but an If-Match ETag was provided: ${notePath}`,
-          ),
-          { code: 'CONFLICT', status: 409 },
-        );
-      }
-      throw err;
     }
+
+    await mkdir(path.dirname(resolved), { recursive: true });
+    await writeFile(resolved, content, 'utf-8');
+    return { etag: computeEtag(content) };
+  });
+}
+
+/** Create a new note without ever replacing an existing one. */
+export async function createNote(notePath: string, content: string): Promise<{ etag: string }> {
+  const byteLength = Buffer.byteLength(content, 'utf-8');
+  if (byteLength > config.maxNoteSize) {
+    throw new Error(`Note content exceeds maximum size of ${config.maxNoteSize} bytes (got ${byteLength})`);
   }
 
-  // Ensure parent directories exist
+  const resolved = resolveSafePath(notePath, true);
+  const vault = findVaultRoot(resolved);
+  if (vault) await assertNoSymlinkEscape(resolved, vault);
   await mkdir(path.dirname(resolved), { recursive: true });
-
-  await writeFile(resolved, content, 'utf-8');
-  const etag = computeEtag(content);
-  return { etag };
+  await writeFile(resolved, content, { encoding: 'utf-8', flag: 'wx' });
+  return { etag: computeEtag(content) };
 }
 
 /**

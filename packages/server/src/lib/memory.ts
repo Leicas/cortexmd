@@ -190,7 +190,8 @@ export interface MemoryConflict {
 //
 // Each memory carries a Beta(α, β) posterior over "this memory is still
 // trustworthy". Default prior α=2, β=1 → 0.667 (mildly trustworthy on first
-// write). Recall successes bump α; contradictions bump β. validity = α/(α+β).
+// write). Contradictions bump β; mere recall does not change truth confidence.
+// validity = α/(α+β).
 //
 // Recall-time behavior:
 //   validity ≤ 0.40  → quarantined (excluded from results)
@@ -236,14 +237,14 @@ export function computeValidity(data: Record<string, unknown>): {
  */
 export async function updateValidity(path: string, outcome: ValidityOutcome): Promise<void> {
   try {
-    const { content } = await readNote(path);
+    const { content, etag } = await readNote(path);
     const { data, body } = parseFrontmatter(content);
     const cur = computeValidity(data);
     if (outcome === 'success') data.validity_alpha = Math.round((cur.alpha + 1) * 1000) / 1000;
     else data.validity_beta = Math.round((cur.beta + 1) * 1000) / 1000;
     data.validity_last_checked = new Date().toISOString().slice(0, 10);
     const updated = stringifyFrontmatter(data, body);
-    await writeNote(path, updated);
+    await writeNote(path, updated, etag);
   } catch (err) {
     logger.debug('updateValidity failed (non-fatal)', {
       path,

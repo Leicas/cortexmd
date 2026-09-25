@@ -14,6 +14,7 @@ import { getVault, pruneStaleVaultTransports } from './vault/registry.js';
 import { listSourceVaultPaths } from './source-vaults.js';
 import { withinWindow } from './bitemporal.js';
 import { extractWikilinks } from './markdown.js';
+import { buildLinkLookup, resolveWikilink } from './link-resolver.js';
 import { detectEntities } from './entity-detector.js';
 import { kgAllMentionTriples } from './knowledge-graph.js';
 import {
@@ -85,6 +86,7 @@ interface DocMeta {
   importance?: string;
   last_accessed?: string;
   archived?: boolean;
+  consolidated_into?: string;
   collection: string;
   // Carried so memory_recall can score/filter without re-reading the file:
   related?: string[];
@@ -96,6 +98,31 @@ interface DocMeta {
   valid_from?: string;
   valid_to?: string;
   superseded_by?: string;
+}
+
+/** Keep full rebuild and single-note updates on the same metadata contract. */
+function metadataForNote(filePath: string, data: Record<string, any>, body: string): DocMeta {
+  return {
+    date: data.date ?? data.created ?? undefined,
+    tags: (Array.isArray(data.tags) ? data.tags : []).map(String),
+    content: body,
+    title: data.title ?? filePath.replace(/\.md$/, '').split('/').pop() ?? filePath,
+    type: typeof data.type === 'string' ? data.type : undefined,
+    category: typeof data.category === 'string' ? data.category : undefined,
+    temperature: typeof data.temperature === 'string' ? data.temperature : undefined,
+    heat_score: typeof data.heat_score === 'number' ? data.heat_score : undefined,
+    importance: typeof data.importance === 'string' ? data.importance : undefined,
+    last_accessed: typeof data.last_accessed === 'string' ? data.last_accessed : undefined,
+    archived: typeof data.archived === 'boolean' ? data.archived : undefined,
+    consolidated_into: typeof data.consolidated_into === 'string' ? data.consolidated_into : undefined,
+    collection: classifyPath(filePath),
+    related: Array.isArray(data.related) ? data.related as string[] : undefined,
+    validity_alpha: typeof data.validity_alpha === 'number' ? data.validity_alpha : undefined,
+    validity_beta: typeof data.validity_beta === 'number' ? data.validity_beta : undefined,
+    valid_from: typeof data.valid_from === 'string' ? data.valid_from : undefined,
+    valid_to: typeof data.valid_to === 'string' ? data.valid_to : undefined,
+    superseded_by: typeof data.superseded_by === 'string' ? data.superseded_by : undefined,
+  };
 }
 
 export interface IndexHealthEntry {
@@ -263,26 +290,7 @@ export async function rebuildIndex(): Promise<void> {
           try { miniSearch.discard(relPath); } catch { /* may not exist */ }
         }
 
-        docMeta.set(relPath, {
-          date,
-          tags,
-          content: body,
-          title,
-          type: typeof data.type === 'string' ? data.type : undefined,
-          category: typeof data.category === 'string' ? data.category : undefined,
-          temperature: typeof data.temperature === 'string' ? data.temperature : undefined,
-          heat_score: typeof data.heat_score === 'number' ? data.heat_score : undefined,
-          importance: typeof data.importance === 'string' ? data.importance : undefined,
-          last_accessed: typeof data.last_accessed === 'string' ? data.last_accessed : undefined,
-          archived: typeof data.archived === 'boolean' ? data.archived : undefined,
-          collection: classifyPath(relPath),
-          related: Array.isArray(data.related) ? data.related as string[] : undefined,
-          validity_alpha: typeof data.validity_alpha === 'number' ? data.validity_alpha : undefined,
-          validity_beta: typeof data.validity_beta === 'number' ? data.validity_beta : undefined,
-          valid_from: typeof data.valid_from === 'string' ? data.valid_from : undefined,
-          valid_to: typeof data.valid_to === 'string' ? data.valid_to : undefined,
-          superseded_by: typeof data.superseded_by === 'string' ? data.superseded_by : undefined,
-        });
+        docMeta.set(relPath, metadataForNote(relPath, data, body));
 
         miniSearch.add({
           id: relPath,
@@ -411,7 +419,7 @@ export async function indexNote(filePath: string): Promise<void> {
   const { content } = await readNote(filePath);
   const { data, body } = parseFrontmatter(content);
 
-  const tags: string[] = Array.isArray(data.tags) ? data.tags : [];
+  const tags: string[] = (Array.isArray(data.tags) ? data.tags : []).map(String);
   const title =
     data.title ?? filePath.replace(/\.md$/, '').split('/').pop() ?? filePath;
   const date = data.date ?? data.created ?? undefined;
@@ -424,23 +432,7 @@ export async function indexNote(filePath: string): Promise<void> {
   }
 
   // Update docMeta
-  docMeta.set(filePath, {
-    date,
-    tags,
-    content: body,
-    title,
-    type: typeof data.type === 'string' ? data.type : undefined,
-    category: typeof data.category === 'string' ? data.category : undefined,
-    temperature: typeof data.temperature === 'string' ? data.temperature : undefined,
-    heat_score: typeof data.heat_score === 'number' ? data.heat_score : undefined,
-    importance: typeof data.importance === 'string' ? data.importance : undefined,
-    last_accessed: typeof data.last_accessed === 'string' ? data.last_accessed : undefined,
-    archived: typeof data.archived === 'boolean' ? data.archived : undefined,
-    collection: classifyPath(filePath),
-    related: Array.isArray(data.related) ? data.related as string[] : undefined,
-    validity_alpha: typeof data.validity_alpha === 'number' ? data.validity_alpha : undefined,
-    validity_beta: typeof data.validity_beta === 'number' ? data.validity_beta : undefined,
-  });
+  docMeta.set(filePath, metadataForNote(filePath, data, body));
 
   // Add to MiniSearch
   miniSearch.add({
@@ -579,29 +571,6 @@ function filterByAsOf<T extends { path: string }>(results: T[], asOf: string): T
 }
 
 /**
- * Resolve a wikilink target against the current index (docMeta keys). Mirrors
- * the private `resolveWikilinkTarget` in graph.ts (first-wins basename lookup)
- * so the PPR arm can derive its note↔note link graph from the in-memory
- * docMeta WITHOUT a second vault walk. Local to search.ts by design — the
- * graph.ts resolver is module-private and graph.ts is owned elsewhere.
- */
-function resolveLinkTargetLocal(
-  target: string,
-  allFiles: Set<string>,
-  basenameLookup: Map<string, string>,
-): string | undefined {
-  const cleaned = target.split('#')[0].trim();
-  if (!cleaned) return undefined;
-  const withMd = cleaned.endsWith('.md') ? cleaned : `${cleaned}.md`;
-  if (allFiles.has(withMd)) return withMd;
-  const found = basenameLookup.get(cleaned.split('/').pop()!);
-  if (found) return found;
-  const normalized = withMd.replace(/\\/g, '/');
-  if (allFiles.has(normalized)) return normalized;
-  return undefined;
-}
-
-/**
  * Build the note↔note wikilink graph and the title→path index from the current
  * in-memory docMeta. Cheap (no I/O — reuses already-parsed note bodies) and
  * only invoked when the graph arm is active.
@@ -610,24 +579,30 @@ function buildLinkGraphFromDocMeta(): {
   linkGraph: Map<string, Set<string>>;
   titleToPath: Map<string, string>;
 } {
-  const allFiles = new Set(docMeta.keys());
-  const basenameLookup = new Map<string, string>();
+  const lookup = buildLinkLookup(docMeta.keys());
   const titleToPath = new Map<string, string>();
+  const ambiguousTitles = new Set<string>();
   for (const [p, meta] of docMeta) {
     const base = p.replace(/\.md$/, '').split('/').pop()!;
-    if (!basenameLookup.has(base)) basenameLookup.set(base, p);
-    // First-wins on title collision (matches basenameLookup semantics).
-    if (meta.title && !titleToPath.has(meta.title)) titleToPath.set(meta.title, p);
+    // Do not route KG entity names to an arbitrary colliding title.
+    if (meta.title) {
+      if (titleToPath.has(meta.title) && titleToPath.get(meta.title) !== p) {
+        titleToPath.delete(meta.title);
+        ambiguousTitles.add(meta.title);
+      } else if (!ambiguousTitles.has(meta.title) && !titleToPath.has(meta.title)) {
+        titleToPath.set(meta.title, p);
+      }
+    }
     // Also index the path-derived title so KG subjects (which fall back to the
     // basename when a note has no explicit title) still resolve.
-    if (!titleToPath.has(base)) titleToPath.set(base, p);
+    if (lookup.basenames.get(base) === p && !titleToPath.has(base)) titleToPath.set(base, p);
   }
 
   const linkGraph = new Map<string, Set<string>>();
   for (const [p, meta] of docMeta) {
     const resolved = new Set<string>();
     for (const target of extractWikilinks(meta.content)) {
-      const t = resolveLinkTargetLocal(target, allFiles, basenameLookup);
+      const t = resolveWikilink(target, lookup, p);
       if (t) resolved.add(t);
     }
     linkGraph.set(p, resolved);

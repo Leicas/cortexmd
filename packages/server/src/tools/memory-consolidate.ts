@@ -1,14 +1,16 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
-import { readNote, writeNote, moveNote } from '../lib/vault.js';
+import { readNote, writeNote, createNote } from '../lib/vault.js';
+import { createHash } from 'node:crypto';
 import { parseFrontmatter, stringifyFrontmatter } from '../lib/frontmatter.js';
 import { appendJournalEntry } from '../lib/journal.js';
-import { indexNote, removeFromIndex, getDocMeta } from '../lib/search.js';
+import { indexNote, getDocMeta } from '../lib/search.js';
 import { wrapToolHandler } from '../lib/tool-wrapper.js';
 import { sanitizePath } from '../lib/sanitize.js';
 import { recordConsolidation } from '../lib/metrics.js';
 import { isEmbeddingsReady, embedText } from '../lib/embeddings.js';
 import { logger } from '../lib/logger.js';
+import { invalidateGraphCache } from '../lib/graph.js';
 import { v4 as uuidv4 } from 'uuid';
 
 interface SourceNote {
@@ -16,6 +18,7 @@ interface SourceNote {
   title: string;
   data: Record<string, any>;
   body: string;
+  etag: string;
 }
 
 /**
@@ -25,10 +28,10 @@ async function readSources(paths: string[]): Promise<SourceNote[]> {
   const out: SourceNote[] = [];
   for (const p of paths) {
     try {
-      const { content } = await readNote(p);
+      const { content, etag } = await readNote(p);
       const { data, body } = parseFrontmatter(content);
       const title = data.title || p.replace(/\.md$/, '').split('/').pop() || p;
-      out.push({ path: p, title, data, body });
+      out.push({ path: p, title, data, body, etag });
     } catch (err) {
       logger.debug('memory_consolidate: skipping unreadable source', { path: p, error: String(err) });
     }
@@ -169,13 +172,12 @@ async function clusterMemoriesByCategory(opts: {
 }
 
 /**
- * Process a single cluster: write a canonical fact, MOVE sources to
- * Memories/consolidated/sources/<original-path>. Returns the canonical path
- * and the list of moved source paths.
+ * Process a single cluster: create a derived memory and archive sources in
+ * place so existing wiki links and full source evidence remain intact.
  *
  * In dry_run mode, computes paths + intent but performs no I/O.
  */
-async function distillCluster(
+export async function distillCluster(
   cluster: { category: string; paths: string[] },
   opts: {
     dryRun: boolean;
@@ -194,37 +196,35 @@ async function distillCluster(
   const errors: string[] = [];
 
   const sources = await readSources(cluster.paths);
-  if (sources.length === 0) {
-    return { canonical: '', sources: cluster.paths, moved: [], errors: ['no readable sources'], skipped: true };
+  if (sources.length < 2 || sources.length !== new Set(cluster.paths).size || new Set(sources.map((s) => s.path)).size !== sources.length) {
+    return { canonical: '', sources: cluster.paths, moved: [], errors: ['at least two distinct, readable sources are required'], skipped: true };
   }
 
   // Pick canonical title: caller-supplied → first source's title.
   const title = opts.summaryTitle ?? sources[0].title;
   const slug = slugifyTitle(title);
 
-  // Pick canonical category: spec says `fact` if cluster category is
-  // `observation`, otherwise the cluster category. (Most common case is
-  // observations getting promoted to facts.)
-  const canonicalCategory = cluster.category === 'observation' ? 'fact' : cluster.category;
+  // A generated digest is a derived insight, not a newly verified fact or
+  // preference, even when all source memories share that category.
+  const canonicalCategory = 'insight';
 
   // Timeless categories (fact, preference) stay flat; otherwise use year/month.
   const TIMELESS = new Set(['fact', 'preference']);
   const subdir = TIMELESS.has(canonicalCategory)
     ? ''
     : `${todayStr.slice(0, 4)}/${todayStr.slice(5, 7)}/`;
-  const canonicalPath = `Memories/${canonicalCategory}/${subdir}${todayStr}-${slug}.md`;
-
-  // Plan moves: each source moves under Memories/consolidated/sources/<original-path>.
-  const moves: Array<{ src: string; dst: string }> = sources.map((s) => ({
-    src: s.path,
-    dst: `Memories/consolidated/sources/${s.path}`,
-  }));
+  const sourceKey = createHash('sha256').update(sources.map((s) => s.path).sort().join('\n')).digest('hex').slice(0, 12);
+  const canonicalPath = `Memories/${canonicalCategory}/${subdir}${todayStr}-${slug}-${sourceKey}.md`;
+  const conflictingSource = sources.find((s) => s.data.archived && s.data.consolidated_into && s.data.consolidated_into !== canonicalPath);
+  if (conflictingSource) {
+    return { canonical: canonicalPath, sources: sources.map((s) => s.path), moved: [], errors: [`source already belongs to ${conflictingSource.data.consolidated_into}: ${conflictingSource.path}`], skipped: true };
+  }
 
   if (opts.dryRun) {
     return {
       canonical: canonicalPath,
       sources: sources.map((s) => s.path),
-      moved: moves.map((m) => m.dst),
+      moved: sources.map((s) => s.path),
       errors,
       skipped: false,
     };
@@ -243,7 +243,7 @@ async function distillCluster(
     }
   }
 
-  const movedSourcePaths = moves.map((m) => m.dst);
+  const sourcePaths = sources.map((s) => s.path);
 
   const frontmatter: Record<string, unknown> = {
     id: uuidv4(),
@@ -258,38 +258,64 @@ async function distillCluster(
     created: todayStr,
     last_updated: todayStr,
     tags: [...allTags].sort(),
-    consolidated_from: movedSourcePaths,
+    consolidated_from: sourcePaths,
     distilled: true,
   };
   if (allRelated.size > 0) frontmatter.related = [...allRelated];
 
   const body = opts.summaryContent
     ? `\n# ${title}\n\n${opts.summaryContent}\n\n## Source Memories\n${sources
-        .map((s) => `- [[${movesByPath(s.path, moves)}]] — ${s.title}`)
+        .map((s) => `- [[${s.path}]] — ${s.title}`)
         .join('\n')}\n`
     : buildCanonicalBody(title, sources, todayStr);
 
   const canonicalContent = stringifyFrontmatter(frontmatter, body);
 
-  // Write canonical first; if this fails, abort without moving anything.
+  // Create-only prevents both source collisions and overwriting an earlier
+  // distillation. Verify that the source versions still match the plan.
   try {
-    await writeNote(canonicalPath, canonicalContent);
+    for (const source of sources) {
+      const current = await readNote(source.path);
+      if (current.etag !== source.etag) throw new Error(`source changed: ${source.path}`);
+    }
+    try {
+      await createNote(canonicalPath, canonicalContent);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
+      const { content } = await readNote(canonicalPath);
+      const { data: existing } = parseFrontmatter(content);
+      const previous = Array.isArray(existing.consolidated_from) ? existing.consolidated_from : [];
+      if (!existing.distilled || JSON.stringify([...previous].sort()) !== JSON.stringify([...sourcePaths].sort())) throw err;
+      // Same operation after a partial archive: keep its original summary and
+      // finish archiving sources below.
+    }
     await indexNote(canonicalPath);
+    invalidateGraphCache();
   } catch (err) {
     errors.push(`write canonical ${canonicalPath}: ${err instanceof Error ? err.message : String(err)}`);
     return { canonical: canonicalPath, sources: sources.map((s) => s.path), moved: [], errors, skipped: false };
   }
 
-  // Move sources atomically (.tmp + rename inside vault.ts moveNote).
+  // Keep sources at stable paths. Their full content remains accessible from
+  // the canonical note; only their search visibility changes.
   const moved: string[] = [];
-  for (const m of moves) {
+  for (const source of sources) {
     try {
-      await moveNote(m.src, m.dst);
-      removeFromIndex(m.src);
-      await indexNote(m.dst);
-      moved.push(m.dst);
+      const current = await readNote(source.path);
+      if (current.etag !== source.etag) throw new Error('source changed since distillation');
+      const { data, body } = parseFrontmatter(current.content);
+      if (data.archived && data.consolidated_into === canonicalPath) {
+        moved.push(source.path);
+        continue;
+      }
+      if (data.archived) throw new Error('source is already archived into another summary');
+      data.archived = true;
+      data.consolidated_into = canonicalPath;
+      await writeNote(source.path, stringifyFrontmatter(data, body), current.etag);
+      await indexNote(source.path);
+      moved.push(source.path);
     } catch (err) {
-      errors.push(`move ${m.src} → ${m.dst}: ${err instanceof Error ? err.message : String(err)}`);
+      errors.push(`archive ${source.path}: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 
@@ -304,15 +330,10 @@ async function distillCluster(
   };
 }
 
-function movesByPath(src: string, moves: Array<{ src: string; dst: string }>): string {
-  const m = moves.find((x) => x.src === src);
-  return m ? m.dst : src;
-}
-
 export function register(server: McpServer): void {
   server.tool(
     'memory_consolidate',
-    "Distill near-duplicate memories into a single canonical fact, MOVING sources into Memories/consolidated/sources/. DESTRUCTIVE on default invocation: source memories are moved out of their original paths (recoverable from Memories/consolidated/sources/ but the originals will no longer be there). Two modes: (1) manual — pass sourcePaths/summaryTitle/summaryContent for an explicit cluster; (2) auto_distill=true — clusters all memories by semantic similarity (≥0.85 cosine) within category, distilling clusters of ≥3 members. Use dry_run=true to preview without writing.",
+    "Distill near-duplicate memories into a derived summary. Source notes stay at their original paths and are archived in place, preserving full evidence and wiki links. An observation summary remains an observation. Use dry_run=true to preview without writing.",
     {
       sourcePaths: z
         .array(z.string())
@@ -346,7 +367,7 @@ export function register(server: McpServer): void {
         .boolean()
         .optional()
         .default(false)
-        .describe('Preview only — no canonical writes, no source moves. Returns what WOULD be distilled.'),
+        .describe('Preview only — no canonical writes or source archives. Returns what would be distilled.'),
     },
     wrapToolHandler('memory_consolidate', async (params) => {
       const sourcePaths = (params.sourcePaths as string[] | undefined)?.map(sanitizePath);
@@ -429,17 +450,17 @@ export function register(server: McpServer): void {
 
       if (!dryRun && totalSourcesMoved > 0) {
         await appendJournalEntry(
-          `Distilled ${totalClusters} cluster${totalClusters === 1 ? '' : 's'} → ${distilled.length} canonical memor${
+          `Distilled ${totalClusters} cluster${totalClusters === 1 ? '' : 's'} → ${distilled.length} derived memor${
             distilled.length === 1 ? 'y' : 'ies'
-          }; moved ${totalSourcesMoved} source${totalSourcesMoved === 1 ? '' : 's'} to Memories/consolidated/sources/.`,
+          }; archived ${totalSourcesMoved} source${totalSourcesMoved === 1 ? '' : 's'} in place.`,
         );
       }
 
       const summary = dryRun
-        ? `[DRY RUN] Would distill ${distilled.length}/${totalClusters} cluster(s); would move ${
+        ? `[DRY RUN] Would distill ${distilled.length}/${totalClusters} cluster(s); would archive ${
             distilled.reduce((s, d) => s + d.sources.length, 0)
-          } source(s) to Memories/consolidated/sources/.`
-        : `Distilled ${distilled.length}/${totalClusters} cluster(s); moved ${totalSourcesMoved} source(s) to Memories/consolidated/sources/.`;
+          } source(s) in place.`
+        : `Distilled ${distilled.length}/${totalClusters} cluster(s); archived ${totalSourcesMoved} source(s) in place.`;
 
       return {
         content: [

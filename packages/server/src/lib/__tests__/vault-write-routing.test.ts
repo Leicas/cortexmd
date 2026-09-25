@@ -33,7 +33,7 @@ vi.mock('../../config.js', () => ({
   },
 }));
 
-const { resolveSafePath, writeNote } = await import('../vault.js');
+const { resolveSafePath, writeNote, createNote } = await import('../vault.js');
 
 afterAll(() => {
   for (const d of [brainVault, sourceVault, outsideDir]) {
@@ -59,6 +59,24 @@ describe('vault write-routing containment', () => {
     expect(etag).toBeTruthy();
     const written = readFileSync(join(brainVault, 'subdir', 'hello.md'), 'utf-8');
     expect(written).toBe('# hello');
+  });
+
+  it('never replaces an existing note during create', async () => {
+    await createNote('subdir/create-only.md', '# original');
+    await expect(createNote('subdir/create-only.md', '# replacement')).rejects.toMatchObject({ code: 'EEXIST' });
+    expect(readFileSync(join(brainVault, 'subdir', 'create-only.md'), 'utf-8')).toBe('# original');
+  });
+
+  it('rejects one of two concurrent updates based on the same ETag', async () => {
+    const notePath = 'subdir/concurrent.md';
+    const { etag } = await createNote(notePath, '# original');
+    const outcomes = await Promise.allSettled([
+      writeNote(notePath, '# first', etag),
+      writeNote(notePath, '# second', etag),
+    ]);
+    expect(outcomes.filter((o) => o.status === 'fulfilled')).toHaveLength(1);
+    expect(outcomes.filter((o) => o.status === 'rejected')).toHaveLength(1);
+    expect(['# first', '# second']).toContain(readFileSync(join(brainVault, notePath), 'utf-8'));
   });
 
   it('rejects a write via a symlink inside the brain that points outside it', () => {

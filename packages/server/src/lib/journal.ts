@@ -43,17 +43,94 @@ function diaryPath(agentName: string, date: Date = new Date()): string {
   return `Ops/Agent Diaries/${agentName}/${year}-${month}-${day}.md`;
 }
 
+// ---------------------------------------------------------------------------
+// Diary wiki-links: every diary entry links the PROJECT and the MACHINE it was
+// written from, so Obsidian's graph ties agent activity to `Projects/<slug>`
+// (the same notes the dream reconciles cold memories into — see
+// project-reconcile.ts) and to `Machines/<id>` (one note per host; created
+// on demand by Obsidian when the link is first followed).
+//
+// Rendered as an entry suffix: ` · [[Projects/<slug>]] @ [[Machines/<id>]]`.
+// ---------------------------------------------------------------------------
+
+export interface DiaryLinkOptions {
+  /** Project slug → `[[Projects/<slug>]]`. Slugified like Projects/<slug>.md. */
+  project?: string;
+  /**
+   * Machine id → `[[Machines/<id>]]`. When omitted, derived from the agent
+   * name's trailing parenthesised segment (`Claude Code (Ao)` → `Ao`). Never
+   * the server's own machineId — that is where the SERVER runs, not the agent.
+   */
+  machine?: string;
+}
+
+/** Same slug rule as Projects/<slug>.md (project-reconcile.ts). */
+export function projectSlug(text: string): string {
+  return text.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 80);
+}
+
+/** Strip anything that would break a `[[wiki-link]]` or a path segment. */
+function sanitizeLinkSegment(text: string): string {
+  return text
+    .replace(/[\/\\]/g, '')
+    .replace(/\.\./g, '')
+    .replace(/[\[\]|#^\r\n]/g, '')
+    .trim();
+}
+
+/**
+ * Machine id implied by a machine-scoped agent name: the trailing
+ * parenthesised segment (`Claude Code (Ao)` → `Ao`). Returns '' when the name
+ * carries no such segment.
+ */
+export function machineFromAgentName(agentName: string): string {
+  const m = /\(([^()]+)\)\s*$/.exec(agentName);
+  return m ? sanitizeLinkSegment(m[1]) : '';
+}
+
+/**
+ * Render the wiki-link suffix for a diary entry, e.g.
+ * ` · [[Projects/cortexmd]] @ [[Machines/Ao]]`. Links already present in
+ * `entry` are not repeated (the agent may have written them itself, as the
+ * hooks instruct when talking to a server that predates these params).
+ * Returns '' when there is nothing to add.
+ */
+export function renderDiaryLinks(
+  entry: string,
+  agentName: string,
+  opts: DiaryLinkOptions = {},
+): string {
+  const project = opts.project ? projectSlug(sanitizeLinkSegment(opts.project)) : '';
+  const machine = sanitizeLinkSegment(opts.machine ?? '') || machineFromAgentName(agentName);
+
+  const links: string[] = [];
+  if (project) {
+    const link = `[[Projects/${project}]]`;
+    if (!entry.toLowerCase().includes(link.toLowerCase())) links.push(link);
+  }
+  if (machine) {
+    const link = `[[Machines/${machine}]]`;
+    if (!entry.toLowerCase().includes(link.toLowerCase())) links.push(link);
+  }
+  if (links.length === 0) return '';
+  return ` · ${links.join(' @ ')}`;
+}
+
 /**
  * Append a timestamped entry to today's journal file,
  * or to a per-agent daily diary when agentName is provided.
  *
  * Journal files: Journal/YYYY/MM/YYYY-MM-DD.md
  * Diary files:   Ops/Agent Diaries/{agent}/YYYY-MM-DD.md
+ *
+ * Diary entries get a ` · [[Projects/<slug>]] @ [[Machines/<id>]]` suffix
+ * (see {@link renderDiaryLinks}); `links` is ignored for the daily journal.
  */
 export async function appendJournalEntry(
   entry: string,
   source?: { kind: string; id?: string },
   agentName?: string,
+  links?: DiaryLinkOptions,
 ): Promise<{ path: string; lineRef: string }> {
   const now = new Date();
 
@@ -65,7 +142,12 @@ export async function appendJournalEntry(
     }
     const filePath = diaryPath(safeName, now);
     const timestamp = formatTime(now);
-    const line = `- **${timestamp}** — ${entry}`;
+    // Diary contract: ONE line per entry. readAgentDiary / memory_wakeup only
+    // parse the first line of an entry, so a multi-line "paragraph" would be
+    // silently truncated on read-back — fold newlines into " / " instead.
+    const oneLine = entry.replace(/\s*\r?\n+\s*/g, ' / ').trim();
+    const suffix = renderDiaryLinks(oneLine, safeName, links);
+    const line = `- **${timestamp}** — ${oneLine}${suffix}`;
     const today = now.toISOString().slice(0, 10);
 
     let existing = '';

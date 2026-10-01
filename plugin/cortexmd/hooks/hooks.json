@@ -5,8 +5,24 @@
         "hooks": [
           {
             "type": "command",
-            "command": "cortexmd hud-line --ensure-daemon",
-            "timeout": 8
+            "command": "cortexmd",
+            "args": ["hud-line", "--ensure-daemon"],
+            "timeout": 8,
+            "statusMessage": "cortexmd: HUD daemon"
+          },
+          {
+            "type": "command",
+            "command": "node",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/hooks/code_nav_hint_hook.mjs"],
+            "timeout": 6,
+            "statusMessage": "cortexmd: code-nav"
+          },
+          {
+            "type": "command",
+            "command": "node",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/hooks/wakeup_directive_hook.mjs"],
+            "timeout": 6,
+            "statusMessage": "cortexmd: wakeup"
           }
         ]
       }
@@ -16,8 +32,10 @@
         "hooks": [
           {
             "type": "command",
-            "command": "cortexmd recall --hook --server ${user_config.server_url}",
-            "timeout": 8
+            "command": "node",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/hooks/userprompt_hook.mjs"],
+            "timeout": 8,
+            "statusMessage": "cortexmd: recall"
           }
         ]
       }
@@ -28,8 +46,20 @@
         "hooks": [
           {
             "type": "command",
-            "command": "cortexmd rewrite --hook",
+            "command": "cortexmd",
+            "args": ["rewrite", "--hook"],
             "timeout": 6
+          }
+        ]
+      },
+      {
+        "matcher": "Read|Grep",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/hooks/code_nav_pretool_hook.mjs"],
+            "timeout": 5
           }
         ]
       }
@@ -40,8 +70,34 @@
         "hooks": [
           {
             "type": "command",
-            "command": "cortexmd store-memory --hook --server ${user_config.server_url}",
-            "timeout": 6
+            "command": "node",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/hooks/posttooluse_hook.mjs"],
+            "timeout": 6,
+            "async": true
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/hooks/diary_stop_hook.mjs"],
+            "timeout": 8
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/hooks/precompact_diary_hook.mjs"],
+            "timeout": 8
           }
         ]
       }

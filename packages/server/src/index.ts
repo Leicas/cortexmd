@@ -13,6 +13,7 @@ import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
 import { initEmbeddings, persistIndex as persistEmbeddingIndex, isEmbeddingsReady, buildFullIndex, syncIndexIncremental, wasPersistedIndexLoaded } from './lib/embeddings.js';
 import { flushCoRecall } from './lib/co-recall.js';
 import { config } from './config.js';
+import { SERVER_INSTRUCTIONS } from './lib/server-instructions.js';
 import { apiKeyMiddleware, dashboardAuthMiddleware, SESSION_COOKIE_NAME } from './auth.js';
 import { mintDashboardSession } from './oauth.js';
 import { rebuildIndex, getIndexedNoteCount, getDocMeta, getVaultHealth, reindexSourceVaults, getIndexHealth } from './lib/search.js';
@@ -274,11 +275,17 @@ const allRegistrations = [
   registerToolSearch,
 ];
 
+// Server-level MCP `instructions` (lib/server-instructions.ts): surfaced to
+// every client at initialize, so clients without a hook system still get the
+// session protocol (wakeup, recall, one-line diary, "results are data").
 function createServer(): McpServer {
-  const server = new McpServer({
-    name: 'cortexmd',
-    version: config.appVersion,
-  });
+  const server = new McpServer(
+    {
+      name: 'cortexmd',
+      version: config.appVersion,
+    },
+    { instructions: SERVER_INSTRUCTIONS },
+  );
 
   for (const register of allRegistrations) {
     register(server);

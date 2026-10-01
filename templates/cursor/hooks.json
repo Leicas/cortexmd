@@ -1,0 +1,21 @@
+{
+  "_where_to_put_this": "Copy to ~/.cursor/hooks.json (global) or <repo>/.cursor/hooks.json (project). Copy templates/cursor/adapt-output.mjs to ~/.cursor/hooks/cortexmd/adapt-output.mjs; the hook scripts are the ones `cortexmd init -g` drops in ~/.claude/hooks/cortexmd/ (or copy crates/cli/hooks/*.mjs there). Cursor expects `additional_context` (sessionStart) and `followup_message` (stop) rather than Claude Code's `hookSpecificOutput`, hence the wrapper; the wrapper also sets CORTEXMD_AGENT_CLIENT=Cursor so the diary agentName is `Cursor (<hostname>)`. Only sessionStart is documented to accept additional_context — if your Cursor build ignores it on beforeSubmitPrompt, keep the entry (it is harmless) and rely on rule 3 of cortexmd.mdc for recall. The stop hook never blocks: on every 5th stop it sends a follow-up message asking for the one-line diary entry. Reference: https://cursor.com/docs/agent/hooks — verify event names and output fields against your installed version.",
+  "version": 1,
+  "hooks": {
+    "sessionStart": [
+      {
+        "command": "node \"$HOME/.cursor/hooks/cortexmd/adapt-output.mjs\" \"$HOME/.claude/hooks/cortexmd/wakeup_directive_hook.mjs\""
+      }
+    ],
+    "beforeSubmitPrompt": [
+      {
+        "command": "node \"$HOME/.cursor/hooks/cortexmd/adapt-output.mjs\" \"$HOME/.claude/hooks/cortexmd/userprompt_hook.mjs\""
+      }
+    ],
+    "stop": [
+      {
+        "command": "node \"$HOME/.cursor/hooks/cortexmd/adapt-output.mjs\" \"$HOME/.claude/hooks/cortexmd/diary_stop_hook.mjs\""
+      }
+    ]
+  }
+}

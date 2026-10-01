@@ -1,8 +1,8 @@
 {
   "name": "cortexmd",
   "displayName": "cortexmd",
-  "version": "0.1.0",
-  "description": "Second-brain MCP server for Claude Code: memory store/recall with temperature decay, a knowledge graph, code navigation, a dream consolidation engine, and a web dashboard. This plugin wires the MCP server + the automation hooks in one install.",
+  "version": "0.2.0",
+  "description": "Persistent second brain for Claude Code: memory store/recall with temperature decay, per-machine agent diaries, Obsidian notes + knowledge graph, and cheap code navigation (~60 tokens per symbol). Wires the cortexmd MCP server plus the full hook template — session wakeup, per-prompt recall, code-nav hints, high-signal command capture, diary on Stop/PreCompact — in one install.",
   "author": {
     "name": "Antoine Weill--Duflos",
     "email": "antoine@haply.co"
@@ -10,7 +10,7 @@
   "homepage": "https://github.com/Leicas/cortexmd",
   "repository": "https://github.com/Leicas/cortexmd",
   "license": "MIT",
-  "keywords": ["mcp", "memory", "knowledge-graph", "code-nav", "second-brain", "obsidian"],
+  "keywords": ["mcp", "memory", "knowledge-graph", "code-nav", "second-brain", "obsidian", "diary", "hooks"],
   "mcpServers": "./.mcp.json",
   "hooks": "./hooks/hooks.json",
   "skills": "./skills/",
@@ -18,8 +18,16 @@
     "server_url": {
       "type": "string",
       "title": "cortexmd server URL",
-      "description": "Base URL of your running cortexmd server (the MCP endpoint is <url>/mcp).",
+      "description": "Base URL of your running cortexmd server (the MCP endpoint is <url>/mcp). Also exported to every hook as CLAUDE_PLUGIN_OPTION_SERVER_URL, which the hook scripts forward to the cortexmd CLI as --server.",
+      "required": true,
       "default": "http://localhost:3000"
+    },
+    "api_key": {
+      "type": "string",
+      "title": "cortexmd API key (optional)",
+      "description": "Static Bearer token for servers configured with API_KEY. Leave empty to use OAuth (/mcp in Claude Code, `cortexmd auth oauth-login --server <url>` for the hooks). Stored in secure storage, never in settings.json.",
+      "sensitive": true,
+      "required": false
     }
   }
 }

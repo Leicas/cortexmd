@@ -7,6 +7,9 @@
   "scripts": {
     "build:server": "npm -w packages/server run build",
     "test:server": "npm -w packages/server run test",
-    "dev:server": "npm -w packages/server run dev"
+    "dev:server": "npm -w packages/server run dev",
+    "test:hooks": "node --test \"crates/cli/hooks/__tests__/*.test.mjs\"",
+    "sync-plugin-hooks": "node scripts/sync-plugin-hooks.mjs",
+    "check-plugin-hooks": "node scripts/sync-plugin-hooks.mjs --check"
   }
 }

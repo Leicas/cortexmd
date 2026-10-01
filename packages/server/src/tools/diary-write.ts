@@ -7,18 +7,14 @@ import { sanitizeContent } from '../lib/sanitize.js';
 export function register(server: McpServer): void {
   server.tool(
     'diary_write',
-    `Write to YOUR personal agent diary (Ops/Agent Diaries/{agentName}/YYYY-MM-DD.md). Use this for session recaps, decisions made, observations, and self-reflection — anything that future sessions of this agent should remember.
-
-This is separate from journal_append (vault-wide ops log) and memory_store (structured knowledge). Diary entries are per-agent, timestamped, and read back via diary_read or memory_wakeup.
-
-Always write a diary entry at the end of a meaningful session.`,
+    `Deliberate session recap in YOUR diary — same file and one-line format as agent_diary_append with silent=false (outcome → open threads → files touched; pass project/machine so the entry ends with " · [[Projects/<slug>]] @ [[Machines/<host>]]"). Use at the end of a meaningful session or after a decision worth remembering across sessions. Not for structured knowledge (memory_store) or the vault-wide ops log (journal_append). Use the machine-scoped agentName ("Claude Code (<hostname>)").`,
     {
       agentName: z
         .string()
-        .describe('Name of the agent (used as filename and diary heading)'),
+        .describe('Machine-scoped agent name, e.g. "Claude Code (my-laptop)" (used as directory and diary heading; must match memory_wakeup)'),
       entry: z
         .string()
-        .describe('The diary entry text — include [[wiki-links]] to reference notes'),
+        .describe('One line, no newlines: outcome → open threads → files touched. Include [[wiki-links]] to notes.'),
       topic: z
         .string()
         .optional()
@@ -27,6 +23,14 @@ Always write a diary entry at the end of a meaningful session.`,
         .array(z.string())
         .optional()
         .describe('Tags to append as hashtags to the entry'),
+      project: z
+        .string()
+        .optional()
+        .describe('Project slug the agent is working on (git repo name, e.g. "cortexmd") — rendered as [[Projects/<slug>]]'),
+      machine: z
+        .string()
+        .optional()
+        .describe('Machine the agent runs on (hostname, e.g. "Ao") — rendered as [[Machines/<id>]]. Defaults to the "(host)" in agentName.'),
     },
     wrapToolHandler('diary_write', async (params) => {
       const agentName = (params.agentName as string).trim();
@@ -59,7 +63,10 @@ Always write a diary entry at the end of a meaningful session.`,
         entryText = `${entryText} ${hashtags}`;
       }
 
-      const result = await appendJournalEntry(entryText, undefined, agentName);
+      const project = params.project as string | undefined;
+      const machine = params.machine as string | undefined;
+
+      const result = await appendJournalEntry(entryText, undefined, agentName, { project, machine });
 
       return {
         content: [
@@ -69,6 +76,8 @@ Always write a diary entry at the end of a meaningful session.`,
               path: result.path,
               lineRef: result.lineRef,
               agentName,
+              ...(project ? { project } : {}),
+              ...(machine ? { machine } : {}),
             }),
           },
         ],

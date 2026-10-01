@@ -33,6 +33,16 @@ function truncateToTokens(text: string, maxTokens: number): string {
   return text.slice(0, maxChars) + '\n... [truncated]';
 }
 
+/**
+ * Path-qualified link with the title as display text. Titles rarely match
+ * filenames (e.g. "Email - <subject>" vs a slugged path), so a bare
+ * `[[title]]` dangles — and agents copy these lines into new notes.
+ */
+export function noteLink(notePath: string, title: string): string {
+  const display = (title || notePath).replace(/\.md$/, '').replace(/[[\]|]/g, '');
+  return `[[${notePath.replace(/\.md$/, '')}|${display}]]`;
+}
+
 // ── L0: Identity ──────────────────────────────────────────────────────────────
 
 /**
@@ -129,8 +139,7 @@ async function buildEssentialNarrative(focusCollection?: string): Promise<string
     if (topNotes.length === 0) continue;
     lines.push(`### ${collection}`);
     for (const note of topNotes) {
-      const title = note.title.replace(/\.md$/, '');
-      lines.push(`- [[${title}]] -- ${note.category}, ${note.temperature} (${note.heat_score})`);
+      lines.push(`- ${noteLink(note.path, note.title)} -- ${note.category}, ${note.temperature} (${note.heat_score})`);
     }
     lines.push('');
   }
@@ -194,8 +203,7 @@ export async function filteredRecall(
   lines.push(`*${entries.length} notes total, showing top ${topEntries.length}*`);
   lines.push('');
   for (const note of topEntries) {
-    const title = note.title.replace(/\.md$/, '');
-    lines.push(`- [[${title}]] -- ${note.category}, ${note.temperature} (${note.heat_score})`);
+    lines.push(`- ${noteLink(note.path, note.title)} -- ${note.category}, ${note.temperature} (${note.heat_score})`);
   }
 
   const content = truncateToTokens(lines.join('\n'), 500);

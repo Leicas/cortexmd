@@ -8,7 +8,7 @@ import { updateGraphForNote } from '../lib/graph.js';
 import { wrapToolHandler } from '../lib/tool-wrapper.js';
 import { sanitizeContent } from '../lib/sanitize.js';
 import { findSimilarNotes } from '../lib/similar-notes.js';
-import { autoLinkEntities, selectAutoRelated, seedEntityKg } from '../lib/auto-link.js';
+import { autoLinkEntities, repairWikilinks, selectAutoRelated, seedEntityKg } from '../lib/auto-link.js';
 import { isEmbeddingsReady, checkSemanticDuplicate } from '../lib/embeddings.js';
 import { extractPreferences, DetectedPreference } from '../lib/preference-detector.js';
 import { detectEntities, type DetectedEntity } from '../lib/entity-detector.js';
@@ -18,6 +18,8 @@ import type { MemoryCategory } from '../lib/categorize.js';
 import { captureCodeRefs } from '../lib/code-nav/refs.js';
 import { detectMemoryConflicts, updateValidity, type MemoryConflict } from '../lib/memory.js';
 import { config } from '../config.js';
+import { matchCaptureNoise, isSlugTitle } from '../lib/capture-filter.js';
+import { linkFromIndex } from '../lib/index-notes.js';
 
 // Local mutable tuple for z.enum (MEMORY_CATEGORIES is the shared readonly source of truth).
 const CATEGORIES = [...MEMORY_CATEGORIES] as [MemoryCategory, ...MemoryCategory[]];
@@ -119,14 +121,29 @@ Categories: observation, decision, insight, conversation, fact, preference, plan
         .describe("Skip semantic duplicate detection. Use when you know the content is unique or want to force storage"),
     },
     wrapToolHandler("memory_store", async (params) => {
-      const content = sanitizeContent(params.content as string);
+      // Title/registry-named links ([[Email - <subject>]]) → real paths
+      const content = repairWikilinks(sanitizeContent(params.content as string));
       const category = (params.category as Category | undefined) ?? detectCategory(content);
-      const title = (params.title as string | undefined) ?? generateTitle(content);
+      // A filename-slug title ("2026-09-30-fix-sync") reads as a stub; derive one
+      const givenTitle = params.title as string | undefined;
+      const title = givenTitle && !isSlugTitle(givenTitle) ? givenTitle : generateTitle(content);
       const tags = params.tags as string[] | undefined;
       const relatedPaths = params.relatedPaths as string[] | undefined;
       const context = params.context as { conversationId?: string; toolName?: string; trigger?: string } | undefined;
       const importance = (params.importance as string | undefined) ?? 'medium';
       const skipDedupe = params.skipDedupe as boolean | undefined;
+
+      // Shell-command stubs and automated emails never become memories
+      const noise = matchCaptureNoise(title);
+      if (noise) {
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({ stored: false, reason: 'capture_noise', title, pattern: noise.source }),
+          }],
+          isError: false,
+        };
+      }
 
       const now = new Date();
       const today = now.toISOString().slice(0, 10);
@@ -358,6 +375,14 @@ Categories: observation, decision, insight, conversation, fact, preference, plan
       }
       if (!isEmailCapture) {
         seedEntityKg(title, highConfidence, notePath);
+      } else {
+        // Email captures get no entity/related links; a per-month index keeps
+        // them from landing as orphans.
+        await linkFromIndex(
+          { path: `EmailLog/EmailLog ${year}-${month}.md`, title: `EmailLog — ${year}-${month}` },
+          notePath,
+          [{ path: 'EmailLog/EmailLog Index.md', title: 'EmailLog' }],
+        );
       }
 
       // Bitemporal supersession pass (DORMANT unless config.bitemporalKg). When

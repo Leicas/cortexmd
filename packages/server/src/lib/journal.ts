@@ -1,5 +1,6 @@
 import { readNote, writeNote, listFiles } from './vault.js';
 import { logger } from './logger.js';
+import { linkFromIndex } from './index-notes.js';
 
 /**
  * Build a formatted timestamp string for journal entries.
@@ -163,6 +164,16 @@ export async function appendJournalEntry(
 
     const newContent = existing.trimEnd() + '\n' + line + '\n';
     await writeNote(filePath, newContent, ifMatch);
+    // A new diary day gets an inbound link from the per-agent index so it is
+    // never an orphan (index notes sit beside, not inside, the agent folder,
+    // so readAgentDiary / listAgents never mistake them for diary days).
+    if (!ifMatch) {
+      await linkFromIndex(
+        { path: `Ops/Agent Diaries/${safeName}.md`, title: `${safeName} — diary` },
+        filePath,
+        [{ path: 'Ops/Agent Diaries/Agent Diaries.md', title: 'Agent Diaries' }],
+      );
+    }
 
     const lineNumber = newContent.trimEnd().split('\n').length;
     return { path: filePath, lineRef: `L${lineNumber}:${timestamp}` };
@@ -191,6 +202,15 @@ export async function appendJournalEntry(
 
   const newContent = existing.trimEnd() + '\n' + line + '\n';
   await writeNote(filePath, newContent, ifMatch);
+  // A new journal day gets an inbound link from its month index.
+  if (!ifMatch) {
+    const month = filePath.match(/^Journal\/(\d{4})\/(\d{2})\//)!;
+    await linkFromIndex(
+      { path: `Journal/${month[1]}/${month[1]}-${month[2]}.md`, title: `Journal — ${month[1]}-${month[2]}` },
+      filePath,
+      [{ path: 'Journal/Journal Index.md', title: 'Journal' }],
+    );
+  }
 
   const lineNumber = newContent.trimEnd().split('\n').length;
   return { path: filePath, lineRef: `L${lineNumber}:${timestamp}` };

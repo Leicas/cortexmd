@@ -1,7 +1,7 @@
 import { config } from '../config.js';
 import { listFiles, readNote } from './vault.js';
 import { listSourceVaultPaths } from './source-vaults.js';
-import { extractWikilinks } from './markdown.js';
+import { extractWikilinks, extractWikilinksWithLines } from './markdown.js';
 import { classifyPath } from './collections.js';
 import { isKgInitialized, kgQueryEntity } from './knowledge-graph.js';
 import { buildLinkLookup, resolveWikilink } from './link-resolver.js';
@@ -279,28 +279,13 @@ export async function findBrokenLinks(): Promise<BrokenLink[]> {
 
   const lookup = buildLinkLookup(allFiles);
   const broken: BrokenLink[] = [];
-  const wikilinkRegex = /\[\[([^\]|]+)(?:\|[^\]]*)?\]\]/g;
 
   for (const filePath of allFiles) {
     try {
       const { content } = await readNote(filePath);
-      const lines = content.split('\n');
-      for (let i = 0; i < lines.length; i++) {
-        const line = lines[i];
-        let match: RegExpExecArray | null;
-        // Reset regex state per line
-        wikilinkRegex.lastIndex = 0;
-        while ((match = wikilinkRegex.exec(line)) !== null) {
-          const target = match[1].trim();
-          if (!target) continue;
-          const resolved = resolveWikilink(target, lookup, filePath);
-          if (resolved === undefined) {
-            broken.push({
-              sourcePath: filePath,
-              brokenTarget: target,
-              line: i + 1,
-            });
-          }
+      for (const { target, line } of extractWikilinksWithLines(content)) {
+        if (resolveWikilink(target, lookup, filePath) === undefined) {
+          broken.push({ sourcePath: filePath, brokenTarget: target, line });
         }
       }
     } catch {

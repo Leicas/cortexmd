@@ -50,6 +50,8 @@
 import { mkdtemp, rm, mkdir } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+// markdown.ts is dependency-free, so a static import does not load config early.
+import { extractWikilinks } from '../lib/markdown.js';
 
 export type RealVaultArm = 'lexical' | 'semantic' | 'ppr';
 
@@ -398,7 +400,7 @@ function buildGoldNotes(
   for (const p of paths) {
     const meta = docMeta.get(p)!;
     const links: string[] = [];
-    for (const target of extractWikilinksLocal(meta.content)) {
+    for (const target of extractWikilinks(meta.content)) {
       const t = resolve(target);
       if (t) links.push(t);
     }
@@ -409,23 +411,6 @@ function buildGoldNotes(
     });
   }
   return notes;
-}
-
-/**
- * Extract `[[wikilink]]` targets from note content. Local copy (search.ts's
- * extractWikilinks is module-private and lib/* is owned elsewhere) — kept in
- * lockstep with the `[[target|alias]]` / `[[target#heading]]` forms the vault
- * uses. Alias/heading suffixes are stripped by the resolver.
- */
-function extractWikilinksLocal(content: string): string[] {
-  const out: string[] = [];
-  const re = /\[\[([^\]]+)\]\]/g;
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(content)) !== null) {
-    const inner = m[1].split('|')[0].trim();
-    if (inner) out.push(inner);
-  }
-  return out;
 }
 
 /** Render the report as a compact per-arm table (JSON is emitted separately). */

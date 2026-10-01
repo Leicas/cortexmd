@@ -796,8 +796,17 @@ app.post('/api/store-memory', apiKeyMiddleware, async (req: Request, res: Respon
     const TIMELESS = new Set(['fact', 'preference']);
     const subdir = TIMELESS.has(category) ? '' : `${year}/${month}/`;
 
-    const firstLine = content.split('\n')[0].trim();
-    const title = (body.title ?? firstLine).slice(0, 80) || 'Auto-captured';
+    const { matchCaptureNoise, isSlugTitle } = await import('./lib/capture-filter.js');
+    const firstLine = content.split('\n')[0].replace(/^#+\s*/, '').trim();
+    // A filename-slug title is a stub: fall back to the content's first line
+    const rawTitle = body.title && !isSlugTitle(body.title) ? body.title : firstLine;
+    const title = rawTitle.slice(0, 80) || 'Auto-captured';
+    // Shell-command stubs and automated emails never become memories
+    const noise = matchCaptureNoise(title);
+    if (noise) {
+      res.json({ stored: false, reason: 'capture_noise', title, pattern: noise.source });
+      return;
+    }
     const slug = title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 60);
     const notePath = `Memories/${category}/${subdir}${today}-${slug}.md`;
 
@@ -932,8 +941,19 @@ app.post('/api/notes-delete', apiKeyMiddleware, async (req: Request, res: Respon
     const { removeFromIndex } = await import('./lib/search.js');
     const { sanitizePath } = await import('./lib/sanitize.js');
 
+    const { rewriteInboundLinks } = await import('./lib/link-rewrite.js');
+
     const notePath = sanitizePath(rawPath);
     try {
+      // Keep inbound [[links]] valid: follow `consolidated_into`, else plain text
+      let consolidatedInto: string | undefined;
+      try {
+        const { readNote } = await import('./lib/vault.js');
+        const { parseFrontmatter } = await import('./lib/frontmatter.js');
+        const { data } = parseFrontmatter((await readNote(notePath)).content);
+        if (typeof data.consolidated_into === 'string') consolidatedInto = data.consolidated_into;
+        await rewriteInboundLinks(notePath, consolidatedInto);
+      } catch { /* unreadable note: delete anyway */ }
       await deleteNote(notePath);
     } catch (err: any) {
       if (err.code === 'ENOENT' || /not found|no such/i.test(err.message || '')) {

@@ -23,6 +23,7 @@ import { updateGraphForNote } from './graph.js';
 import { recordConsolidation } from './metrics.js';
 import { isProtectedFromConsolidation } from './memory-lifecycle.js';
 import { logger } from './logger.js';
+import { rewriteInboundLinks } from './link-rewrite.js';
 
 export interface ColdCluster {
   paths: string[];
@@ -330,6 +331,8 @@ export async function reconcileClusterIntoProject(
   if (destructive) {
     for (const s of newEntries) {
       try {
+        // Inbound links follow the folded body to its new home
+        await rewriteInboundLinks(s.path, projectPath);
         await deleteNote(s.path);
         removeFromIndex(s.path);
         deleted.push(s.path);

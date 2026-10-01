@@ -325,6 +325,17 @@ export const config = {
   autoLinkRelatedMax: parseInt(process.env.AUTO_LINK_RELATED_MAX ?? '3', 10),
   autoSeedKg: process.env.AUTO_SEED_KG !== 'false',
 
+  // Capture-time noise filter (memory_store + /api/store-memory). Drops
+  // memories whose title is a raw shell-command stub or an automated email
+  // (see lib/capture-filter.ts for the built-in patterns).
+  //   CAPTURE_NOISE_FILTER=false      — disable the filter entirely
+  //   CAPTURE_NOISE_PATTERNS='re1|||re2' — extra title regexes, `|||`-separated
+  captureNoiseFilter: process.env.CAPTURE_NOISE_FILTER !== 'false',
+  captureNoisePatterns: (process.env.CAPTURE_NOISE_PATTERNS ?? '')
+    .split('|||')
+    .map((s) => s.trim())
+    .filter(Boolean),
+
   // Memory engine v2: contradiction detection on memory_store. Toggleable for
   // tests/benchmarks. Default true; embeds the new body + same-entity candidates
   // and surfaces any with cosine ≥ 0.85 and zero shared content tokens.

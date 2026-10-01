@@ -1,15 +1,101 @@
+// Target may contain balanced `[...]` groups (e.g. `[[Tasks/[P1] Reply]]`);
+// an optional `|alias` (group 2) follows.
+const WIKILINK_RE = /\[\[((?:[^[\]|]|\[[^[\]|]*\])+)(?:\|([^\]]*))?\]\]/g;
+
+/**
+ * Normalise a raw wiki-link target. Returns undefined when the text is not a
+ * real link but shell/command syntax: bash tests (`[[ -f x ]]`,
+ * `[[ $x == y ]]`), `&&` chains, variable expansions (`$HOME`, `${x}`,
+ * `$(cmd)`) and `; then`-style control flow. A bare `$` or `;` in a note name
+ * (`[[Pricing $99]]`) is kept. A trailing backslash (from table-escaped
+ * `[[a\|alias]]`) is stripped.
+ */
+function cleanWikilinkTarget(raw: string): string | undefined {
+  const target = raw.replace(/\\+$/, '').trim();
+  if (!target) return undefined;
+  if (/^[-!]/.test(target) || /&&/.test(target)) return undefined;
+  if (/\$[A-Za-z_{(]/.test(target) || /;\s*(then|do|done|fi|else)\b/.test(target)) return undefined;
+  // bash `[[ a == b ]]` always pads with spaces; a padded comparison is never a note
+  if (/^\s/.test(raw) && /\s(==|!=|=~|-eq|-ne|-lt|-gt|-le|-ge)\s/.test(raw)) return undefined;
+  return target;
+}
+
+/**
+ * Rewrite every line that is outside fenced code blocks (``` or ~~~; an
+ * unterminated fence runs to end of file, as in CommonMark). `fn` gets the
+ * line with inline code spans removed from view: it is called per non-code
+ * segment and its results are re-joined with the untouched code spans.
+ */
+function mapProseSegments(content: string, fn: (segment: string, line: number) => string): string {
+  const lines = content.split('\n');
+  let fence: string | null = null;
+  for (let i = 0; i < lines.length; i++) {
+    const fenceMatch = lines[i].match(/^\s{0,3}(`{3,}|~{3,})(.*)$/);
+    if (fenceMatch) {
+      const marker = fenceMatch[1];
+      if (fence === null) {
+        fence = marker;
+        continue;
+      }
+      // A closing fence uses the same char, is at least as long, and has no info string
+      if (marker[0] === fence[0] && marker.length >= fence.length && !fenceMatch[2].trim()) {
+        fence = null;
+        continue;
+      }
+    }
+    if (fence !== null) continue;
+    // split() with two groups yields [prose, code, backticks, prose, ...]
+    const parts = lines[i].split(/((`+)[^`]*?\2)/);
+    let out = '';
+    for (let j = 0; j < parts.length; j++) {
+      if (j % 3 === 0) out += fn(parts[j], i + 1);
+      else if (j % 3 === 1) out += parts[j];
+    }
+    lines[i] = out;
+  }
+  return lines.join('\n');
+}
+
+/**
+ * Extract wiki-link targets with 1-based line numbers, ignoring fenced code
+ * blocks and inline code spans.
+ */
+export function extractWikilinksWithLines(content: string): Array<{ target: string; line: number }> {
+  const out: Array<{ target: string; line: number }> = [];
+  mapProseSegments(content, (segment, line) => {
+    for (const match of segment.matchAll(WIKILINK_RE)) {
+      const target = cleanWikilinkTarget(match[1]);
+      if (target) out.push({ target, line });
+    }
+    return segment;
+  });
+  return out;
+}
+
+/**
+ * Rewrite wiki-links outside code. `fn` receives the cleaned target, the alias
+ * (if any) and whether the link used a table-escaped `\|`; it returns the
+ * replacement text, or undefined to leave the link unchanged.
+ */
+export function replaceWikilinks(
+  content: string,
+  fn: (target: string, alias: string | undefined, escapedPipe: boolean) => string | undefined,
+): string {
+  return mapProseSegments(content, (segment) =>
+    segment.replace(WIKILINK_RE, (whole, raw: string, alias: string | undefined) => {
+      const target = cleanWikilinkTarget(raw);
+      if (!target) return whole;
+      return fn(target, alias, /\\$/.test(raw)) ?? whole;
+    }),
+  );
+}
+
 /**
  * Extract all wiki-link targets from markdown content.
  * Returns link targets without aliases.
  */
 export function extractWikilinks(content: string): string[] {
-  const regex = /\[\[([^\]|]+)(?:\|[^\]]*)?\]\]/g;
-  const links: string[] = [];
-  let match: RegExpExecArray | null;
-  while ((match = regex.exec(content)) !== null) {
-    links.push(match[1].trim());
-  }
-  return links;
+  return extractWikilinksWithLines(content).map((l) => l.target);
 }
 
 /**

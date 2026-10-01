@@ -22,7 +22,8 @@ import { kgAddTriple, isKgInitialized } from './knowledge-graph.js';
 import type { DetectedEntity } from './entity-detector.js';
 import type { SimilarNote } from './similar-notes.js';
 import { getDocMeta } from './search.js';
-import { buildLinkLookup, resolveWikilink } from './link-resolver.js';
+import { buildLinkLookup, resolveWikilink, type LinkLookup } from './link-resolver.js';
+import { replaceWikilinks } from './markdown.js';
 
 type EntityType = 'person' | 'project' | 'organization';
 
@@ -42,6 +43,22 @@ export function resolveCanonical(name: string): string {
 }
 
 /**
+ * Resolve an entity surface form to the existing note it should link to: the
+ * registry's `notePath` when indexed, else a unique note named after the
+ * canonical name. Undefined when no such note exists (never link a guess).
+ */
+export function resolveEntityTarget(name: string, lookup: LinkLookup): { target?: string; canonical: string } {
+  const raw = name.trim();
+  const canonical = resolveCanonical(raw).trim() || raw;
+  let registryPath: string | undefined;
+  try { registryPath = findEntity(raw)?.notePath; } catch { /* registry unavailable */ }
+  const target = registryPath && lookup.paths.has(registryPath)
+    ? registryPath
+    : resolveWikilink(canonical, lookup);
+  return { target, canonical };
+}
+
+/**
  * Resolve detected entities to existing, unambiguous path-qualified wiki
  * links. Keep registry name/type/occurrence fresh; omit unresolved links.
  */
@@ -52,14 +69,8 @@ export function autoLinkEntities(
   const seen = new Set<string>();
   const lookup = buildLinkLookup(getDocMeta().keys());
   for (const e of entities) {
-    const raw = e.name.trim();
-    if (!raw) continue;
-    const canonical = resolveCanonical(raw).trim() || raw;
-    let registryPath: string | undefined;
-    try { registryPath = findEntity(raw)?.notePath; } catch { /* registry unavailable */ }
-    const target = registryPath && lookup.paths.has(registryPath)
-      ? registryPath
-      : resolveWikilink(canonical, lookup);
+    if (!e.name.trim()) continue;
+    const { target, canonical } = resolveEntityTarget(e.name, lookup);
     // Do not emit an ambiguous or nonexistent wiki link as though it were
     // connected to an entity note.
     const link = target ? `[[${target}|${canonical}]]` : undefined;
@@ -75,6 +86,41 @@ export function autoLinkEntities(
     }
   }
   return links;
+}
+
+/**
+ * Re-point wiki-links that do not resolve to any note but unambiguously name
+ * one: through the entity registry (`[[Haply]]` → its `notePath`) or a unique
+ * frontmatter title (`[[Email - <subject>]]` → the slugged EmailLog path).
+ * Links that still resolve to nothing are left as written. Never throws.
+ */
+export function repairWikilinks(body: string): string {
+  try {
+    const docMeta = getDocMeta();
+    const lookup = buildLinkLookup(docMeta.keys());
+    let byTitle: Map<string, string | null> | undefined;
+    return replaceWikilinks(body, (target, alias, escapedPipe) => {
+      const [name, heading] = target.split('#');
+      if (resolveWikilink(name, lookup) !== undefined || name.includes('/')) return undefined;
+      let path = resolveEntityTarget(name, lookup).target;
+      if (!path) {
+        if (!byTitle) {
+          byTitle = new Map();
+          for (const [p, meta] of docMeta) {
+            const key = (meta.title ?? '').trim().toLowerCase();
+            if (!key) continue;
+            byTitle.set(key, byTitle.has(key) && byTitle.get(key) !== p ? null : p);
+          }
+        }
+        path = byTitle.get(name.trim().toLowerCase()) ?? undefined;
+      }
+      if (!path) return undefined;
+      const anchor = heading ? `#${heading}` : '';
+      return `[[${path.replace(/\.md$/i, '')}${anchor}${escapedPipe ? '\\|' : '|'}${alias?.trim() || name.trim()}]]`;
+    });
+  } catch {
+    return body;
+  }
 }
 
 /**

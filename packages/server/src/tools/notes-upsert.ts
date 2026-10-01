@@ -12,7 +12,7 @@ import { sanitizePath, sanitizeContent } from '../lib/sanitize.js';
 import { findSimilarNotes } from '../lib/similar-notes.js';
 import { detectEntities } from '../lib/entity-detector.js';
 import { registerEntity } from '../lib/entity-registry.js';
-import { autoLinkEntities, selectAutoRelated, seedEntityKg } from '../lib/auto-link.js';
+import { autoLinkEntities, repairWikilinks, selectAutoRelated, seedEntityKg } from '../lib/auto-link.js';
 import { inferNoteCategory } from '../lib/categorize.js';
 import { captureCodeRefs } from '../lib/code-nav/refs.js';
 import { config } from '../config.js';
@@ -225,7 +225,8 @@ Use wiki-links in content to build the knowledge graph: [[Note Name]] links to a
     },
     wrapToolHandler("notes_upsert", async (params) => {
       const notePath = sanitizePath(params.path as string);
-      const noteContent = sanitizeContent(params.content as string);
+      // Title/registry-named links ([[Email - <subject>]]) → real paths
+      const noteContent = repairWikilinks(sanitizeContent(params.content as string));
       const mergeMode = params.mergeMode as string;
       const sectionTitle = params.sectionTitle as string | undefined;
       const ifMatch = params.ifMatch as string | undefined;

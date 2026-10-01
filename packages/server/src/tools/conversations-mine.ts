@@ -12,6 +12,9 @@ import {
 import { extractMemories } from '../lib/memory-extractor.js';
 import type { ExtractedMemory } from '../lib/memory-extractor.js';
 import { acquireOperation, releaseOperation } from '../lib/operation-mutex.js';
+import { resolveEntityTarget } from '../lib/auto-link.js';
+import { buildLinkLookup } from '../lib/link-resolver.js';
+import { getDocMeta } from '../lib/search.js';
 
 const MAX_CONTENT_LENGTH = 10_000_000; // 10MB
 
@@ -48,21 +51,30 @@ function generateTitle(content: string): string {
 }
 
 /**
- * Convert entities to [[wiki-links]] in the content body.
+ * Convert entities to [[wiki-links]] in the content body. Only entities that
+ * resolve to an existing note are linked (as `[[path|Name]]`); the rest stay
+ * plain text so mining never emits dangling `[[Name]]` links.
  */
-function addWikiLinks(content: string, entities: string[]): string {
+export function addWikiLinks(
+  content: string,
+  entities: string[],
+  resolveTarget: (entity: string) => string | undefined,
+): string {
   let result = content;
   // Sort by length descending to avoid partial replacements
   const sorted = [...entities].sort((a, b) => b.length - a.length);
   for (const entity of sorted) {
-    // Only link the first occurrence, avoid double-linking
+    const target = resolveTarget(entity);
+    if (!target) continue;
+    // Only link the first occurrence; existing [[links]] are matched first and
+    // kept verbatim so a shorter entity never lands inside one.
     const escaped = entity.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const regex = new RegExp(`(?<!\\[\\[)\\b(${escaped})\\b(?!\\]\\])`, 'g');
+    const regex = new RegExp(`(\\[\\[[^\\]]*\\]\\])|\\b(${escaped})\\b`, 'g');
     let replaced = false;
-    result = result.replace(regex, (_match, p1: string) => {
-      if (replaced) return p1;
+    result = result.replace(regex, (match, link: string | undefined, p1: string) => {
+      if (link || replaced) return match;
       replaced = true;
-      return `[[${p1}]]`;
+      return `[[${target.replace(/\.md$/i, '')}|${p1}]]`;
     });
   }
   return result;
@@ -157,6 +169,7 @@ Use dryRun to preview what would be extracted without storing anything.`,
       const storedPaths: string[] = [];
 
       const today = new Date().toISOString().slice(0, 10);
+      const lookup = buildLinkLookup(getDocMeta().keys());
 
       for (const memory of memories) {
         categoryCounts[memory.category] =
@@ -191,7 +204,11 @@ Use dryRun to preview what would be extracted without storing anything.`,
         }
 
         // Build body with wiki-links for entities
-        const bodyContent = addWikiLinks(memory.content, memory.entities);
+        const bodyContent = addWikiLinks(
+          memory.content,
+          memory.entities,
+          (entity) => resolveEntityTarget(entity, lookup).target,
+        );
         const body = `# ${title}\n\n${bodyContent}\n`;
 
         const noteContent = stringifyFrontmatter(frontmatter, body);

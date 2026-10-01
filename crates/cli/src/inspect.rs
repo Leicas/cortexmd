@@ -1504,7 +1504,8 @@ fn recall_item_excluded(item: &Value) -> bool {
         }
     }
     // `/api/recall` does not return tags yet: recognise hook captures by the
-    // shape of their content (binary hook: "[[repo]] — `cmd`\n\n```sh";
+    // shape of their content (binary hook: "[[Projects/<repo>]] — `cmd`\n\n```sh",
+    // older captures "[[repo]] — …";
     // Node hook: "Ran `…` —" / "Made a commit with message:").
     let snippet = snippet_body(item);
     let snippet = snippet.trim_start();
@@ -1940,10 +1941,18 @@ fn store_from_stdin(server: Option<&str>, key: Option<&str>) -> Result<()> {
         let head: String = cmd_first.chars().take(70).collect();
         if repo.is_empty() { head } else { format!("{}: {}", repo, head) }
     };
-    let anchor = if repo.is_empty() {
+    // `[[Projects/<slug>]]` (same slug rule as the server's projectSlug) is the
+    // note diaries and the Node hook link; a bare `[[repo]]` never resolves.
+    let slug: String = repo
+        .to_lowercase()
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+    let anchor = if slug.is_empty() {
         String::new()
     } else {
-        format!("[[{}]] — ", repo)
+        format!("[[Projects/{}]] — ", slug)
     };
     let summary = format!("{}`{}`", anchor, cmd_first);
     let content = if stdout_snip.is_empty() {

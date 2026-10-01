@@ -8,7 +8,7 @@ const { matchCaptureNoise, isSlugTitle } = await import('../capture-filter.js');
 describe('matchCaptureNoise', () => {
   it.each([
     'cortexmd: git add -A',
-    'investigate: cd /srv/app && ls',
+    'investigate: cd /opt/app && ls',
     'homelab: docker compose up -d',
     'systemctl stop nginx',
     'git commit: fix typo',

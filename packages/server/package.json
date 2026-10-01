@@ -12,8 +12,6 @@
     "eval": "tsx src/eval/index.ts",
     "eval:realvault": "tsx src/eval/index.ts --real-vault .realvault-snapshot",
     "snapshot": "node scripts/snapshot-vault.mjs",
-    "hooks:install": "node scripts/install-hooks.mjs",
-    "hooks:uninstall": "node scripts/install-hooks.mjs --uninstall",
     "code:index": "node bin/code-index.mjs",
     "contract:check": "node scripts/contract-check.mjs"
   },

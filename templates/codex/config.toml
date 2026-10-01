@@ -1,0 +1,50 @@
+# where to put this: merge into ~/.codex/config.toml (Codex CLI and the Codex IDE extension
+# read the same file). Only the [mcp_servers.cortexmd] table is required; [features] is for
+# the optional hooks.json template.
+#
+# References (verify against your Codex version — the config surface still moves):
+#   https://developers.openai.com/codex/config-reference        (mcp_servers.*, features, notify)
+#   https://developers.openai.com/codex/mcp                     (adding MCP servers, `codex mcp` CLI)
+#   https://github.com/openai/codex/blob/main/docs/config.md    (source of truth for the keys below)
+
+[mcp_servers.cortexmd]
+# Streamable HTTP endpoint of your cortexmd server (docs/deploy-http.md). For a local
+# stdio build use `command = "cortexmd"` / `args = ["mcp"]` instead of `url`.
+url = "http://localhost:3000/mcp"
+
+# Auth — pick one:
+#   * OAuth (default for HTTP servers): leave `bearer_token_env_var` commented and run
+#     `codex mcp login cortexmd` once; the server supports dynamic client registration.
+#   * Static API key (server started with API_KEY): export CORTEXMD_API_KEY=<key> in the
+#     environment Codex starts from and uncomment the next line.
+# bearer_token_env_var = "CORTEXMD_API_KEY"
+
+# Server boot can take a few seconds on a cold vault (embeddings cache); code-nav and
+# memory_dream calls can be slow on large repos.
+startup_timeout_sec = 20
+tool_timeout_sec = 120
+
+# Keep Codex usable when the server is down (the tools just disappear).
+required = false
+
+# cortexmd exposes ~90 tools. Trimming to the protocol set saves prompt tokens on every
+# turn; everything else stays reachable through `tool_search`. Uncomment to enable.
+# enabled_tools = [
+#   "memory_wakeup", "memory_recall", "memory_store",
+#   "agent_diary_append", "agent_diary_read",
+#   "notes_search", "notes_get", "notes_upsert", "kg_query",
+#   "code_repo_list", "code_file_outline", "code_symbol_search", "code_symbol_get",
+#   "code_symbol_callers", "code_symbol_callees", "code_change_impact", "code_call_chain",
+#   "code_index_repo", "tool_search",
+# ]
+
+[features]
+# Codex hooks are experimental and gated behind this flag. When enabled, Codex reads
+# ~/.codex/hooks.json (see templates/codex/hooks.json). Not available on Windows.
+hooks = true
+
+# NOTE: `notify = ["..."]` (top-level key) runs a program AFTER a turn completes
+# (`agent-turn-complete`) with a JSON payload. It cannot inject context or block the
+# turn, so it is a notification channel, not a hook — keep it for desktop alerts and use
+# hooks.json for the cortexmd protocol.
+# notify = ["python3", "/path/to/notify.py"]

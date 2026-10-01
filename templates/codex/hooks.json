@@ -1,0 +1,68 @@
+{
+  "_where_to_put_this": "Copy to ~/.codex/hooks.json after enabling `[features] hooks = true` in ~/.codex/config.toml (templates/codex/config.toml). EXPERIMENTAL: Codex hooks are behind a feature flag and not available on Windows; the command strings below are POSIX shell. The scripts are the ones `cortexmd init -g` drops in ~/.claude/hooks/cortexmd/ — if you do not use Claude Code, copy crates/cli/hooks/*.mjs (or plugin/cortexmd/scripts/hooks/*.mjs) to ~/.codex/hooks/cortexmd/ and adjust the paths. CORTEXMD_AGENT_CLIENT=Codex makes the diary agentName `Codex (<hostname>)` instead of `Claude Code (<hostname>)`. Events not listed here (PreCompact, Read/Grep advisories, HUD line) have no Codex equivalent. Reference: https://developers.openai.com/codex/hooks and https://github.com/openai/codex/blob/main/docs/hooks.md — verify the event names, the shell tool matcher (`Bash`, `shell` on older builds) and `additionalContextLimit` against your installed version. Remove this key if your Codex version rejects unknown top-level keys.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "CORTEXMD_AGENT_CLIENT=Codex node \"$HOME/.claude/hooks/cortexmd/code_nav_hint_hook.mjs\"",
+            "timeout": 6
+          },
+          {
+            "type": "command",
+            "command": "CORTEXMD_AGENT_CLIENT=Codex node \"$HOME/.claude/hooks/cortexmd/wakeup_directive_hook.mjs\"",
+            "timeout": 6
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "additionalContextLimit": 2500,
+        "hooks": [
+          {
+            "type": "command",
+            "command": "CORTEXMD_AGENT_CLIENT=Codex node \"$HOME/.claude/hooks/cortexmd/userprompt_hook.mjs\"",
+            "timeout": 8
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "^Bash$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cortexmd rewrite --hook",
+            "timeout": 6
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "^Bash$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "CORTEXMD_AGENT_CLIENT=Codex node \"$HOME/.claude/hooks/cortexmd/posttooluse_hook.mjs\"",
+            "timeout": 6
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "CORTEXMD_AGENT_CLIENT=Codex node \"$HOME/.claude/hooks/cortexmd/diary_stop_hook.mjs\"",
+            "timeout": 8
+          }
+        ]
+      }
+    ]
+  }
+}

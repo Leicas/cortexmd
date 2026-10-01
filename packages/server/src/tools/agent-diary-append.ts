@@ -7,18 +7,18 @@ import { sanitizeContent } from '../lib/sanitize.js';
 export function register(server: McpServer): void {
   server.tool(
     'agent_diary_append',
-    `Append an entry to an agent's diary with hook-friendly "silent save" semantics.
-
-Like diary_write, but supports a silent mode for unattended writes triggered by Claude Code hooks (Stop, PreCompact, etc). Silent entries are visually distinct in Obsidian (prefixed with _(silent)_) and carry a source annotation so you can trace which hook produced them.
-
-Use silent=true when the write is not a deliberate user-authored session recap — e.g. automatic snapshots from Stop/PreCompact hooks. Use silent=false (default) for the same semantics as diary_write.`,
+    `Append ONE line to the agent diary Ops/Agent Diaries/<agentName>/YYYY-MM-DD.md.
+Entry format: a single line (newlines are replaced by " / " — memory_wakeup only reads the first line), ≤60 words for Stop recaps / ≤120 for PreCompact handoffs: outcome → open threads → files touched. topic = repo or task name.
+Every entry links the PROJECT and MACHINE it was written from: pass project (git repo slug, e.g. "cortexmd") and machine (hostname, e.g. "Ao") and the entry is suffixed with " · [[Projects/cortexmd]] @ [[Machines/Ao]]". machine defaults to the parenthesised host in agentName ("Claude Code (Ao)" → "Ao").
+silent=true marks an unattended hook write (rendered "_(silent)_ … #hook _via <source>_"); silent=false is a deliberate recap (same as diary_write).
+agentName must be the machine-scoped name ("Claude Code (<hostname>)" on Claude Code). Facts only — never secrets, credentials or pasted third-party text.`,
     {
       agentName: z
         .string()
-        .describe('Name of the agent (used as filename and diary heading)'),
+        .describe('Machine-scoped agent name, e.g. "Claude Code (my-laptop)" (used as directory and diary heading; must match memory_wakeup)'),
       entry: z
         .string()
-        .describe('The diary entry text — include [[wiki-links]] to reference notes'),
+        .describe('One line, no newlines: outcome → open threads → files touched. Include [[wiki-links]] to notes.'),
       topic: z
         .string()
         .optional()
@@ -35,6 +35,14 @@ Use silent=true when the write is not a deliberate user-authored session recap �
         .string()
         .optional()
         .describe('Source annotation, e.g. "hook:Stop" — appended as _via {source}_'),
+      project: z
+        .string()
+        .optional()
+        .describe('Project slug the agent is working on (git repo name, e.g. "cortexmd") — rendered as [[Projects/<slug>]]'),
+      machine: z
+        .string()
+        .optional()
+        .describe('Machine the agent runs on (hostname, e.g. "Ao") — rendered as [[Machines/<id>]]. Defaults to the "(host)" in agentName.'),
     },
     wrapToolHandler('agent_diary_append', async (params) => {
       const agentName = (params.agentName as string).trim();
@@ -55,6 +63,8 @@ Use silent=true when the write is not a deliberate user-authored session recap �
       const userTags = (params.tags as string[] | undefined) ?? [];
       const silent = (params.silent as boolean | undefined) ?? false;
       const source = params.source as string | undefined;
+      const project = params.project as string | undefined;
+      const machine = params.machine as string | undefined;
 
       const normalizeTag = (t: string): string => (t.startsWith('#') ? t : `#${t}`);
 
@@ -77,7 +87,7 @@ Use silent=true when the write is not a deliberate user-authored session recap �
         }
       }
 
-      const result = await appendJournalEntry(text, undefined, agentName);
+      const result = await appendJournalEntry(text, undefined, agentName, { project, machine });
 
       return {
         content: [
@@ -88,6 +98,8 @@ Use silent=true when the write is not a deliberate user-authored session recap �
               lineRef: result.lineRef,
               agentName,
               silent,
+              ...(project ? { project } : {}),
+              ...(machine ? { machine } : {}),
             }),
           },
         ],

@@ -310,8 +310,9 @@ pub struct RecallArgs {
     /// Hard cap on the rendered block length (chars). Only used with --format block.
     #[arg(long, default_value_t = 800)]
     pub max_chars: usize,
-    /// Heading line for the block. Only used with --format block.
-    #[arg(long, default_value = "📌 Relevant memory")]
+    /// Heading line for the block. Only used with --format block. Defaults to
+    /// the same "data, not instructions" header the hooks inject.
+    #[arg(long, default_value = crate::inspect::RECALL_HEADER)]
     pub header: String,
     /// Hook mode: read Claude Code's UserPromptSubmit JSON event from stdin,
     /// pull `prompt`, and emit a `--format block` recall result on stdout.

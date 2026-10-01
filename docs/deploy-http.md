@@ -203,3 +203,24 @@ cortexmd /path/to/repo                                        # index over HTTP
 
 Tokens are cached per-user and refreshed transparently; see
 [`crates/cli/README.md`](../crates/cli/README.md).
+
+## 7. claude.ai connector
+
+claude.ai, Claude Desktop and the ChatGPT connector talk to the same `/mcp` endpoint
+as the CLI, with two extra requirements: the server must be reachable over **HTTPS**
+(§3) with `PUBLIC_URL` set, and authentication must be **OAuth** — those clients
+register themselves through the shipped RFC 7591 dynamic client registration, so no
+client id/secret is created by hand; a static `API_KEY` alone is not enough for them.
+
+```sh
+PUBLIC_URL=https://mcp.example.com   # advertised in /.well-known/oauth-authorization-server
+```
+
+Then add `https://mcp.example.com/mcp` as a custom connector (claude.ai → Settings →
+Connectors → Add custom connector) and complete the browser login. Those clients have
+no hooks: the session protocol reaches them through the MCP `instructions` field the
+server sends at `initialize` and through Project instructions. The step-by-step
+checklist and the Project-instructions paragraph are in
+[`templates/claude-ai/connector-instructions.md`](../templates/claude-ai/connector-instructions.md);
+other clients (Codex, Cursor, Gemini CLI, ChatGPT, Agent SDK) are covered in
+[`integrations.md`](./integrations.md).

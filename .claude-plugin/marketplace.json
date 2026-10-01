@@ -1,14 +1,18 @@
 {
   "name": "cortexmd",
+  "description": "Marketplace for the cortexmd second brain: persistent memory, per-machine agent diaries, Obsidian notes + knowledge graph and cheap code navigation over MCP, with the Claude Code hook template wired in one install.",
   "owner": {
     "name": "Antoine Weill--Duflos",
     "url": "https://github.com/Leicas/cortexmd"
+  },
+  "metadata": {
+    "version": "0.2.0"
   },
   "plugins": [
     {
       "name": "cortexmd",
       "source": "./plugin/cortexmd",
-      "description": "Second-brain MCP server for Claude Code: memory + knowledge graph + code navigation + dream consolidation, with the automation hooks wired in one install."
+      "description": "Second-brain MCP server for Claude Code: memory + per-machine diaries + knowledge graph + code navigation, with the full hook template (wakeup, recall, code-nav, capture, diary on Stop/PreCompact) wired in one install."
     }
   ]
 }

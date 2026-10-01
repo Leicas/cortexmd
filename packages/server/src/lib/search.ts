@@ -98,6 +98,14 @@ interface DocMeta {
   valid_from?: string;
   valid_to?: string;
   superseded_by?: string;
+  /** Frontmatter `project` / `projects` values (raw strings) — used to find a note's project hub. */
+  project?: string[];
+}
+
+/** Normalise frontmatter `project`/`projects` (string | string[]) to a string list. */
+function projectField(data: Record<string, any>): string[] | undefined {
+  const raw = [data.project, data.projects].flat().filter((v) => typeof v === 'string' && v.trim());
+  return raw.length > 0 ? raw.map((v: string) => v.trim()) : undefined;
 }
 
 /** Keep full rebuild and single-note updates on the same metadata contract. */
@@ -122,6 +130,7 @@ function metadataForNote(filePath: string, data: Record<string, any>, body: stri
     valid_from: typeof data.valid_from === 'string' ? data.valid_from : undefined,
     valid_to: typeof data.valid_to === 'string' ? data.valid_to : undefined,
     superseded_by: typeof data.superseded_by === 'string' ? data.superseded_by : undefined,
+    project: projectField(data),
   };
 }
 

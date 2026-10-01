@@ -2310,7 +2310,8 @@ async function main(): Promise<void> {
         await appendJournalEntry(
           `Scheduled dream cycle: ${report.themes.length} themes, ${report.orphans.length} orphans, ` +
           `${report.connectionSuggestions.length} connections, ${report.consolidationGroups.length} consolidation groups. ` +
-          `Decayed: ${report.lifecycle.decayed}, Archived: ${report.lifecycle.archived.length}`,
+          `Decayed: ${report.lifecycle.decayed}, Archived: ${report.lifecycle.archived.length}. ` +
+          `Hygiene: deleted_empty ${report.hygiene.deleted_empty}, archived_noise ${report.hygiene.archived_noise}, linked ${report.hygiene.linked}, projects_rebuilt ${report.hygiene.projects_rebuilt}`,
         );
       },
     });
@@ -2361,7 +2362,8 @@ async function main(): Promise<void> {
         await appendJournalEntry(
           `Idle-edge dream: ${report.themes.length} themes, ${report.orphans.length} orphans, ` +
           `${report.consolidationGroups.length} consolidation groups. ` +
-          `Decayed: ${report.lifecycle.decayed}, Archived: ${report.lifecycle.archived.length}`,
+          `Decayed: ${report.lifecycle.decayed}, Archived: ${report.lifecycle.archived.length}. ` +
+          `Hygiene: deleted_empty ${report.hygiene.deleted_empty}, archived_noise ${report.hygiene.archived_noise}, linked ${report.hygiene.linked}, projects_rebuilt ${report.hygiene.projects_rebuilt}`,
         );
       },
     });

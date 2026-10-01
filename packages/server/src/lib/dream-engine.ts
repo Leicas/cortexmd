@@ -8,7 +8,7 @@
  */
 
 import { getDocMeta, getIndexedNoteCount } from './search.js';
-import { getGraphStats } from './graph.js';
+import { getGraphStats, buildAndCacheGraph } from './graph.js';
 import {
   findConsolidationCandidates,
   decayMemories,
@@ -25,8 +25,14 @@ import {
   reconcileClusterIntoProject,
   type ProjectReconciliation,
 } from './project-reconcile.js';
+import { runOrphanTriage, type OrphanTriageOptions, type OrphanTriageReport } from './orphan-triage.js';
+import { runProjectRebuild, type ProjectRebuildReport } from './project-rebuild.js';
+import { acquireOperation, releaseOperation } from './operation-mutex.js';
 import { logger } from './logger.js';
 import { config } from '../config.js';
+
+/** Operation-mutex name guarding the dream's mutating hygiene phases. */
+export const DREAM_HYGIENE_LOCK = 'dream-hygiene';
 
 /**
  * Tags we skip during theme detection: these are tags the system applies to
@@ -141,6 +147,25 @@ export interface DreamReport {
    */
   projectReconciliations: ProjectReconciliation[];
 
+  /**
+   * Vault hygiene summary: orphan triage (empty → deleted, noise → archived,
+   * valuable → linked) and project-hub reconstruction. In dryRun the counts
+   * are what WOULD happen. skipReason is set when a phase did not run
+   * (disabled, over budget, or another hygiene run holds the lock).
+   */
+  hygiene: {
+    deleted_empty: number;
+    archived_noise: number;
+    linked: number;
+    projects_rebuilt: number;
+    skipped: number;
+    skipReason?: string;
+  };
+  /** Full orphan-triage detail (absent when the phase did not run). */
+  orphanTriage?: OrphanTriageReport;
+  /** Full project-rebuild detail (absent when the phase did not run). */
+  projectRebuild?: ProjectRebuildReport;
+
   /** Always present — even when the LLM was skipped — so consumers get a uniform shape. */
   llm: DreamLlmBlock;
 
@@ -207,6 +232,18 @@ export interface DreamOptions {
   reconcileColdOnly?: boolean;
   /** Minimum cluster size before a project is created/updated (default 2). */
   reconcileMinClusterSize?: number;
+
+  /**
+   * Orphan triage: delete empty orphans, archive capture noise, link valuable
+   * orphans to their project hub / a type index. Default config.dreamOrphanTriage
+   * (DREAM_ORPHAN_TRIAGE, on). Per-action switches/caps come from config and
+   * can be overridden with `triage`.
+   */
+  orphanTriage?: boolean;
+  /** Per-run overrides for the orphan triage (switches, caps, min age …). */
+  triage?: Partial<OrphanTriageOptions>;
+  /** Rebuild project hubs' managed sections. Default config.dreamProjectRebuild (on). */
+  projectRebuild?: boolean;
 
   /**
    * Overall wall-clock budget for the cycle (ms). Once exceeded, the remaining
@@ -593,6 +630,9 @@ export async function runDreamCycle(options: DreamOptions = {}): Promise<DreamRe
     reconcileProjects = true,
     reconcileColdOnly = true,
     reconcileMinClusterSize = 2,
+    orphanTriage = config.dreamOrphanTriage,
+    triage = {},
+    projectRebuild = config.dreamProjectRebuild,
     budgetMs = DREAM_DEFAULT_BUDGET_MS,
   } = options;
 
@@ -758,6 +798,56 @@ export async function runDreamCycle(options: DreamOptions = {}): Promise<DreamRe
     }
   }
 
+  // 6.7. Vault hygiene — orphan triage then project reconstruction. Both
+  // mutate the vault, so they run under an operation lock (a scheduled, idle
+  // and manual dream can overlap) and only within the time budget.
+  const hygiene: DreamReport['hygiene'] = {
+    deleted_empty: 0, archived_noise: 0, linked: 0, projects_rebuilt: 0, skipped: 0,
+  };
+  let orphanTriageReport: OrphanTriageReport | undefined;
+  let projectRebuildReport: ProjectRebuildReport | undefined;
+  if (!orphanTriage && !projectRebuild) {
+    hygiene.skipReason = 'disabled';
+  } else if (overBudget('hygiene')) {
+    hygiene.skipReason = 'over-budget';
+  } else if (!acquireOperation(DREAM_HYGIENE_LOCK)) {
+    hygiene.skipReason = 'already-running';
+    logger.warn('Dream cycle: hygiene skipped — another run holds the lock');
+  } else {
+    try {
+      if (orphanTriage) {
+        try {
+          orphanTriageReport = await runOrphanTriage({ ...triage, dryRun });
+          hygiene.deleted_empty = orphanTriageReport.deleted_empty.length;
+          hygiene.archived_noise = orphanTriageReport.archived_noise.length;
+          hygiene.linked = orphanTriageReport.linked.length;
+          hygiene.skipped += Object.values(orphanTriageReport.skipped).reduce((a, b) => a + b, 0);
+        } catch (err) {
+          logger.warn('Dream cycle: orphan triage failed', { error: String(err) });
+        }
+      }
+      if (projectRebuild && !overBudget('project-rebuild')) {
+        try {
+          projectRebuildReport = await runProjectRebuild({ dryRun });
+          hygiene.projects_rebuilt = projectRebuildReport.projects_rebuilt.length;
+          hygiene.skipped += projectRebuildReport.skipped;
+        } catch (err) {
+          logger.warn('Dream cycle: project rebuild failed', { error: String(err) });
+        }
+      }
+      const mutated = hygiene.deleted_empty + hygiene.archived_noise + hygiene.linked + hygiene.projects_rebuilt > 0;
+      if (mutated && !dryRun) {
+        // Fresh graph so the next run (and recall centrality) sees the new
+        // links — this is also what makes the triage idempotent.
+        try { await buildAndCacheGraph(); } catch (err) {
+          logger.warn('Dream cycle: graph rebuild after hygiene failed', { error: String(err) });
+        }
+      }
+    } finally {
+      releaseOperation(DREAM_HYGIENE_LOCK);
+    }
+  }
+
   // 6.5. ROI demotion; promotion needs evidence and is not automatic.
   let roiDemotions: ROIDemotionCandidate[] = [];
   if (!overBudget('roi-demotion')) {
@@ -803,6 +893,9 @@ export async function runDreamCycle(options: DreamOptions = {}): Promise<DreamRe
     roiDemotions,
     promotions,
     projectReconciliations,
+    hygiene,
+    orphanTriage: orphanTriageReport,
+    projectRebuild: projectRebuildReport,
     llm,
     dryRun,
     budgetExceeded,
@@ -817,6 +910,7 @@ export async function runDreamCycle(options: DreamOptions = {}): Promise<DreamRe
     themes: themes.length,
     orphans: orphans.length,
     autoConsolidated: autoConsolidations.length,
+    hygiene,
     llmRan: llm.ran,
     dryRun,
   });
@@ -1020,12 +1114,26 @@ function generateNarrative(report: DreamReport): string {
 
   if (report.projectReconciliations.length > 0) {
     const created = report.projectReconciliations.filter((r) => r.created).length;
-    const linked = report.projectReconciliations.reduce((n, r) => n + r.deleted.length, 0);
+    const linked = report.projectReconciliations.reduce((n, r) => n + r.sourcePaths.length, 0);
     parts.push(
-      `Consolidated ${linked} cold ${linked === 1 ? 'memory' : 'memories'} into ` +
+      `Linked ${linked} cold ${linked === 1 ? 'memory' : 'memories'} into ` +
       `${report.projectReconciliations.length} project${report.projectReconciliations.length === 1 ? '' : 's'}` +
       `${created > 0 ? ` (${created} new)` : ''}.`,
     );
+  }
+
+  {
+    const h = report.hygiene;
+    const verb = report.dryRun ? 'would ' : '';
+    const bits: string[] = [];
+    if (h.deleted_empty > 0) bits.push(`${verb}delete ${h.deleted_empty} empty`);
+    if (h.archived_noise > 0) bits.push(`${verb}archive ${h.archived_noise} noise`);
+    if (h.linked > 0) bits.push(`${verb}link ${h.linked}`);
+    if (bits.length > 0) parts.push(`Orphan triage: ${bits.join(', ')}.`);
+    if (h.projects_rebuilt > 0) {
+      parts.push(`${report.dryRun ? 'Would rebuild' : 'Rebuilt'} ${h.projects_rebuilt} project note${h.projects_rebuilt === 1 ? '' : 's'}.`);
+    }
+    if (h.skipReason && h.skipReason !== 'disabled') parts.push(`Hygiene skipped: ${h.skipReason}.`);
   }
 
   if (report.consolidationGroups.length > 0) {

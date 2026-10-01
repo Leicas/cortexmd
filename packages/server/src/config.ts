@@ -268,6 +268,42 @@ export const config = {
   idleDreamCheckMs: parseInt(process.env.IDLE_DREAM_CHECK_MS ?? '60000', 10),
   idleDreamBudgetMs: parseInt(process.env.IDLE_DREAM_BUDGET_MS ?? '30000', 10),
 
+  // Dream orphan triage (lib/orphan-triage.ts): every dream run looks at notes
+  // with zero inbound links and deletes EMPTY ones (frontmatter/headings/
+  // template boilerplate only), archives capture NOISE, and links VALUABLE ones
+  // from a project hub's managed "## Related memories" section (or a monthly
+  // type index). Each action has its own switch and per-run cap; notes younger
+  // than the min age, protected paths and record-type notes are never touched.
+  dreamOrphanTriage: process.env.DREAM_ORPHAN_TRIAGE !== 'false',
+  dreamTriageDeleteEmpty: process.env.DREAM_TRIAGE_DELETE_EMPTY !== 'false',
+  dreamTriageArchiveNoise: process.env.DREAM_TRIAGE_ARCHIVE_NOISE !== 'false',
+  dreamTriageLink: process.env.DREAM_TRIAGE_LINK !== 'false',
+  dreamTriageMinAgeDays: parseInt(process.env.DREAM_TRIAGE_MIN_AGE_DAYS ?? '7', 10),
+  dreamTriageMaxDelete: parseInt(process.env.DREAM_TRIAGE_MAX_DELETE ?? '25', 10),
+  dreamTriageMaxArchive: parseInt(process.env.DREAM_TRIAGE_MAX_ARCHIVE ?? '50', 10),
+  dreamTriageMaxLink: parseInt(process.env.DREAM_TRIAGE_MAX_LINK ?? '50', 10),
+  /** Orphans examined per run (perf guard). */
+  dreamTriageMaxScan: parseInt(process.env.DREAM_TRIAGE_MAX_SCAN ?? '2000', 10),
+  /** A noise-titled note with more prose words than this is kept, not archived. */
+  dreamTriageNoiseMaxWords: parseInt(process.env.DREAM_TRIAGE_NOISE_MAX_WORDS ?? '80', 10),
+  /** Extra comma-separated path prefixes the triage never touches (added to the built-ins). */
+  dreamTriageProtectedPrefixes: (process.env.DREAM_TRIAGE_PROTECTED_PREFIXES ?? '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean),
+
+  // Dream project reconstruction (lib/project-rebuild.ts): rebuilds the managed
+  // "## Related memories" section of every Projects/<slug>.md hub, grouped by
+  // type and capped; the rest go to monthly index notes. Folded
+  // "## Consolidated memories" bodies move to a dated archive note.
+  dreamProjectRebuild: process.env.DREAM_PROJECT_REBUILD !== 'false',
+  /** Max memories listed in a hub's managed section; overflow goes to monthly indexes. */
+  dreamProjectMaxLinks: parseInt(process.env.DREAM_PROJECT_MAX_LINKS ?? '50', 10),
+  /** Max project hubs rewritten per run. */
+  dreamProjectMaxRebuilds: parseInt(process.env.DREAM_PROJECT_MAX_REBUILDS ?? '20', 10),
+  /** Max folded source bodies project-reconcile keeps inline; overflow goes to a dated archive note. */
+  dreamProjectFoldCap: parseInt(process.env.DREAM_PROJECT_FOLD_CAP ?? '20', 10),
+
   // Embeddings / semantic search
   enableEmbeddings: process.env.ENABLE_EMBEDDINGS !== 'false',
   embeddingModel: process.env.EMBEDDING_MODEL ?? 'Xenova/all-MiniLM-L6-v2',

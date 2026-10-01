@@ -121,6 +121,8 @@ All off-by-default-friendly; none required for a working local install.
 | `EMBEDDING_MODEL` | (built-in) | Override the embedding model id. |
 | `ENABLE_RERANKER` | `false` | Optional LLM reranker. No default host/model — opt-in only. |
 | `DREAM_SCHEDULE` | (empty) | Cron expression for memory "dream" consolidation. Empty disables it. |
+| `DREAM_ORPHAN_TRIAGE` | `true` | Each dream deletes empty orphan notes, archives capture noise and links valuable orphans to their project hub (per-action switches, caps, min age: see `.env.example`). |
+| `DREAM_PROJECT_REBUILD` | `true` | Each dream rebuilds the managed `## Related memories` block of `Projects/*.md` (capped, grouped, user text preserved). |
 | `DATA_DIR` | per-user data dir | Where the SQLite cache + HNSW index live. |
 | `LOG_LEVEL` | `info` | `debug`, etc. |
 

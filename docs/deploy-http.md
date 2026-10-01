@@ -187,6 +187,8 @@ SOURCE_VAULTS="notes=git+https://git.example.com/me/notes.git#main:Public/**"
 | `EMBEDDING_MODEL` | no | Override embedding model id. |
 | `ENABLE_RERANKER` | no | Optional reranker (default `false`); no default host/model. |
 | `DREAM_SCHEDULE` | no | Cron expression for memory consolidation; empty disables. |
+| `DREAM_ORPHAN_TRIAGE` | no | Dream orphan triage: delete empty, archive noise, link valuable orphans (default `true`; switches/caps in `.env.example`). |
+| `DREAM_PROJECT_REBUILD` | no | Dream rebuild of `Projects/*.md` managed related-memories sections (default `true`). |
 | `LOG_LEVEL` | no | `info` (default), `debug`, … |
 
 See [`packages/server/.env.example`](../packages/server/.env.example) for the

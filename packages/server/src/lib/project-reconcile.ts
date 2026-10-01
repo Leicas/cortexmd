@@ -24,6 +24,9 @@ import { recordConsolidation } from './metrics.js';
 import { isProtectedFromConsolidation } from './memory-lifecycle.js';
 import { logger } from './logger.js';
 import { rewriteInboundLinks } from './link-rewrite.js';
+import { syncHub, listVaultPaths } from './hub-links.js';
+import { moveFoldOverflow } from './project-rebuild.js';
+import { config } from '../config.js';
 
 export interface ColdCluster {
   paths: string[];
@@ -261,45 +264,74 @@ export async function reconcileClusterIntoProject(
     cluster.sharedEntities.forEach((e) => ent.add(e));
     projData.entities = [...ent];
   }
-  const consolidatedFrom = new Set<string>(Array.isArray(projData.consolidated_from) ? projData.consolidated_from : []);
-  // Merge any related/sources frontmatter the originals carried.
-  const mergedRelated = new Set<string>(Array.isArray(projData.related) ? projData.related : []);
-  for (const s of sources) {
-    consolidatedFrom.add(s.path);
-    if (Array.isArray(s.data.related)) for (const r of s.data.related) mergedRelated.add(r);
+  if (destructive) {
+    // Provenance of folded (and then deleted) sources. Non-destructive linking
+    // leaves the originals in place, so it records nothing here — the hub's
+    // managed section is the membership list.
+    const consolidatedFrom = new Set<string>(Array.isArray(projData.consolidated_from) ? projData.consolidated_from : []);
+    const mergedRelated = new Set<string>(Array.isArray(projData.related) ? projData.related : []);
+    for (const s of sources) {
+      consolidatedFrom.add(s.path);
+      if (Array.isArray(s.data.related)) for (const r of s.data.related) mergedRelated.add(r);
+    }
+    projData.consolidated_from = [...consolidatedFrom];
+    if (mergedRelated.size > 0) projData.related = [...mergedRelated];
   }
-  projData.consolidated_from = [...consolidatedFrom];
-  if (mergedRelated.size > 0) projData.related = [...mergedRelated];
 
-  // Marker differs by mode so a note linked non-destructively isn't later
-  // mistaken for one whose body was folded in (and vice-versa).
-  const marker = destructive ? 'src' : 'link';
+  if (!destructive) {
+    // Non-destructive: add the sources to the hub's managed, capped
+    // "## Related memories" block (shared with the orphan triage and the
+    // project rebuild) — never an unbounded appended list.
+    const sourcePaths = sources.map((s) => s.path);
+    const initial = { data: projData, body: projBody };
+    // Plan first: an existing hub that already lists every source is left
+    // byte-identical (no tag/metadata churn).
+    const plan = await syncHub(projectPath, sourcePaths, { dryRun: true, initial });
+    if (!plan || (plan.added.length === 0 && !plan.created)) return null;
+    const res = await syncHub(projectPath, sourcePaths, {
+      dryRun,
+      initial,
+      transform: async (data, body) => {
+        // Existing hub: merge the cluster metadata computed above
+        if (!created) {
+          data.type = 'project';
+          data.tags = projData.tags;
+          if (projData.entities) data.entities = projData.entities;
+        }
+        return { data, body };
+      },
+    });
+    if (!res || (res.added.length === 0 && !res.created)) return null;
+    if (!dryRun) {
+      logger.info('Project reconciliation applied', {
+        projectPath, created: res.created, linked: res.added.length, destructive,
+      });
+    }
+    return {
+      projectPath, created: res.created,
+      sourcePaths: res.added,
+      deleted: [],
+      title: cluster.suggestedTitle, basis: cluster.basis,
+    };
+  }
+
+  const marker = 'src';
   const newEntries = sources.filter((s) => !projBody.includes(`<!-- ${marker}:${s.path} -->`));
   if (newEntries.length === 0 && !created) return null;
 
   if (newEntries.length > 0) {
-    if (destructive) {
-      // Fold each source's FULL body in (lossless) before the originals are
-      // deleted below.
-      const blocks = newEntries.map((s) => {
-        const content = stripLeadingTitle(s.body);
-        return `<!-- src:${s.path} -->\n### ${s.title}\n_was ${s.path}_\n\n${content || '(no body)'}\n`;
-      });
-      const header = '## Consolidated memories';
-      if (projBody.includes(header)) {
-        projBody = projBody.replace(header, `${header}\n\n${blocks.join('\n')}`);
-      } else {
-        projBody = `${projBody.replace(/\s*$/, '')}\n\n${header}\n\n${blocks.join('\n')}`;
-      }
+    // Fold each source's FULL body in (lossless) before the originals are
+    // deleted below. Blocks beyond DREAM_PROJECT_FOLD_CAP move to a dated
+    // archive note after the deletes (see moveFoldOverflow).
+    const blocks = newEntries.map((s) => {
+      const content = stripLeadingTitle(s.body);
+      return `<!-- src:${s.path} -->\n### ${s.title}\n_was ${s.path}_\n\n${content || '(no body)'}\n`;
+    });
+    const header = '## Consolidated memories';
+    if (projBody.includes(header)) {
+      projBody = projBody.replace(header, `${header}\n\n${blocks.join('\n')}`);
     } else {
-      // Non-destructive: link to each source; the originals stay put.
-      const lines = newEntries.map((s) => `- [[${s.path}|${s.title}]] <!-- link:${s.path} -->`);
-      const header = '## Related memories';
-      if (projBody.includes(header)) {
-        projBody = projBody.replace(header, `${header}\n${lines.join('\n')}`);
-      } else {
-        projBody = `${projBody.replace(/\s*$/, '')}\n\n${header}\n${lines.join('\n')}\n`;
-      }
+      projBody = `${projBody.replace(/\s*$/, '')}\n\n${header}\n\n${blocks.join('\n')}`;
     }
   }
 
@@ -342,6 +374,24 @@ export async function reconcileClusterIntoProject(
         });
       }
     }
+  }
+
+  // Keep the hub small: folded blocks beyond the cap move (lossless) to a
+  // dated archive note linked from the managed section.
+  try {
+    const files = await listVaultPaths();
+    await syncHub(projectPath, [], {
+      files,
+      transform: async (data, body) => {
+        const title = typeof data.title === 'string' && data.title ? data.title : cluster.suggestedTitle;
+        const moved = await moveFoldOverflow(projectPath, title, body, config.dreamProjectFoldCap, files, false);
+        return { data, body: moved.body, foldArchives: moved.archivePath ? [moved.archivePath] : [] };
+      },
+    });
+  } catch (err) {
+    logger.warn('reconcileClusterIntoProject: fold cap failed', {
+      projectPath, error: err instanceof Error ? err.message : String(err),
+    });
   }
 
   recordConsolidation(deleted.length);

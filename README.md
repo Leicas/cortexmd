@@ -140,6 +140,8 @@ All off-by-default-friendly; none required for a working local install.
 | `ENABLE_EMBEDDINGS` | `true` | Semantic search. Set `false` for a lexical-only fast path (skips the first-run model download) on low-resource machines. |
 | `ENABLE_RERANKER` | `false` | Optional LLM reranker; no default host/model. |
 | `DREAM_SCHEDULE` | (empty) | Cron expression for memory "dream" consolidation. |
+| `DREAM_ORPHAN_TRIAGE` | `true` | Each dream deletes empty orphan notes, archives capture noise and links valuable orphans to their project hub (per-action switches, caps, min age: see `.env.example`). |
+| `DREAM_PROJECT_REBUILD` | `true` | Each dream rebuilds the managed `## Related memories` block of `Projects/*.md` (capped, grouped, user text preserved). |
 
 See [`packages/server/.env.example`](./packages/server/.env.example) for the
 authoritative list.

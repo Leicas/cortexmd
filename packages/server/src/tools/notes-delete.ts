@@ -1,12 +1,8 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
-import { readNote, deleteNote } from '../lib/vault.js';
-import { parseFrontmatter } from '../lib/frontmatter.js';
-import { removeFromIndex } from '../lib/search.js';
-import { appendJournalEntry } from '../lib/journal.js';
 import { wrapToolHandler } from '../lib/tool-wrapper.js';
 import { sanitizePath } from '../lib/sanitize.js';
-import { rewriteInboundLinks } from '../lib/link-rewrite.js';
+import { deleteNoteWithRelink } from '../lib/note-actions.js';
 
 export function register(server: McpServer): void {
   server.tool(
@@ -46,34 +42,7 @@ Requires confirmation via the confirm parameter to prevent accidental deletion.`
         };
       }
 
-      // Read note metadata before deletion for the audit log
-      let title = notePath;
-      let category: string | undefined;
-      let consolidatedInto: string | undefined;
-      try {
-        const { content } = await readNote(notePath);
-        const { data } = parseFrontmatter(content);
-        title = data.title ?? notePath;
-        category = data.category;
-        if (typeof data.consolidated_into === 'string') consolidatedInto = data.consolidated_into;
-      } catch {
-        // File might not parse — still allow deletion
-      }
-
-      // Re-point inbound links at the consolidated summary (or flatten them to
-      // plain text) so the deletion leaves no dangling [[links]].
-      const relinked = await rewriteInboundLinks(notePath, consolidatedInto);
-
-      // Delete the file
-      await deleteNote(notePath);
-
-      // Remove from all indexes (lexical, semantic, docMeta)
-      removeFromIndex(notePath);
-
-      // Audit trail in journal
-      await appendJournalEntry(
-        `Deleted note: \`${notePath}\` (${title})${category ? ` [${category}]` : ''} — reason: ${reason}`,
-      );
+      const { title, relinked } = await deleteNoteWithRelink(notePath, reason);
 
       return {
         content: [

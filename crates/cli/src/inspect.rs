@@ -310,8 +310,9 @@ fn health_detail_line(h: &Value) -> Option<String> {
     } else if let Some(a) = h.get("activeSessions").and_then(|v| v.as_u64()) {
         parts.push(format!("sessions {} active", a));
     }
-    if let Some(up) = h.get("uptime").and_then(|v| v.as_f64()) {
-        parts.push(format!("uptime {}", fmt_uptime(up)));
+    // /health reports `uptime` in milliseconds (process.uptime() * 1000).
+    if let Some(up_ms) = h.get("uptime").and_then(|v| v.as_f64()) {
+        parts.push(format!("uptime {}", fmt_uptime(up_ms / 1000.0)));
     }
     if let Some(li) = h.get("lastIndexUpdate").filter(|v| v.is_object()) {
         let updated = li.get("updated").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -3432,7 +3433,7 @@ mod proxy_index_tests {
     fn health_detail_line_renders_i1_fields() {
         let h = serde_json::json!({
             "status": "ok", "version": "1.18.0", "commit": "abcdef0123",
-            "uptime": 93784.0,
+            "uptime": 93784000.0,
             "heap": { "usedMb": 123.4, "totalMb": 200.0, "rssMb": 300.0, "limitMb": 1024.0 },
             "sessions": { "active": 3, "persisted": 41, "maxActive": 200, "timeoutMs": 1800000 },
             "lastIndexUpdate": { "at": "2026-10-09T10:00:00Z", "updated": 12, "removed": 1, "ms": 340, "collisions": 0 },

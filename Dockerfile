@@ -12,7 +12,9 @@
 # unset. See docker-compose.yml for an env-driven deployment.
 
 # --- Stage 1: build ---------------------------------------------------------
-FROM node:22-slim AS build
+# Pulled from ECR Public (a mirror of the Docker Hub official image) so CI
+# builds are not subject to Docker Hub's anonymous pull rate limit (429).
+FROM public.ecr.aws/docker/library/node:22-slim AS build
 WORKDIR /app
 
 # Toolchain for native addon compilation.
@@ -31,7 +33,7 @@ COPY packages/server/src ./src
 RUN npm run build
 
 # --- Stage 2: runtime -------------------------------------------------------
-FROM node:22-slim AS runtime
+FROM public.ecr.aws/docker/library/node:22-slim AS runtime
 WORKDIR /app
 # NODE_OPTIONS: without it Node 22 caps the old-space heap at ~792 MB
 # regardless of the container limit, and a vault-sized index + embeddings

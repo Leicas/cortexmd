@@ -1,7 +1,7 @@
 {
   "name": "cortexmd",
   "displayName": "cortexmd",
-  "version": "0.2.0",
+  "version": "1.19.0",
   "description": "Persistent second brain for Claude Code: memory store/recall with temperature decay, per-machine agent diaries, Obsidian notes + knowledge graph, and cheap code navigation (~60 tokens per symbol). Wires the cortexmd MCP server plus the full hook template — session wakeup, per-prompt recall, code-nav hints, high-signal command capture, diary on Stop/PreCompact — in one install.",
   "author": {
     "name": "Antoine Weill--Duflos",

@@ -23,7 +23,7 @@
 
 [package]
 name = "cortexmd-cli"
-version = "0.2.0"
+version = "1.19.0"
 edition = "2021"
 license = "MIT"
 description = "cortexmd CLI: indexes repos, queries the symbol DB, drives session hooks, and bootstraps Claude Code/Codex/Cursor integrations."

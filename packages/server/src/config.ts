@@ -67,7 +67,11 @@ function resolveLocalSecrets(): { apiKey: string; dashboardPassword: string } {
   const persisted = loadLocalSecrets();
   let dirty = false;
 
-  let apiKey = process.env.API_KEY ?? persisted.apiKey;
+  // `||` (not `??`): docker-compose passes `API_KEY: "${API_KEY:-}"`, i.e. an
+  // EMPTY string when unset. With `??` the empty string won, the persisted value
+  // was ignored, and a fresh key + password were generated (and printed) on
+  // every boot. Treat an empty env var as unset.
+  let apiKey = process.env.API_KEY || persisted.apiKey;
   if (!apiKey) {
     apiKey = crypto.randomBytes(32).toString('base64url');
     persisted.apiKey = apiKey;
@@ -75,7 +79,7 @@ function resolveLocalSecrets(): { apiKey: string; dashboardPassword: string } {
     process.stderr.write(`Generated API key: ${apiKey} (set API_KEY to override)\n`);
   }
 
-  let dashboardPassword = process.env.DASHBOARD_PASSWORD ?? persisted.dashboardPassword;
+  let dashboardPassword = process.env.DASHBOARD_PASSWORD || persisted.dashboardPassword;
   if (!dashboardPassword) {
     dashboardPassword = crypto.randomBytes(18).toString('base64url');
     persisted.dashboardPassword = dashboardPassword;
@@ -223,10 +227,17 @@ export const config = {
   maxRequestSizeBytes: MAX_REQUEST_SIZE_BYTES,
   maxNoteSize: MAX_NOTE_SIZE,
   maxPathLength: 1024,
-  // Idle-session sweep. Set to 0 to disable (sessions only die on transport close or DELETE).
-  sessionTimeoutMs: parseInt(process.env.SESSION_TIMEOUT_MS ?? '0', 10),
-  // How long to retain persisted session metadata across restarts (default 30d, matches JWT lifetime).
-  sessionRetentionMs: parseInt(process.env.SESSION_RETENTION_MS ?? '2592000000', 10),
+  // Idle-session sweep (default 30 min). Set to 0 to disable (sessions then only
+  // die on transport close, DELETE, or LRU eviction). Clients that never DELETE
+  // (n8n workflow runs, the CLI) otherwise accumulate transports forever.
+  sessionTimeoutMs: parseInt(process.env.SESSION_TIMEOUT_MS ?? '1800000', 10),
+  // Hard cap on live MCP sessions. When a new session would exceed it, the
+  // least-recently-active session is closed first. 0 disables the cap.
+  maxActiveSessions: parseInt(process.env.MAX_ACTIVE_SESSIONS ?? '200', 10),
+  // How long to retain persisted session metadata across restarts (default 7d).
+  sessionRetentionMs: parseInt(process.env.SESSION_RETENTION_MS ?? '604800000', 10),
+  // Max session records written to sessions.json (newest lastActivity kept).
+  maxPersistedSessions: parseInt(process.env.MAX_PERSISTED_SESSIONS ?? '500', 10),
 
   // OAuth public URL (issuer / redirect base).
   publicUrl: process.env.PUBLIC_URL ?? 'http://localhost:3000',

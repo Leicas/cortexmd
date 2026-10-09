@@ -8,8 +8,17 @@ import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { SERVER_INSTRUCTIONS } from '../server-instructions.js';
 
 describe('SERVER_INSTRUCTIONS', () => {
-  it('stays short enough for clients that truncate instructions', () => {
-    expect(SERVER_INSTRUCTIONS.length).toBeLessThanOrEqual(2000);
+  it('stays within the 900-char budget (hooks carry the rest of the protocol)', () => {
+    expect(SERVER_INSTRUCTIONS.length).toBeLessThanOrEqual(900);
+    // The first 512 chars (what ChatGPT/Codex reliably read) must already name wakeup + store.
+    const head = SERVER_INSTRUCTIONS.slice(0, 512);
+    expect(head).toContain('memory_wakeup');
+    expect(head).toContain('memory_store');
+  });
+
+  it('dropped the code-nav paragraph and the agentName examples (hooks nudge those)', () => {
+    expect(SERVER_INSTRUCTIONS).not.toContain('code_file_outline');
+    expect(SERVER_INSTRUCTIONS).not.toContain('"Claude Code (laptop)"');
   });
 
   it('names the session protocol tools and the one-line diary contract', () => {

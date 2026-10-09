@@ -67,7 +67,7 @@ export function register(server: McpServer): void {
         content: [
           {
             type: "text" as const,
-            text: JSON.stringify(responseData, null, 2),
+            text: JSON.stringify(responseData),
           },
         ],
       };

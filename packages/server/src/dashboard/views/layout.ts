@@ -13,7 +13,7 @@ import { TABS, TAB_GROUP_LABELS, type TabGroup } from './tabs.js';
  * Asset cache-bust token. Bump on deploy (or wire to package version later).
  * Appended as `?v=` to the <link>/<script> URLs in renderPage().
  */
-export const ASSET_VERSION = '7';
+export const ASSET_VERSION = '8';
 
 /** Minimal HTML-escape for the (static) tab labels. */
 function esc(s: string): string {
@@ -67,6 +67,7 @@ export function renderPage(): string {
   <h1>
     <span class="brand-mark" aria-hidden="true">&#9635;</span>
     <span class="brand">cortexmd</span> <span class="h1-sub">Control Panel</span>
+    <span class="h1-sub" id="serverVersion" title="Server version · commit (from /health)" style="font-family:var(--mono);font-size:.75rem;margin-left:.5rem">&mdash;</span>
   </h1>
   <div class="status-group">
     <div class="status-badge" aria-live="polite">

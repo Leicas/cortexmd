@@ -55,7 +55,7 @@ export function register(server: McpServer): void {
       return {
         content: [{
           type: 'text',
-          text: `${report.narrative}\n\n${JSON.stringify(report, null, 2)}`,
+          text: `${report.narrative}\n\n${JSON.stringify(report)}`,
         }],
       };
     })

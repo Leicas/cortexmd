@@ -31,7 +31,7 @@ Returns { error: "not_found" } if no agent file matches.`,
         content: [
           {
             type: 'text' as const,
-            text: JSON.stringify(agent, null, 2),
+            text: JSON.stringify(agent),
           },
         ],
       };

@@ -229,6 +229,51 @@ export function purgeOldSessions(maxAgeDays = 7) {
   return removed;
 }
 
+// ── server reachability (one notice per session) ─────────────────────────
+//
+// When the Rust client cannot reach the server (connection refused, DNS,
+// timeout, 5xx, bad credentials…) every hook used to fail silently and the
+// user never learned that memory was off. `notifyUnreachableOnce` writes a
+// `<session>/unreachable.json` marker and returns ONE additionalContext line
+// the first time; later calls return '' and only refresh the marker's
+// timestamp. `isServerUnreachable` lets the other hooks skip work that would
+// fail anyway (and the UserPromptSubmit hook skip a 4 s spawn per prompt).
+// The marker expires after UNREACHABLE_TTL_MS so a server that comes back is
+// picked up again; a successful call clears it.
+
+export const UNREACHABLE_NOTICE = 'cortexmd server unreachable — memory features off this session';
+const UNREACHABLE_TTL_MS = 10 * 60 * 1000;
+
+export function unreachableMarkerPath(sessionId) {
+  return sessionStatePath('unreachable', sessionId);
+}
+
+export function isServerUnreachable(sessionId, ttlMs = UNREACHABLE_TTL_MS) {
+  if (!sessionId) return false;
+  const st = readState(unreachableMarkerPath(sessionId));
+  if (st.unreachable !== true) return false;
+  const at = Date.parse(st.at ?? '');
+  return Number.isFinite(at) ? Date.now() - at < ttlMs : true;
+}
+
+export function notifyUnreachableOnce(sessionId) {
+  if (!sessionId) return '';
+  const p = unreachableMarkerPath(sessionId);
+  const st = readState(p);
+  if (st.unreachable === true) {
+    // Already notified this session: keep the TTL measuring the LAST failure.
+    writeState(p, { ...st, at: new Date().toISOString() });
+    return '';
+  }
+  writeState(p, { unreachable: true, at: new Date().toISOString(), notified: true });
+  return UNREACHABLE_NOTICE;
+}
+
+export function clearUnreachable(sessionId) {
+  if (!sessionId) return;
+  try { rmSync(unreachableMarkerPath(sessionId), { force: true }); } catch { /* ignore */ }
+}
+
 export const ERROR_LOG = join(stateRoot(), 'hook-errors.log');
 const ERROR_LOG_MAX = 2 * 1024 * 1024;
 
@@ -319,22 +364,104 @@ function runCortexmd(args, opts = {}) {
  * Returns null when the binary is missing OR creds are unresolved OR the
  * call errored. Errors logged best-effort.
  */
-export async function recall({ query, limit = 5, kinds = 'both' }) {
-  const args = [
+// Last `cortexmd` failure seen by recall()/storeMemory(): { stage, status,
+// missing, unreachable, stderr }. `unreachable` = the binary ran but exited
+// non-zero for a reason other than a CLI usage error — i.e. the server (or the
+// credentials) is the problem and memory is effectively off.
+let lastFailure = null;
+export function lastCortexmdFailure() { return lastFailure; }
+
+const ARG_ERROR = /unexpected argument|unrecognized|wasn't expected|unknown (?:option|argument|flag)|invalid value|usage:/i;
+
+function noteFailure(stage, r) {
+  const stderr = String(r.stderr || '').slice(0, 300);
+  lastFailure = {
+    stage,
+    status: r.status,
+    missing: r.missing === true,
+    unreachable: r.missing !== true && r.status !== 0 && !ARG_ERROR.test(stderr),
+    stderr,
+  };
+  return lastFailure;
+}
+
+// ── recall --seen / --project capability (older CLIs reject unknown flags) ──
+//
+// `seen` (paths already injected this session) and `project` (git repo slug)
+// are forwarded to `/api/recall` by `cortexmd recall --seen <path>… --project
+// <slug>`. A CLI predating those flags exits with a clap usage error; we then
+// retry without them, remember that in `<stateRoot>/cli-caps.json` for a day,
+// and fall back to client-side `seen` filtering (always applied anyway).
+
+const CLI_CAPS_PATH = join(stateRoot(), 'cli-caps.json');
+const CLI_CAPS_TTL_MS = 24 * 60 * 60 * 1000;
+export const RECALL_SEEN_MAX = 40;
+
+function cliSupportsRecallFilters() {
+  const caps = readState(CLI_CAPS_PATH);
+  if (caps.recallFilters !== false || caps.bin !== CORTEXMD_BIN) return true;
+  const at = Date.parse(caps.updatedAt ?? '');
+  return Number.isFinite(at) ? Date.now() - at >= CLI_CAPS_TTL_MS : false;
+}
+
+function rememberRecallFilters(supported) {
+  writeState(CLI_CAPS_PATH, { bin: CORTEXMD_BIN, recallFilters: supported });
+}
+
+function recallFilterArgs(seen, project, minImportance) {
+  const out = [];
+  for (const p of (Array.isArray(seen) ? seen : []).slice(-RECALL_SEEN_MAX)) {
+    if (typeof p === 'string' && p) out.push('--seen', p);
+  }
+  if (typeof project === 'string' && project) out.push('--project', project);
+  if (typeof minImportance === 'string' && minImportance) out.push('--min-importance', minImportance);
+  return out;
+}
+
+/** Drop items whose path was already injected this session (client-side fallback). */
+export function excludeSeen(payload, seen) {
+  if (!payload || typeof payload !== 'object' || !Array.isArray(seen) || seen.length === 0) return payload;
+  const set = new Set(seen.filter((p) => typeof p === 'string'));
+  const keep = (list) => (Array.isArray(list) ? list.filter((x) => !(x && set.has(x.path))) : list);
+  return { ...payload, memories: keep(payload.memories), notes: keep(payload.notes) };
+}
+
+/**
+ * Same shape as the server's `/api/recall` response:
+ *   { query, memories: [...], notes: [...] }   (items carry path, title,
+ *   snippet, score; memories also category/temperature; tags when the server
+ *   returns them)
+ * `seen` paths are excluded (server-side when the CLI forwards --seen, and
+ * always client-side); `project` boosts notes linked to [[Projects/<slug>]];
+ * `minImportance` drops low-importance captures from the injected block.
+ * Returns null when the binary is missing OR creds are unresolved OR the
+ * call errored — see lastCortexmdFailure() for why. Errors logged best-effort.
+ */
+export async function recall({ query, limit = 5, kinds = 'both', seen = [], project = '', minImportance = '' }) {
+  const base = [
     'recall',
     '--query', query,
     '--limit', String(limit),
     '--kinds', kinds,
     '--format', 'json',
   ];
-  const r = runCortexmd(args);
-  if (r.missing) return null;
+  const filters = recallFilterArgs(seen, project, minImportance);
+  const useFilters = filters.length > 0 && cliSupportsRecallFilters();
+  let r = runCortexmd(useFilters ? [...base, ...filters] : base);
+  if (useFilters && !r.missing && r.status !== 0 && ARG_ERROR.test(String(r.stderr || ''))) {
+    // Older CLI without --seen/--project: remember and retry bare.
+    rememberRecallFilters(false);
+    r = runCortexmd(base);
+  }
+  if (r.missing) { noteFailure('recall', r); return null; }
   if (r.status !== 0) {
+    noteFailure('recall', r);
     logError('recall:cortexmd', new Error(`status=${r.status} stderr=${(r.stderr || '').slice(0, 200)}`));
     return null;
   }
+  lastFailure = null;
   try {
-    return JSON.parse(r.stdout);
+    return excludeSeen(JSON.parse(r.stdout), seen);
   } catch (err) {
     logError('recall:parse', err);
     return null;

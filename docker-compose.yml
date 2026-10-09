@@ -19,7 +19,11 @@
 #   # API_KEY=                        # auto-generated + printed if unset
 #   # DASHBOARD_PASSWORD=             # auto-generated + printed if unset
 #   ENABLE_EMBEDDINGS=true
-#   DREAM_SCHEDULE=                   # cron; empty disables consolidation
+#   DREAM_SCHEDULE=                   # "on" or a 5-field cron; empty disables consolidation
+#   # NODE_OPTIONS=--max-old-space-size=1024   # V8 heap cap (image default); keep MEM_LIMIT >= cap + 512m
+#   # SESSION_TIMEOUT_MS=1800000      # idle MCP sessions closed after 30 min (0 = never)
+#   # MAX_ACTIVE_SESSIONS=200         # LRU-evict live sessions beyond this
+#   # MAX_PERSISTED_SESSIONS=500      # cap on sessions.json records
 
 services:
   cortexmd:
@@ -46,7 +50,16 @@ services:
       DASHBOARD_PASSWORD: "${DASHBOARD_PASSWORD:-}"
       # Features.
       ENABLE_EMBEDDINGS: "${ENABLE_EMBEDDINGS:-true}"
+      # "on" (nightly 03:00, override with DREAM_CRON) or a 5-field cron
+      # expression; empty disables the scheduled dream + temperature refresh.
       DREAM_SCHEDULE: "${DREAM_SCHEDULE:-}"
+      # --- Memory / session hygiene ------------------------------------------
+      # V8 old-space cap. The image defaults to 1024 MB; keep `mem_limit` below
+      # at least ~512 MB above it for native memory (HNSW index, sqlite, model).
+      NODE_OPTIONS: "${NODE_OPTIONS:---max-old-space-size=1024}"
+      SESSION_TIMEOUT_MS: "${SESSION_TIMEOUT_MS:-1800000}"
+      MAX_ACTIVE_SESSIONS: "${MAX_ACTIVE_SESSIONS:-200}"
+      MAX_PERSISTED_SESSIONS: "${MAX_PERSISTED_SESSIONS:-500}"
       # --- Optional: reranker (off by default; no default host/model) ---------
       # Bring your own inference endpoint; nothing is hardcoded.
       #   ENABLE_RERANKER: "true"
@@ -80,6 +93,8 @@ services:
       - "${STATE_DIR:-./data/state}:/app/data"
     restart: unless-stopped
     stop_grace_period: 15s
+    # Must stay >= NODE_OPTIONS heap cap (1024 MB) + ~512 MB native headroom.
+    mem_limit: "${MEM_LIMIT:-1536m}"
     logging:
       driver: json-file
       options:

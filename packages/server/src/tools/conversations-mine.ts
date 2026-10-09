@@ -250,7 +250,7 @@ Use dryRun to preview what would be extracted without storing anything.`,
         content: [
           {
             type: 'text' as const,
-            text: `${summary}\n\n${JSON.stringify(responseData, null, 2)}`,
+            text: `${summary}\n\n${JSON.stringify(responseData)}`,
           },
         ],
       };

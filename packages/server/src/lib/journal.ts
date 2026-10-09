@@ -226,28 +226,64 @@ export interface DiaryEntry {
   text: string;
 }
 
+export interface ReadDiaryOptions {
+  /**
+   * Keep only entries that link `[[Projects/<slug>]]` (case-insensitive;
+   * aliases and headings tolerated). Falls back to the unfiltered diary when
+   * fewer than 2 entries match, so a brand-new project still gets context.
+   */
+  project?: string;
+}
+
+/** Newest diary files scanned when looking for project-linked entries. */
+const DIARY_PROJECT_SCAN_MAX_FILES = 60;
+/** Below this many project matches the filter is abandoned (see ReadDiaryOptions). */
+const DIARY_PROJECT_MIN_MATCHES = 2;
+
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/** `[[Projects/<slug>]]`, `[[Projects/<slug>|alias]]`, `[[projects/<slug>#h]]`. */
+export function diaryProjectMatcher(project: string): RegExp | null {
+  const slug = projectSlug(sanitizeLinkSegment(project));
+  if (!slug) return null;
+  return new RegExp(`\\[\\[projects/${escapeRegExp(slug)}(?:\\.md)?(?:\\]\\]|\\||#)`, 'i');
+}
+
 /**
- * Read a per-agent diary. Scans all daily diary files for the agent
- * and returns the last N entries across all dates.
+ * Read a per-agent diary. Scans daily diary files for the agent (newest
+ * first) and returns the last N entries across all dates.
+ *
+ * With `lastN`, the N entries returned are the chronologically LAST ones,
+ * in chronological order (oldest → newest), so "showing last 3" reads as a
+ * recap. Without `lastN` the raw file order is kept (files newest-first,
+ * lines in file order) for backward compatibility.
+ *
+ * `projectFiltered` reports whether the project filter was applied.
  */
 export async function readAgentDiary(
   agentName: string,
   lastN?: number,
-): Promise<{ entries: DiaryEntry[]; total: number }> {
+  opts: ReadDiaryOptions = {},
+): Promise<{ entries: DiaryEntry[]; total: number; projectFiltered: boolean }> {
   const agentDir = `Ops/Agent Diaries/${agentName}`;
 
   let files: string[];
   try {
     files = await listFiles(agentDir, '*.md');
   } catch {
-    return { entries: [], total: 0 };
+    return { entries: [], total: 0, projectFiltered: false };
   }
 
   // Sort by filename (date) descending to get most recent first
   files.sort((a, b) => b.localeCompare(a));
 
+  const projectRe = opts.project ? diaryProjectMatcher(opts.project) : null;
   const entries: DiaryEntry[] = [];
+  const matched: DiaryEntry[] = [];
   const entryRegex = /^-\s+\*\*(\d{2}:\d{2})\*\*\s+—\s+(.+)$/gm;
+  let filesRead = 0;
 
   for (const file of files) {
     // Extract date from filename: "2026-04-08.md" -> "2026-04-08"
@@ -264,18 +300,33 @@ export async function readAgentDiary(
       }
 
       entries.push(...fileEntries);
+      if (projectRe) {
+        for (const e of fileEntries) if (projectRe.test(e.text)) matched.push(e);
+      }
     } catch {
       continue;
     }
+    filesRead++;
 
-    // Early exit if we have enough entries
-    if (lastN && entries.length >= lastN) break;
+    // Early exit once we have enough entries (both lists when filtering, so
+    // the fallback has material too); bound the scan when filtering.
+    if (lastN) {
+      if (!projectRe && entries.length >= lastN) break;
+      if (projectRe && matched.length >= lastN && entries.length >= lastN) break;
+    }
+    if (projectRe && filesRead >= DIARY_PROJECT_SCAN_MAX_FILES) break;
   }
 
-  const total = entries.length;
-  const sliced = lastN && lastN > 0 ? entries.slice(0, lastN) : entries;
+  const projectFiltered = !!projectRe && matched.length >= DIARY_PROJECT_MIN_MATCHES;
+  const pool = projectFiltered ? matched : entries;
+  const total = pool.length;
 
-  return { entries: sliced, total };
+  if (lastN && lastN > 0) {
+    // Chronological, then keep the last N (newest).
+    const chrono = [...pool].sort((a, b) => a.date.localeCompare(b.date) || a.time.localeCompare(b.time));
+    return { entries: chrono.slice(-lastN), total, projectFiltered };
+  }
+  return { entries: pool, total, projectFiltered };
 }
 
 /**

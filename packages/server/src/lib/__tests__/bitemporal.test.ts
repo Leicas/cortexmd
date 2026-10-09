@@ -30,6 +30,7 @@ vi.mock('../search.js', () => ({ indexNote }));
 const {
   extractFacts,
   withinWindow,
+  toIso,
   SINGLE_VALUED,
   runSupersessionPass,
   runSupersessionForNotes,
@@ -107,6 +108,48 @@ describe('bitemporal — withinWindow (half-open [valid_from, valid_to))', () =>
     expect(withinWindow('2026-01-10', '2026-02-01', '2026-01-15T09:30:00Z')).toBe(true);
     // Query instant on the closing day → excluded.
     expect(withinWindow('2026-01-10', '2026-02-01', '2026-02-01T09:30:00Z')).toBe(false);
+  });
+
+  // js-yaml parses an unquoted `created: 2026-05-30T00:00:00.000Z` as a Date.
+  // Before coercion this crashed memory_recall with "a.slice is not a function".
+  it('accepts a Date as valid_from (unquoted YAML timestamp) without throwing', () => {
+    const vf = new Date('2026-05-30T00:00:00.000Z');
+    expect(() => withinWindow(vf, undefined, '2026-06-01T00:00:00Z')).not.toThrow();
+    expect(withinWindow(vf, undefined, '2026-06-01T00:00:00Z')).toBe(true);
+    expect(withinWindow(vf, undefined, '2026-05-01T00:00:00Z')).toBe(false);
+    // Exactly at the Date instant → included (half-open lower bound).
+    expect(withinWindow(vf, undefined, '2026-05-30T00:00:00.000Z')).toBe(true);
+  });
+
+  it('accepts a Date as valid_to and as asOf', () => {
+    const vt = new Date('2026-02-01T00:00:00.000Z');
+    expect(withinWindow('2026-01-01', vt, '2026-01-31T23:59:59Z')).toBe(true);
+    expect(withinWindow('2026-01-01', vt, '2026-02-01T00:00:00Z')).toBe(false);
+    expect(withinWindow(new Date('2026-01-01T00:00:00Z'), vt, new Date('2026-01-15T00:00:00Z'))).toBe(true);
+    expect(withinWindow(new Date('2026-01-01T00:00:00Z'), vt, new Date('2026-03-15T00:00:00Z'))).toBe(false);
+  });
+
+  it('treats an invalid Date bound as unset', () => {
+    expect(withinWindow(new Date('not a date'), undefined, '2026-02-01')).toBe(true);
+    expect(toIso(new Date('not a date'))).toBeUndefined();
+  });
+});
+
+describe('bitemporal — toIso', () => {
+  it('converts a Date to a full ISO instant', () => {
+    expect(toIso(new Date('2026-05-30T00:00:00.000Z'))).toBe('2026-05-30T00:00:00.000Z');
+  });
+
+  it('trims strings and maps empty / nullish to undefined', () => {
+    expect(toIso('  2026-01-10 ')).toBe('2026-01-10');
+    expect(toIso('')).toBeUndefined();
+    expect(toIso('   ')).toBeUndefined();
+    expect(toIso(undefined)).toBeUndefined();
+    expect(toIso(null)).toBeUndefined();
+  });
+
+  it('stringifies non-string scalars (a bare-numeric YAML value) instead of throwing', () => {
+    expect(toIso(2026)).toBe('2026');
   });
 });
 

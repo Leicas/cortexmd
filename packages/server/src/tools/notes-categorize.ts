@@ -299,7 +299,7 @@ Typical usage:
         content: [
           {
             type: 'text',
-            text: `${summary}\n\n${JSON.stringify(result, null, 2)}`,
+            text: `${summary}\n\n${JSON.stringify(result)}`,
           },
         ],
       };

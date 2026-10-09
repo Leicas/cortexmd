@@ -25,6 +25,10 @@ export interface IndexRequestRow {
   requested_at: number;
   claimed_at: number | null;
   completed_at: number | null;
+  /** Times this request has been served to a daemon (claim + reclaims). */
+  attempts: number;
+  /** Last error reported by the daemon (via `failIndexRequest`), if any. */
+  last_error: string | null;
 }
 
 /** A machine that owns a checkout of a repo, with index freshness metadata. */
@@ -115,12 +119,26 @@ export function enqueueIndexRequestsForRepo(
 export const RECLAIM_AFTER_MS = 5 * 60 * 1000;
 
 /**
+ * Maximum number of times a request is served (initial claim + reclaims)
+ * before it is flipped to `status='failed'` and never re-served. Without a cap,
+ * a request whose checkout is permanently broken (path gone, parser crash) was
+ * reclaimed and re-served every `RECLAIM_AFTER_MS` forever. A 'failed' row is
+ * outside the partial unique index on (repo_id, machine_id), so a later stale
+ * query can enqueue a fresh row and the loop gets another MAX attempts.
+ */
+export const MAX_INDEX_ATTEMPTS = 3;
+
+/**
  * Atomically claim up to `limit` requests for `machineId`, flipping them to
  * 'claimed'. Returns the claimed rows so the caller (the owning daemon) can act
  * on them. Picks up both fresh 'pending' rows and stale 'claimed' rows (claimed
  * longer ago than `reclaimAfterMs`) so an abandoned claim self-heals on a later
  * poll. Claiming — rather than deleting — keeps the request visible for
  * observability and lets `completeIndexRequests` mark the lifecycle end.
+ *
+ * Every claim/reclaim increments `attempts`. A stale 'claimed' row that has
+ * already been served `MAX_INDEX_ATTEMPTS` times is flipped to 'failed' instead
+ * of being re-served (I-3).
  */
 export function claimPendingRequests(
   machineId: string,
@@ -131,6 +149,21 @@ export function claimPendingRequests(
 ): IndexRequestRow[] {
   const staleBefore = nowMs - reclaimAfterMs;
   const claim = db.transaction((): IndexRequestRow[] => {
+    // Exhausted stale claims → failed (never re-served).
+    const exhausted = db
+      .prepare(
+        `UPDATE index_requests
+            SET status='failed', completed_at=?,
+                last_error=COALESCE(last_error, 'exhausted ' || attempts || ' attempts without completion')
+          WHERE machine_id=? AND status='claimed' AND claimed_at < ? AND attempts >= ?`,
+      )
+      .run(nowMs, machineId, staleBefore, MAX_INDEX_ATTEMPTS);
+    if (exhausted.changes > 0) {
+      logger.warn('Proxy-index requests exhausted their attempts', {
+        machineId, count: exhausted.changes, maxAttempts: MAX_INDEX_ATTEMPTS,
+      });
+    }
+
     const claimable = db
       .prepare(
         `SELECT * FROM index_requests
@@ -141,11 +174,68 @@ export function claimPendingRequests(
       )
       .all(machineId, staleBefore, limit) as IndexRequestRow[];
     if (claimable.length === 0) return [];
-    const mark = db.prepare(`UPDATE index_requests SET status='claimed', claimed_at=? WHERE id=?`);
+    const mark = db.prepare(
+      `UPDATE index_requests SET status='claimed', claimed_at=?, attempts=attempts+1 WHERE id=?`,
+    );
     for (const r of claimable) mark.run(nowMs, r.id);
-    return claimable.map((r) => ({ ...r, status: 'claimed', claimed_at: nowMs }));
+    return claimable.map((r) => ({
+      ...r,
+      status: 'claimed',
+      claimed_at: nowMs,
+      attempts: (r.attempts ?? 0) + 1,
+    }));
   });
   return claim();
+}
+
+/** Result of {@link failIndexRequest}. */
+export interface FailIndexRequestResult {
+  id: number;
+  attempts: number;
+  /** 'claimed' when the request will be re-served after the reclaim window; 'failed' when exhausted. */
+  status: 'claimed' | 'failed';
+}
+
+/**
+ * Record a daemon-side failure for the outstanding request matching
+ * (`machine_id`, `abs_path`) — I-3. Stores `last_error`; if the row has already
+ * been served `MAX_INDEX_ATTEMPTS` times it is flipped to 'failed' right away
+ * (no need to wait for the reclaim window to expire), otherwise it stays
+ * 'claimed' and becomes claimable again after `RECLAIM_AFTER_MS`. Does NOT
+ * increment `attempts` (the claim that served the request already did).
+ * Returns `null` when there is no outstanding (pending|claimed) row.
+ */
+export function failIndexRequest(
+  req: { abs_path: string; machine_id: string },
+  error: string,
+  nowMs: number,
+  db: BetterSqlite3.Database = getCodeDb(),
+): FailIndexRequestResult | null {
+  const message = String(error ?? '').slice(0, 2000);
+  const tx = db.transaction((): FailIndexRequestResult | null => {
+    const row = db
+      .prepare(
+        `SELECT id, attempts FROM index_requests
+          WHERE machine_id=? AND abs_path=? AND status IN ('pending','claimed')
+          ORDER BY requested_at DESC
+          LIMIT 1`,
+      )
+      .get(req.machine_id, req.abs_path) as { id: number; attempts: number } | undefined;
+    if (!row) return null;
+    const attempts = row.attempts ?? 0;
+    if (attempts >= MAX_INDEX_ATTEMPTS) {
+      db.prepare(
+        `UPDATE index_requests SET status='failed', last_error=?, completed_at=? WHERE id=?`,
+      ).run(message, nowMs, row.id);
+      logger.warn('Proxy-index request failed permanently', {
+        id: row.id, machineId: req.machine_id, absPath: req.abs_path, attempts, error: message,
+      });
+      return { id: row.id, attempts, status: 'failed' };
+    }
+    db.prepare(`UPDATE index_requests SET last_error=? WHERE id=?`).run(message, row.id);
+    return { id: row.id, attempts, status: 'claimed' };
+  });
+  return tx();
 }
 
 /**

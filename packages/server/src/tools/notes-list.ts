@@ -259,7 +259,7 @@ export function register(server: McpServer): void {
         content: [
           {
             type: "text",
-            text: `${summary}\n\n${JSON.stringify({ notes, total, offset, limit, hasMore }, null, 2)}`,
+            text: `${summary}\n\n${JSON.stringify({ notes, total, offset, limit, hasMore })}`,
           },
         ],
       };

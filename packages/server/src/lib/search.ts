@@ -12,7 +12,7 @@ import { isRerankerEnabled, rerankResults } from './reranker.js';
 import { isPathIndexable, sourceNameForVault } from './index-allowlist.js';
 import { getVault, pruneStaleVaultTransports } from './vault/registry.js';
 import { listSourceVaultPaths } from './source-vaults.js';
-import { withinWindow } from './bitemporal.js';
+import { withinWindow, toIso } from './bitemporal.js';
 import { extractWikilinks } from './markdown.js';
 import { buildLinkLookup, resolveWikilink } from './link-resolver.js';
 import { detectEntities } from './entity-detector.js';
@@ -100,10 +100,29 @@ interface DocMeta {
   superseded_by?: string;
 }
 
+/**
+ * Coerce a frontmatter date-ish value to a `YYYY-MM-DD` day string. js-yaml
+ * parses unquoted timestamps (`created: 2026-05-30T00:00:00.000Z`) as `Date`
+ * objects; `DocMeta.date` is compared lexicographically against `dateFrom` /
+ * `dateTo` and fed to the as-of filter, so it must always be a string.
+ * Strings are trimmed as-is (a note may legitimately carry a full instant);
+ * anything else → `undefined`.
+ */
+function toIsoDay(v: unknown): string | undefined {
+  if (v instanceof Date) {
+    return Number.isNaN(v.getTime()) ? undefined : v.toISOString().slice(0, 10);
+  }
+  if (typeof v === 'string') {
+    const s = v.trim();
+    return s.length > 0 ? s : undefined;
+  }
+  return undefined;
+}
+
 /** Keep full rebuild and single-note updates on the same metadata contract. */
 function metadataForNote(filePath: string, data: Record<string, any>, body: string): DocMeta {
   return {
-    date: data.date ?? data.created ?? undefined,
+    date: toIsoDay(data.date ?? data.created),
     tags: (Array.isArray(data.tags) ? data.tags : []).map(String),
     content: body,
     title: data.title ?? filePath.replace(/\.md$/, '').split('/').pop() ?? filePath,
@@ -112,15 +131,15 @@ function metadataForNote(filePath: string, data: Record<string, any>, body: stri
     temperature: typeof data.temperature === 'string' ? data.temperature : undefined,
     heat_score: typeof data.heat_score === 'number' ? data.heat_score : undefined,
     importance: typeof data.importance === 'string' ? data.importance : undefined,
-    last_accessed: typeof data.last_accessed === 'string' ? data.last_accessed : undefined,
+    last_accessed: toIso(data.last_accessed),
     archived: typeof data.archived === 'boolean' ? data.archived : undefined,
     consolidated_into: typeof data.consolidated_into === 'string' ? data.consolidated_into : undefined,
     collection: classifyPath(filePath),
     related: Array.isArray(data.related) ? data.related as string[] : undefined,
     validity_alpha: typeof data.validity_alpha === 'number' ? data.validity_alpha : undefined,
     validity_beta: typeof data.validity_beta === 'number' ? data.validity_beta : undefined,
-    valid_from: typeof data.valid_from === 'string' ? data.valid_from : undefined,
-    valid_to: typeof data.valid_to === 'string' ? data.valid_to : undefined,
+    valid_from: toIso(data.valid_from),
+    valid_to: toIso(data.valid_to),
     superseded_by: typeof data.superseded_by === 'string' ? data.superseded_by : undefined,
   };
 }
@@ -141,9 +160,40 @@ const docMeta = new Map<string, DocMeta>();
 let indexedNoteCount = 0;
 let lastIndexHealth: IndexHealthEntry[] = [];
 
-// Track file modification times for incremental rebuilds
+// Track file modification times for incremental rebuilds. Keyed by
+// `${vault}\0${relPath}` (see `mtimeKey`) — NOT bare relPath — because the brain
+// vault and source vaults share relative paths (e.g. `Daily/2026-01-01.md`), and
+// a bare-relPath key made each rebuild see the "other" vault's mtime as a change
+// and re-index the same ~1200 files every tick forever.
 const fileMtimes = new Map<string, number>();
 let isFirstBuild = true;
+
+/** Composite key for per-vault file state (mtimes / seen-set). */
+function mtimeKey(vault: string, relPath: string): string {
+  return `${vault}\u0000${relPath}`;
+}
+
+/**
+ * Summary of the most recent `rebuildIndex()` run (I-2 — consumed by /health).
+ * `null` until the first rebuild completes. `collisions` counts relPaths that
+ * exist in more than one vault; only the first vault (in `readVaults()` order)
+ * is indexed for such a path.
+ */
+export interface LastIndexUpdate {
+  /** ISO timestamp of when the rebuild finished. */
+  at: string;
+  updated: number;
+  removed: number;
+  /** Wall-clock duration of the rebuild in milliseconds. */
+  ms: number;
+  collisions: number;
+}
+let lastIndexUpdate: LastIndexUpdate | null = null;
+
+/** Most recent rebuild summary, or `null` before the first rebuild. */
+export function getLastIndexUpdate(): LastIndexUpdate | null {
+  return lastIndexUpdate;
+}
 
 export function getIndexedNoteCount(): number {
   return indexedNoteCount;
@@ -176,6 +226,7 @@ function createIndex(): MiniSearch {
  * only files whose mtime has changed (or new/deleted files) are re-indexed.
  */
 export async function rebuildIndex(): Promise<void> {
+  const startedAt = Date.now();
   if (isFirstBuild) {
     // First build: full scan
     miniSearch = createIndex();
@@ -189,8 +240,17 @@ export async function rebuildIndex(): Promise<void> {
   let updatedCount = 0;
   let removedCount = 0;
 
-  // Track which files we see this scan (to detect deletions)
+  // Track which (vault, relPath) pairs we see this scan (to prune `fileMtimes`).
   const seenFiles = new Set<string>();
+  // relPath → vault that claimed it this scan. `docMeta` / MiniSearch stay keyed
+  // by bare relPath (every consumer — readNote, graph, embeddings, co-recall —
+  // depends on that, and `resolveSafePathForRead` resolves first-vault-wins in
+  // the same vault order), so a relPath present in several vaults is indexed
+  // ONCE, from the first vault that lists it. Later vaults' copies are counted
+  // as collisions and skipped instead of ping-ponging the index every tick.
+  const claimedBy = new Map<string, string>();
+  let collisions = 0;
+  const collisionSamples: string[] = [];
 
   // Dynamic vault set: the brain vault plus the runtime-merged source vaults
   // (env + persisted). Using this rather than the frozen `config.allVaults`
@@ -249,7 +309,18 @@ export async function rebuildIndex(): Promise<void> {
     const otherErrors: Array<{ path: string; error: string }> = [];
 
     for (const relPath of files) {
-      seenFiles.add(relPath);
+      // Cross-vault collision: an earlier vault in this scan already owns this
+      // relPath. Skip it entirely (no stat, no read) so it can neither churn the
+      // index nor shadow the first vault's copy.
+      const owner = claimedBy.get(relPath);
+      if (owner !== undefined && owner !== vault) {
+        collisions++;
+        if (collisionSamples.length < 5) collisionSamples.push(`${relPath} (${sourceName ?? 'brain'} ← ${sourceNameForVault(owner) ?? 'brain'})`);
+        continue;
+      }
+      claimedBy.set(relPath, vault);
+      const key = mtimeKey(vault, relPath);
+      seenFiles.add(key);
 
       try {
         const absPath = path.resolve(vault, relPath);
@@ -262,11 +333,11 @@ export async function rebuildIndex(): Promise<void> {
               : await stat(absPath);
             if (fileStat) {
               const mtime = fileStat.mtimeMs;
-              const prevMtime = fileMtimes.get(relPath);
+              const prevMtime = fileMtimes.get(key);
               if (prevMtime !== undefined && mtime === prevMtime) {
                 continue; // file unchanged, skip
               }
-              fileMtimes.set(relPath, mtime);
+              fileMtimes.set(key, mtime);
             }
           } catch {
             // If stat fails, re-index the file anyway
@@ -283,7 +354,6 @@ export async function rebuildIndex(): Promise<void> {
         const tags: string[] = (Array.isArray(data.tags) ? data.tags : []).map(String);
         const title =
           data.title ?? relPath.replace(/\.md$/, '').split('/').pop() ?? relPath;
-        const date = data.date ?? data.created ?? undefined;
 
         // On incremental rebuild, remove old entry before re-adding
         if (!isFirstBuild && docMeta.has(relPath)) {
@@ -306,7 +376,7 @@ export async function rebuildIndex(): Promise<void> {
             const fileStat = transport
               ? await transport.stat(relPath)
               : await stat(absPath);
-            if (fileStat) fileMtimes.set(relPath, fileStat.mtimeMs);
+            if (fileStat) fileMtimes.set(key, fileStat.mtimeMs);
           } catch { /* non-critical */ }
         } else {
           updatedCount++;
@@ -358,33 +428,61 @@ export async function rebuildIndex(): Promise<void> {
     });
   }
 
-  // Remove deleted files from the index (only on incremental rebuilds)
+  // Remove deleted files from the index (only on incremental rebuilds). A doc
+  // is gone when NO vault claimed its relPath this scan; per-vault mtime state
+  // is pruned for every (vault, relPath) pair that was not seen.
   if (!isFirstBuild) {
     for (const existingPath of [...docMeta.keys()]) {
-      if (!seenFiles.has(existingPath)) {
+      if (!claimedBy.has(existingPath)) {
         try { miniSearch.discard(existingPath); } catch { /* may not exist */ }
         docMeta.delete(existingPath);
-        fileMtimes.delete(existingPath);
         removeFromVectorIndex(existingPath);
         removedCount++;
       }
     }
+    for (const key of [...fileMtimes.keys()]) {
+      if (!seenFiles.has(key)) fileMtimes.delete(key);
+    }
     fileCount = docMeta.size;
   }
 
+  const wasFirstBuild = isFirstBuild;
   isFirstBuild = false;
   indexedNoteCount = fileCount;
   setIndexedNotes(fileCount);
   recordIndexRebuild();
 
-  if (updatedCount > 0 || removedCount > 0) {
+  const ms = Date.now() - startedAt;
+  const prevCollisions = lastIndexUpdate?.collisions ?? 0;
+  lastIndexUpdate = {
+    at: new Date().toISOString(),
+    updated: updatedCount,
+    removed: removedCount,
+    ms,
+    collisions,
+  };
+
+  // Log collisions once per rebuild: loudly on the first build / when the count
+  // changes, quietly (debug) when it is the same steady-state figure every tick.
+  if (collisions > 0) {
+    const payload = { count: collisions, samples: collisionSamples };
+    if (wasFirstBuild) {
+      logger.warn('Cross-vault path collisions: only the first vault\'s copy is indexed', payload);
+    } else if (collisions !== prevCollisions) {
+      logger.info('Cross-vault path collisions changed', payload);
+    } else {
+      logger.debug('Cross-vault path collisions unchanged', payload);
+    }
+  }
+
+  if (wasFirstBuild) {
+    logger.info('Search index rebuilt', { indexedNotes: fileCount, ms, collisions });
+  } else if (updatedCount > 0 || removedCount > 0) {
     logger.info('Search index updated (incremental)', {
-      indexedNotes: fileCount, updated: updatedCount, removed: removedCount,
+      indexedNotes: fileCount, updated: updatedCount, removed: removedCount, ms, collisions,
     });
-  } else if (updatedCount === 0 && removedCount === 0 && !isFirstBuild) {
-    logger.debug('Search index unchanged');
   } else {
-    logger.info('Search index rebuilt', { indexedNotes: fileCount });
+    logger.debug('Search index unchanged', { ms });
   }
 }
 
@@ -422,7 +520,6 @@ export async function indexNote(filePath: string): Promise<void> {
   const tags: string[] = (Array.isArray(data.tags) ? data.tags : []).map(String);
   const title =
     data.title ?? filePath.replace(/\.md$/, '').split('/').pop() ?? filePath;
-  const date = data.date ?? data.created ?? undefined;
 
   // Remove old entry if it exists
   try {
@@ -561,10 +658,18 @@ export function searchNotes(
  * fused path. NO-OP contract: callers only invoke this when `asOf` is set, so
  * with no `asOf` recall is byte-identical to today.
  */
-function filterByAsOf<T extends { path: string }>(results: T[], asOf: string): T[] {
+function filterByAsOf<T extends { path: string }>(
+  results: T[],
+  asOf: string,
+  pre: { type?: string; category?: string } = {},
+): T[] {
   return results.filter((r) => {
     const meta = docMeta.get(r.path);
     if (!meta) return true; // no metadata → don't drop (fail-open, matches non-temporal behavior)
+    // Cheap type/category pre-filter first so the window check only runs on
+    // candidates that can survive the post-filters anyway.
+    if (pre.type && meta.type !== pre.type) return false;
+    if (pre.category && meta.category !== pre.category) return false;
     const vf = meta.valid_from ?? meta.date;
     return withinWindow(vf, meta.valid_to, asOf);
   });
@@ -786,6 +891,10 @@ function fuseLexicalWithGraph(
     const meta = docMeta.get(fusedPath);
     if (!meta) continue;
     if (excludeArchived && meta.archived === true) continue;
+    // Cheap type/category checks BEFORE the as-of window so the (string-slice)
+    // window test only runs on candidates that can survive the post-filters.
+    if (type && meta.type !== type) continue;
+    if (category && meta.category !== category) continue;
     if (opts.asOf) {
       const vf = meta.valid_from ?? meta.date;
       if (!withinWindow(vf, meta.valid_to, opts.asOf)) continue;
@@ -799,8 +908,6 @@ function fuseLexicalWithGraph(
     } else if (dateFrom || dateTo) {
       continue;
     }
-    if (type && meta.type !== type) continue;
-    if (category && meta.category !== category) continue;
     if (temperature && meta.temperature !== temperature) continue;
     if (minHeatScore !== undefined && (meta.heat_score === undefined || meta.heat_score < minHeatScore)) continue;
     if (importance && meta.importance !== importance) continue;
@@ -853,7 +960,7 @@ export async function hybridSearch(
   // lexical list up front so the lexical-only early-return branches below are
   // filtered too — that is the branch the default (embeddings-off) eval hits.
   if (opts.asOf) {
-    lexicalResults = filterByAsOf(lexicalResults, opts.asOf);
+    lexicalResults = filterByAsOf(lexicalResults, opts.asOf, { type: opts.type, category: opts.category });
   }
 
   // RRF constant, shared by every arm (lexical, semantic, graph).
@@ -951,6 +1058,10 @@ export async function hybridSearch(
 
     // Apply same filters as searchNotes
     if (excludeArchived && meta.archived === true) continue;
+    // Cheap type/category checks first (most recall calls pass type='memory'),
+    // so the as-of window test below only runs on surviving candidates.
+    if (type && meta.type !== type) continue;
+    if (category && meta.category !== category) continue;
     // Bitemporal as-of suppression on the fused path (semantic results can
     // reintroduce a note the lexical pre-filter dropped). ONLY when asOf set.
     if (opts.asOf) {
@@ -966,8 +1077,6 @@ export async function hybridSearch(
     } else if (dateFrom || dateTo) {
       continue;
     }
-    if (type && meta.type !== type) continue;
-    if (category && meta.category !== category) continue;
     if (temperature && meta.temperature !== temperature) continue;
     if (minHeatScore !== undefined && (meta.heat_score === undefined || meta.heat_score < minHeatScore)) continue;
     if (importance && meta.importance !== importance) continue;

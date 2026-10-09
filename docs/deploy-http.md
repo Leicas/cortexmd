@@ -56,7 +56,7 @@ API_PORT=3000
 # API_KEY=                        # auto-generated + printed on first boot if unset
 # DASHBOARD_PASSWORD=             # auto-generated + printed on first boot if unset
 ENABLE_EMBEDDINGS=true
-DREAM_SCHEDULE=                   # cron; empty disables consolidation
+DREAM_SCHEDULE=                   # "on" or a 5-field cron; empty disables consolidation
 EOF
 
 docker compose up -d --build
@@ -186,8 +186,31 @@ SOURCE_VAULTS="notes=git+https://git.example.com/me/notes.git#main:Public/**"
 | `ENABLE_EMBEDDINGS` | no | Semantic search; `false` = lexical-only (default `true`). |
 | `EMBEDDING_MODEL` | no | Override embedding model id. |
 | `ENABLE_RERANKER` | no | Optional reranker (default `false`); no default host/model. |
-| `DREAM_SCHEDULE` | no | Cron expression for memory consolidation; empty disables. |
+| `DREAM_SCHEDULE` | no | `on` (nightly at 03:00) or a 5-field cron expression for memory consolidation; empty disables. `DREAM_CRON` overrides the cron when set. |
 | `LOG_LEVEL` | no | `info` (default), `debug`, … |
+| `NODE_OPTIONS` | no | Image default `--max-old-space-size=1024`. Without it Node 22 caps the heap at ~792 MB and a large vault OOMs; keep the container `mem_limit` ≥ heap cap + ~512 MB (compose default `MEM_LIMIT=1536m`). |
+| `SESSION_TIMEOUT_MS` | no | Idle MCP sessions are closed after this (default `1800000` = 30 min; `0` disables). |
+| `MAX_ACTIVE_SESSIONS` | no | Cap on live MCP sessions; the least-recently-active one is evicted first (default `200`, `0` disables). |
+| `MAX_PERSISTED_SESSIONS` | no | Max records kept in `sessions.json` (default `500`, newest first). `SESSION_RETENTION_MS` (default 7 d) ages the rest out. |
+| `MAX_REQUEST_SIZE` | no | JSON body limit (default `10mb`); oversized bodies get a `413 {"error":"Payload too large","limit":…}`. |
+
+### Health endpoint
+
+`GET /health` needs no auth and is what the dashboard "Server" card and
+`cortexmd status` read:
+
+```json
+{ "status": "ok", "version": "1.18.0", "commit": "abc1234", "uptime": 123456,
+  "activeSessions": 3, "indexedNotes": 4200,
+  "heap": { "usedMb": 310, "totalMb": 420, "rssMb": 760, "limitMb": 1024 },
+  "sessions": { "active": 3, "persisted": 12, "maxActive": 200, "timeoutMs": 1800000 },
+  "lastIndexUpdate": { "at": "…", "updated": 2, "removed": 0, "ms": 140, "collisions": 0 },
+  "restarts": { "lastExit": { "at": "…", "reason": "SIGTERM", "signal": "SIGTERM", "heapUsedMb": 300 } } }
+```
+
+`restarts.lastExit` comes from `DATA_DIR/last-exit.json`, written on graceful
+shutdown and on `uncaughtException` / `unhandledRejection` (reason, message,
+heap at exit), so an OOM-adjacent crash is diagnosable after the restart.
 
 See [`packages/server/.env.example`](../packages/server/.env.example) for the
 authoritative list. Deprecated `VAULT_RW` / `VAULT_RO_*` names are still honored

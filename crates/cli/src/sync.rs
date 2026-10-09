@@ -176,7 +176,9 @@ pub fn bootstrap_pull_blocking(slug: &str, server: &str, api_key: &str) -> Resul
 
 fn call_pull(server: &str, api_key: &str, args: &Value) -> Result<Value> {
     let (session_id, _init) = mcp::initialize(server, api_key)?;
-    let result = mcp::tools_call(server, api_key, &session_id, "code_sync_pull", args)?;
+    let result = mcp::tools_call(server, api_key, &session_id, "code_sync_pull", args);
+    let _ = mcp::delete_session(server, api_key, &session_id);
+    let result = result?;
     let text = result
         .get("content")
         .and_then(|c| c.as_array())
@@ -225,7 +227,9 @@ pub fn push_local_savings(server: &str, api_key: &str) -> Result<bool> {
     let args = json!({ "entries": entries });
 
     let (session_id, _init) = mcp::initialize(server, api_key)?;
-    let _result = mcp::tools_call(server, api_key, &session_id, "code_savings_push", &args)?;
+    let result = mcp::tools_call(server, api_key, &session_id, "code_savings_push", &args);
+    let _ = mcp::delete_session(server, api_key, &session_id);
+    let _result = result?;
 
     // Subtract what we just sent so we don't re-push it next time. Concurrent
     // bumps that arrived during the push window remain as a positive remainder.
@@ -359,13 +363,16 @@ fn incremental_push_blocking(slug: &str, server: &str, api_key: &str) -> Result<
     let payload_value = serde_json::to_value(&payload).context("serialize ingest payload")?;
 
     let (session_id, _init) = mcp::initialize(server, api_key)?;
-    let _result = mcp::tools_call(
+    let result = mcp::tools_call_with_timeout(
         server,
         api_key,
         &session_id,
         "code_ingest_repo",
         &payload_value,
-    )?;
+        Some(mcp::INGEST_TIMEOUT),
+    );
+    let _ = mcp::delete_session(server, api_key, &session_id);
+    let _result = result?;
 
     // 4. Pull back the canonical snapshot so `last_indexed_at` advances
     //    locally — otherwise the next call sees the same files as still

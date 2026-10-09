@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import type { OAuthClient } from '../oauth.js';
+import { capSessionRecords } from './session-lru.js';
 
 /**
  * Session metadata that can be serialized (no transport object).
@@ -91,14 +92,25 @@ export function saveClients(dataDir: string, clients: Map<string, OAuthClient>):
   fs.renameSync(tmpPath, clientsPath);
 }
 
+/** Default cap on persisted session records (newest `lastActivity` kept). */
+export const DEFAULT_MAX_PERSISTED_SESSIONS = 500;
+
 /**
  * Atomically save session metadata to disk (write .tmp then rename).
+ *
+ * Compact JSON (no pretty-print) and capped at `maxRecords` newest-first: the
+ * pretty-printed, uncapped file (19k records, 6.6 MB every 5 min) was the
+ * allocation that OOM'd the live container.
  */
-export function saveSessions(dataDir: string, sessions: PersistedSession[]): void {
+export function saveSessions(
+  dataDir: string,
+  sessions: PersistedSession[],
+  maxRecords: number = DEFAULT_MAX_PERSISTED_SESSIONS,
+): void {
   const sessionsPath = path.join(dataDir, 'sessions.json');
   const tmpPath = sessionsPath + '.tmp';
   fs.mkdirSync(dataDir, { recursive: true });
-  const json = JSON.stringify(sessions, null, 2);
+  const json = JSON.stringify(capSessionRecords(sessions, maxRecords));
   fs.writeFileSync(tmpPath, json, { mode: 0o600 });
   fs.renameSync(tmpPath, sessionsPath);
 }

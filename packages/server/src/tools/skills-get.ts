@@ -31,7 +31,7 @@ Returns { error: "not_found" } if no skill file matches.`,
         content: [
           {
             type: 'text' as const,
-            text: JSON.stringify(skill, null, 2),
+            text: JSON.stringify(skill),
           },
         ],
       };

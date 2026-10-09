@@ -1,4 +1,5 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { z } from 'zod';
 import { wrapToolHandler } from '../lib/tool-wrapper.js';
 import { getIndexedNoteCount, getDocMeta, getVaultHealth } from '../lib/search.js';
 import { getGraphStats } from '../lib/graph.js';
@@ -8,21 +9,28 @@ import { getCollectionNames, classifyPath } from '../lib/collections.js';
 import { config } from '../config.js';
 import { listAgents } from '../lib/journal.js';
 
+const MAX_AGENTS = 10;
+
 export function register(server: McpServer): void {
   server.tool(
     'vault_status',
-    `Full vault overview in one call — use this first to orient yourself. Returns:
-- Note counts by collection (memories, projects, crm, ops, etc.)
-- Temperature distribution (hot/warm/cold) and category breakdown
-- Graph connectivity summary (links, orphans, bridges)
-- Knowledge graph status (entities, triples, top predicates)
-- Embeddings/semantic search readiness
-- Active agents with diary entries
+    `Compact vault overview in one call — use this first to orient yourself. Returns:
+- Note counts by collection (memories, projects, crm, ops, etc.) and temperature (hot/warm/cold)
+- Graph connectivity summary (links, orphans), knowledge-graph and embeddings readiness
+- The ${MAX_AGENTS} most recently active agents with diary entries
 - Vault configuration (enabled features, multi-vault setup)
+verbose=true adds the category/importance histograms, the collection catalogue, top predicates/entities and most-linked notes.
 
 For deeper wing/room/drawer breakdown, use vault_taxonomy. For graph details, use graph_stats. For KG details, use kg_stats.`,
-    {},
-    wrapToolHandler('vault_status', async () => {
+    {
+      verbose: z
+        .boolean()
+        .optional()
+        .default(false)
+        .describe('Include histograms (categories, importance), the collection catalogue and top-N lists. Default false (compact).'),
+    },
+    wrapToolHandler('vault_status', async (params) => {
+      const verbose = (params.verbose as boolean | undefined) ?? false;
       const noteCount = getIndexedNoteCount();
       const docMeta = getDocMeta();
       const health = getVaultHealth();
@@ -40,11 +48,12 @@ For deeper wing/room/drawer breakdown, use vault_taxonomy. For graph details, us
         const temp = meta.temperature ?? 'unknown';
         temperatureCounts[temp] = (temperatureCounts[temp] ?? 0) + 1;
 
-        const cat = meta.category ?? 'uncategorized';
-        categoryCounts[cat] = (categoryCounts[cat] ?? 0) + 1;
-
-        if (meta.importance) {
-          importanceCounts[meta.importance] = (importanceCounts[meta.importance] ?? 0) + 1;
+        if (verbose) {
+          const cat = meta.category ?? 'uncategorized';
+          categoryCounts[cat] = (categoryCounts[cat] ?? 0) + 1;
+          if (meta.importance) {
+            importanceCounts[meta.importance] = (importanceCounts[meta.importance] ?? 0) + 1;
+          }
         }
       }
 
@@ -60,8 +69,10 @@ For deeper wing/room/drawer breakdown, use vault_taxonomy. For graph details, us
           triples: kg.tripleCount,
           active: kg.activeTriples,
           expired: kg.expiredTriples,
-          topPredicates: kg.topPredicates?.slice(0, 5),
-          topEntities: kg.topEntities?.slice(0, 5),
+          ...(verbose ? {
+            topPredicates: kg.topPredicates?.slice(0, 5),
+            topEntities: kg.topEntities?.slice(0, 5),
+          } : {}),
         };
       }
 
@@ -85,6 +96,10 @@ For deeper wing/room/drawer breakdown, use vault_taxonomy. For graph details, us
       } catch {
         // diary listing is optional
       }
+      const totalAgents = agents.length;
+      agents = [...agents]
+        .sort((a, b) => String(b.lastActive ?? '').localeCompare(String(a.lastActive ?? '')))
+        .slice(0, MAX_AGENTS);
 
       // Config summary
       const configSummary = {
@@ -99,10 +114,9 @@ For deeper wing/room/drawer breakdown, use vault_taxonomy. For graph details, us
       const result = {
         totalNotes: noteCount,
         collections: collectionCounts,
-        availableCollections: getCollectionNames(),
+        ...(verbose ? { availableCollections: getCollectionNames() } : {}),
         temperature: temperatureCounts,
-        categories: categoryCounts,
-        importance: importanceCounts,
+        ...(verbose ? { categories: categoryCounts, importance: importanceCounts } : {}),
         health: {
           archived: health.archivedNotes,
           stale: health.staleNotes,
@@ -111,7 +125,7 @@ For deeper wing/room/drawer breakdown, use vault_taxonomy. For graph details, us
           totalLinks: graphStats.totalLinks,
           avgLinksPerNote: graphStats.avgLinksPerNote,
           orphanNotes: graphStats.orphanNotes,
-          mostLinked: graphStats.mostLinked?.slice(0, 5),
+          ...(verbose ? { mostLinked: graphStats.mostLinked?.slice(0, 5) } : {}),
         } : null,
         knowledgeGraph: kgInfo,
         embeddings: {
@@ -120,6 +134,7 @@ For deeper wing/room/drawer breakdown, use vault_taxonomy. For graph details, us
           indexedVectors: embeddingInfo.indexSize,
         },
         agents,
+        ...(totalAgents > agents.length ? { agentsTotal: totalAgents } : {}),
         config: configSummary,
       };
 
@@ -127,7 +142,7 @@ For deeper wing/room/drawer breakdown, use vault_taxonomy. For graph details, us
         content: [
           {
             type: 'text',
-            text: JSON.stringify(result, null, 2),
+            text: JSON.stringify(result),
           },
         ],
       };

@@ -544,11 +544,8 @@ fn match_indexed_path(
     } else {
         cwd.join(stripped)
     };
-    let canonical = abs
-        .canonicalize()
-        .unwrap_or(abs)
-        .to_string_lossy()
-        .to_string();
+    let canonical_path = abs.canonicalize().unwrap_or(abs);
+    let canonical = canonical_path.to_string_lossy().to_string();
     let target = normalize_path(&canonical);
 
     let mut best: Option<(String, String, usize)> = None;
@@ -567,7 +564,38 @@ fn match_indexed_path(
             }
         }
     }
-    best.map(|(slug, rel, _)| (slug, rel))
+    let (slug, rel, root_len) = best?;
+    // A git *worktree* nested under a registered checkout (`.git` is a file
+    // pointing at the main repo's gitdir) is a different branch: its files are
+    // not what the index holds, so never rewrite reads there. Mirrors
+    // `isUnderWorktree` in hooks/code_nav_pretool_hook.mjs.
+    if is_under_worktree(&canonical_path, &target[..root_len]) {
+        return None;
+    }
+    Some((slug, rel))
+}
+
+/// True when a directory strictly between the registered repo root
+/// (`repo_abs_norm`, already normalized) and `target` holds a `.git` FILE.
+/// Walks the original path (normalization lowercases, which would break
+/// `metadata` on case-sensitive filesystems). Bounded to 64 levels.
+fn is_under_worktree(target: &Path, repo_abs_norm: &str) -> bool {
+    let mut dir: Option<&Path> = target.parent();
+    for _ in 0..64 {
+        let Some(d) = dir else { break };
+        let n = normalize_path(&d.to_string_lossy());
+        if n.is_empty() || n == repo_abs_norm || !n.starts_with(&format!("{}/", repo_abs_norm)) {
+            break;
+        }
+        if std::fs::metadata(d.join(".git"))
+            .map(|m| m.is_file())
+            .unwrap_or(false)
+        {
+            return true;
+        }
+        dir = d.parent();
+    }
+    false
 }
 
 /// Try to find a repo whose abs_path contains the cwd. Returns (slug, "").
@@ -745,6 +773,74 @@ mod tests {
                 }],
             },
         ]
+    }
+
+    /// Fresh, unique temp dir per test (no tempfile dependency).
+    fn scratch_dir(tag: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!(
+            "cortexmd-rewrite-{}-{}-{}",
+            tag,
+            std::process::id(),
+            nanos
+        ));
+        std::fs::create_dir_all(&dir).expect("create scratch dir");
+        dir.canonicalize().unwrap_or(dir)
+    }
+
+    fn repo_at(root: &Path) -> Vec<CachedRepo> {
+        vec![CachedRepo {
+            slug: "wtdemo".to_string(),
+            paths: vec![CachedRepoPath {
+                abs_path: root.to_string_lossy().to_string(),
+            }],
+        }]
+    }
+
+    #[test]
+    fn worktree_guard_blocks_files_under_a_git_file() {
+        let root = scratch_dir("wt");
+        // <root>/.claude/worktrees/feature/.git is a FILE (worktree pointer).
+        let wt = root.join(".claude").join("worktrees").join("feature");
+        std::fs::create_dir_all(wt.join("src")).unwrap();
+        std::fs::write(wt.join(".git"), "gitdir: ../../../.git/worktrees/feature\n").unwrap();
+        let file = wt.join("src").join("lib.rs");
+        std::fs::write(&file, "pub fn x() {}\n").unwrap();
+
+        let repos = repo_at(&root);
+        let arg = file.to_string_lossy().to_string();
+        assert_eq!(
+            match_indexed_path(&arg, &repos),
+            None,
+            "file under a nested worktree must not match the parent checkout"
+        );
+        // The worktree root itself is also under the guard (its parent chain
+        // starts at the dir holding the .git file).
+        let in_wt_root = wt.join("README.md");
+        std::fs::write(&in_wt_root, "x").unwrap();
+        assert_eq!(match_indexed_path(&in_wt_root.to_string_lossy(), &repos), None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn worktree_guard_allows_plain_subdirs_and_git_dirs() {
+        let root = scratch_dir("plain");
+        // Main checkout: `.git` is a DIRECTORY, which must not trigger the guard
+        // (and it sits at the root, not strictly between root and the file).
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let file = root.join("src").join("deep").join("mod.rs");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "fn y() {}\n").unwrap();
+        // A nested .git DIRECTORY (submodule-like) is not a worktree pointer.
+        std::fs::create_dir_all(root.join("src").join(".git")).unwrap();
+
+        let repos = repo_at(&root);
+        let got = match_indexed_path(&file.to_string_lossy(), &repos);
+        assert_eq!(got, Some(("wtdemo".to_string(), "src/deep/mod.rs".to_string())));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

@@ -84,7 +84,7 @@ Pass agentName="" to list all agents. Use silentOnly to see only hook snapshots;
           content: [
             {
               type: 'text' as const,
-              text: JSON.stringify({ agents, count: agents.length }, null, 2),
+              text: JSON.stringify({ agents, count: agents.length }),
             },
           ],
         };

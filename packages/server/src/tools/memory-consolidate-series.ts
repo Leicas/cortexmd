@@ -133,7 +133,7 @@ export function register(server: McpServer): void {
               kept: toKeep.map((k) => k.path),
               plan,
               note: 'Re-run with dryRun=false to apply.',
-            }, null, 2),
+            }),
           }],
         };
       }
@@ -278,7 +278,7 @@ export function register(server: McpServer): void {
             totalFolded,
             totalArchived,
             results: applied,
-          }, null, 2),
+          }),
         }],
       };
     })

@@ -89,6 +89,29 @@ fn dispatch(cli: Cli) -> Result<()> {
     }
 }
 
+/// Server-side body limit (`MAX_REQUEST_SIZE`, express.json default 10mb).
+pub const WIRE_MAX_BYTES: usize = 10 * 1024 * 1024;
+/// Warn above this many bytes on the wire (I-7: > 9 MB).
+pub const WIRE_WARN_BYTES: usize = 9 * 1024 * 1024;
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum WireSize {
+    Ok,
+    Warn,
+    Refuse,
+}
+
+/// Classify the exact number of bytes about to be sent.
+pub fn wire_size_verdict(len: usize) -> WireSize {
+    if len > WIRE_MAX_BYTES {
+        WireSize::Refuse
+    } else if len > WIRE_WARN_BYTES {
+        WireSize::Warn
+    } else {
+        WireSize::Ok
+    }
+}
+
 fn run_index(args: IndexArgs) -> Result<()> {
     let repo_path_arg = args
         .repo_path
@@ -245,8 +268,16 @@ fn run_index(args: IndexArgs) -> Result<()> {
         full_replace: args.full_replace,
     };
 
-    let payload_json = serde_json::to_string(&payload).context("serialize payload")?;
-    let payload_kb = payload_json.len() as f64 / 1024.0;
+    // Build the exact bytes that go on the wire: the JSON-RPC `tools/call`
+    // envelope, compact-encoded (see mcp.rs). The server's body limit
+    // (MAX_REQUEST_SIZE, 10 MB) is checked against this length, so size
+    // warnings must be computed from it — not from the bare payload.
+    let payload_value = serde_json::to_value(&payload).context("serialize payload")?;
+    let wire_body = mcp::tools_call_body("code_ingest_repo", &payload_value);
+    let wire_bytes = mcp::encode_body(&wire_body)?;
+    drop(wire_body);
+    let wire_len = wire_bytes.len();
+    let payload_kb = wire_len as f64 / 1024.0;
     let payload_mb = payload_kb / 1024.0;
     println!(
         "[client] files={} symbols={} calls={} imports={}",
@@ -256,9 +287,32 @@ fn run_index(args: IndexArgs) -> Result<()> {
         total_imports
     );
     println!(
-        "[client] payload size: {:.1} KB ({:.2} MB)",
+        "[client] payload size: {:.1} KB ({:.2} MB) on the wire",
         payload_kb, payload_mb
     );
+
+    match wire_size_verdict(wire_len) {
+        WireSize::Ok => {}
+        WireSize::Warn => eprintln!(
+            "[client] WARN: request body is {:.2} MB, close to the server's 10 MB body limit (MAX_REQUEST_SIZE). Consider indexing sub-directories separately or raising MAX_REQUEST_SIZE on the server.",
+            payload_mb
+        ),
+        WireSize::Refuse => {
+            eprintln!(
+                "[client] ERROR: request body is {:.2} MB, over the server's 10 MB body limit (MAX_REQUEST_SIZE); the server would reject it with 413. Not sending. Index sub-directories separately or raise MAX_REQUEST_SIZE on the server.",
+                payload_mb
+            );
+            // Return an error rather than exiting: this function also runs
+            // inside the long-lived hud-line daemon (proxy-index), which must
+            // survive one oversized repo.
+            if !args.dry_run {
+                anyhow::bail!(
+                    "request body {:.2} MB exceeds the server's 10 MB body limit (MAX_REQUEST_SIZE); not sent",
+                    payload_mb
+                );
+            }
+        }
+    }
 
     if args.dry_run {
         println!("[client] --dry-run: not contacting server.");
@@ -278,13 +332,6 @@ fn run_index(args: IndexArgs) -> Result<()> {
         return Ok(());
     }
 
-    if payload_json.len() > (9.5 * 1024.0 * 1024.0) as usize {
-        eprintln!(
-            "[client] WARN: payload {:.1} KB approaches the server's 10 MB body limit. Consider chunking.",
-            payload_kb
-        );
-    }
-
     println!("[client] connecting to {} ...", server_url);
     let (session_id, _init_result) = mcp::initialize(&server_url, &api_key)?;
     println!(
@@ -292,15 +339,20 @@ fn run_index(args: IndexArgs) -> Result<()> {
         &session_id[..session_id.len().min(8)]
     );
 
-    let payload_value: serde_json::Value =
-        serde_json::from_str(&payload_json).context("re-parse payload to Value for MCP send")?;
-    let result = mcp::tools_call(
+    let result = mcp::tools_call_bytes(
         &server_url,
         &api_key,
         &session_id,
-        "code_ingest_repo",
-        &payload_value,
-    )?;
+        &wire_bytes,
+        Some(mcp::INGEST_TIMEOUT),
+    );
+    // Close the session whether or not the call succeeded (best-effort).
+    match mcp::delete_session(&server_url, &api_key, &session_id) {
+        Ok(()) if args.verbose => println!("[client] session closed"),
+        Err(e) if args.verbose => eprintln!("[client] session close failed (ignored): {}", e),
+        _ => {}
+    }
+    let result = result?;
     let pretty = if let Some(text) = result
         .get("content")
         .and_then(|c| c.as_array())
@@ -321,4 +373,22 @@ fn run_index(args: IndexArgs) -> Result<()> {
     };
     println!("[client] ingest result: {}", pretty);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wire_size_thresholds() {
+        assert_eq!(wire_size_verdict(0), WireSize::Ok);
+        assert_eq!(wire_size_verdict(WIRE_WARN_BYTES), WireSize::Ok);
+        assert_eq!(wire_size_verdict(WIRE_WARN_BYTES + 1), WireSize::Warn);
+        assert_eq!(wire_size_verdict(WIRE_MAX_BYTES), WireSize::Warn);
+        assert_eq!(wire_size_verdict(WIRE_MAX_BYTES + 1), WireSize::Refuse);
+        // The reported 12,766,498-byte pretty body is refused; its compact
+        // 6.61 MB equivalent is fine.
+        assert_eq!(wire_size_verdict(12_766_498), WireSize::Refuse);
+        assert_eq!(wire_size_verdict(6_930_000), WireSize::Ok);
+    }
 }

@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { appendJournalEntry } from '../lib/journal.js';
 import { wrapToolHandler } from '../lib/tool-wrapper.js';
 import { sanitizeContent } from '../lib/sanitize.js';
+import { trimWords, DIARY_WORD_LIMIT, DIARY_WORD_LIMIT_TOPIC } from './diary-trim.js';
 
 export function register(server: McpServer): void {
   server.tool(
@@ -46,8 +47,13 @@ export function register(server: McpServer): void {
         };
       }
 
-      let entryText = sanitizeContent(params.entry as string, 5000);
       const topic = params.topic as string | undefined;
+      // ≤60 words (≤120 with a topic): memory_wakeup re-reads every line.
+      const trimmed = trimWords(
+        sanitizeContent(params.entry as string, 5000),
+        topic ? DIARY_WORD_LIMIT_TOPIC : DIARY_WORD_LIMIT,
+      );
+      let entryText = trimmed.text;
       const tags = params.tags as string[] | undefined;
 
       // Prepend topic as bold prefix
@@ -78,6 +84,7 @@ export function register(server: McpServer): void {
               agentName,
               ...(project ? { project } : {}),
               ...(machine ? { machine } : {}),
+              ...(trimmed.truncated ? { truncated: true, words: trimmed.words, limit: trimmed.limit } : {}),
             }),
           },
         ],

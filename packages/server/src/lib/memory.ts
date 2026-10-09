@@ -5,6 +5,11 @@ import type { MemoryCategory as _MemoryCategory } from './categorize.js';
 import { isEmbeddingsReady, embedText } from './embeddings.js';
 import { getDocMeta } from './search.js';
 import { logger } from './logger.js';
+import type { SearchResult } from './search.js';
+import { getInboundLinkCounts } from './graph.js';
+import { centralityBoost, explainRecall, type RecallSignalBreakdown } from './recall-signals.js';
+import { coRecallBoosts } from './co-recall.js';
+import { config } from '../config.js';
 
 // Re-export so existing consumers keep working after the helper moved to
 // ./categorize.ts (see detectCategory / inferNoteCategory there).
@@ -367,4 +372,343 @@ export function memoryDir(category: MemoryCategory, date?: Date): string {
   const year = String(d.getFullYear());
   const month = String(d.getMonth() + 1).padStart(2, '0');
   return `Memories/${category}/${year}/${month}/`;
+}
+
+// ───────────────────────────── Recall rescoring ─────────────────────────────
+//
+// Shared by the `memory_recall` tool and the hook-facing `/api/recall`
+// (lib/recall-api.ts) so both callers rank with the same signals: heat,
+// importance, category half-life recency, relatedTo, context keywords,
+// graph centrality, Bayesian validity, archive penalty, co-recall spreading
+// activation and MMR diversity. Pure over the in-memory docMeta index: no
+// disk reads, no side effects (access bumps live in touchRecalledMemories).
+
+export const CATEGORY_HALF_LIFE_DAYS: Record<string, number> = {
+  observation: 14,
+  decision: 30,
+  insight: 30,
+  conversation: 7,
+  fact: 90,
+  preference: 60,
+  plan: 7,
+  reflection: 30,
+};
+export const DEFAULT_HALF_LIFE_DAYS = 30;
+
+export const TEMPERATURE_BOOST: Record<string, number> = { hot: 1.5, warm: 1.0, cold: 0.5 };
+export const IMPORTANCE_BOOST: Record<string, number> = { critical: 2.0, high: 1.5, medium: 1.0, low: 0.7 };
+export const IMPORTANCE_ORDER = ['low', 'medium', 'high', 'critical'] as const;
+
+const CONTEXT_STOPWORDS = new Set([
+  'the', 'and', 'for', 'that', 'this', 'with', 'from', 'have', 'been',
+  'are', 'was', 'were', 'will', 'can', 'could', 'would', 'should',
+  'not', 'but', 'they', 'their', 'them', 'what', 'which', 'when',
+  'where', 'how', 'who', 'all', 'each', 'every', 'both', 'few',
+  'more', 'most', 'other', 'some', 'such', 'than', 'too', 'very',
+  'just', 'about', 'above', 'after', 'again', 'also', 'because',
+  'before', 'between', 'does', 'done', 'down', 'during', 'into',
+  'its', 'only', 'our', 'out', 'over', 'own', 'same', 'then',
+  'there', 'these', 'those', 'through', 'under', 'until', 'upon',
+  'your', 'you', 'she', 'her', 'his', 'him',
+]);
+
+/** Keywords (>3 chars, de-duplicated, stopwords removed) from a context snippet. */
+export function extractContextKeywords(contextSnippet: string | undefined): string[] {
+  if (!contextSnippet) return [];
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const w of contextSnippet.toLowerCase().split(/\s+/)) {
+    const clean = w.replace(/[^a-z0-9]/g, '');
+    if (clean.length > 3 && !CONTEXT_STOPWORDS.has(clean) && !seen.has(clean)) {
+      seen.add(clean);
+      out.push(clean);
+    }
+  }
+  return out;
+}
+
+// MMR diversity (avoid near-duplicate recalls): cheap lexical similarity on
+// title+snippet tokens, no embedding round-trip.
+function tokenSet(text: string): Set<string> {
+  const out = new Set<string>();
+  for (const tok of text.toLowerCase().split(/[^a-z0-9]+/)) {
+    if (tok.length >= 3) out.add(tok);
+  }
+  return out;
+}
+
+function jaccardSets(a: Set<string>, b: Set<string>): number {
+  if (a.size === 0 || b.size === 0) return 0;
+  let inter = 0;
+  for (const t of a) if (b.has(t)) inter++;
+  return inter / (a.size + b.size - inter);
+}
+
+/**
+ * Maximal Marginal Relevance selection. `items` must be pre-sorted by score
+ * descending. Picks `limit` results balancing relevance (lambda) against
+ * novelty vs. already-selected items (1 - lambda). 0.7 keeps relevance dominant.
+ */
+export function mmrSelect<T extends { title: string; snippet: string; score: number }>(
+  items: T[],
+  limit: number,
+  lambda = 0.7,
+): T[] {
+  if (items.length <= limit) return items;
+  const maxScore = items[0].score || 1;
+  const toks = new Map<T, Set<string>>();
+  const tokensFor = (r: T): Set<string> => {
+    let t = toks.get(r);
+    if (!t) { t = tokenSet(`${r.title} ${r.snippet}`); toks.set(r, t); }
+    return t;
+  };
+  const selected: T[] = [];
+  const remaining = [...items];
+  while (selected.length < limit && remaining.length > 0) {
+    let bestIdx = 0;
+    let bestVal = -Infinity;
+    for (let i = 0; i < remaining.length; i++) {
+      const cand = remaining[i];
+      let maxSim = 0;
+      for (const s of selected) {
+        const sim = jaccardSets(tokensFor(cand), tokensFor(s));
+        if (sim > maxSim) maxSim = sim;
+      }
+      const relNorm = cand.score / maxScore;
+      const mmr = lambda * relNorm - (1 - lambda) * maxSim;
+      if (mmr > bestVal) { bestVal = mmr; bestIdx = i; }
+    }
+    selected.push(remaining.splice(bestIdx, 1)[0]);
+  }
+  return selected;
+}
+
+export interface RescoreOptions {
+  /** Final number of results after MMR selection. */
+  limit: number;
+  categories?: string[];
+  /** 'any' (default) or a temperature bucket. */
+  temperature?: string;
+  minImportance?: string;
+  /** Vault paths (with or without `.md`); notes [[linked]] to any of them get x2. */
+  relatedTo?: string[];
+  /** Raw context snippet; keywords are extracted with extractContextKeywords. */
+  contextSnippet?: string;
+  /** Pre-extracted keywords (wins over contextSnippet when given). */
+  contextKeywords?: string[];
+  /** Paths to drop before selection (e.g. a hook's per-session seen-set). */
+  exclude?: Iterable<string>;
+  explain?: boolean;
+  /** Apply co-recall spreading activation from the top seeds (default true). */
+  coRecall?: boolean;
+}
+
+export interface RescoredResult {
+  path: string;
+  title: string;
+  category: string;
+  temperature: string;
+  importance: string;
+  archived?: boolean;
+  consolidatedInto?: string;
+  score: number;
+  lexicalScore: number;
+  semanticScore: number;
+  fusedScore: number;
+  snippet: string;
+  content?: string;
+  signals?: RecallSignalBreakdown;
+}
+
+/** `[[Projects/x|alias]]`, `Projects/x.md`, `projects/X` all normalise to `projects/x`. */
+function normalizeLinkTarget(raw: string): string {
+  return raw
+    .replace(/^\[\[/, '').replace(/\]\]$/, '')
+    .split('|')[0].split('#')[0]
+    .replace(/\.md$/i, '')
+    .trim()
+    .toLowerCase();
+}
+
+/**
+ * Post-filter and re-score hybrid-search hits over memories. Returns the
+ * MMR-selected top `opts.limit`, sorted by final score. Never bumps access
+ * counters or validity: surfacing a memory is not evidence it is true.
+ */
+export function rescoreRecall(results: SearchResult[], opts: RescoreOptions): RescoredResult[] {
+  const docMeta = getDocMeta();
+  const categories = opts.categories && opts.categories.length > 0 ? opts.categories : undefined;
+  const temperature = opts.temperature ?? 'any';
+  const minImportanceIdx = opts.minImportance
+    ? (IMPORTANCE_ORDER as readonly string[]).indexOf(opts.minImportance)
+    : -1;
+  const relatedSet = opts.relatedTo && opts.relatedTo.length > 0
+    ? new Set(opts.relatedTo.map(normalizeLinkTarget))
+    : undefined;
+  const contextKeywords = opts.contextKeywords ?? extractContextKeywords(opts.contextSnippet);
+  const exclude = opts.exclude ? new Set(opts.exclude) : undefined;
+  const explain = opts.explain ?? false;
+
+  // Graph-centrality signal (null until the graph is built, then a no-op).
+  const inboundCounts = config.recallCentralityWeight > 0 ? getInboundLinkCounts() : null;
+
+  const scored: RescoredResult[] = [];
+  for (const result of results) {
+    if (exclude?.has(result.path)) continue;
+    const meta = docMeta.get(result.path);
+    if (!meta) continue;
+    if (meta.type !== 'memory') continue;
+
+    const noteCategory = meta.category || 'observation';
+    const noteTemperature = meta.temperature || 'warm';
+    const noteImportance = meta.importance || 'medium';
+
+    if (categories && !categories.includes(noteCategory)) continue;
+    if (temperature !== 'any' && noteTemperature !== temperature) continue;
+    if (minImportanceIdx >= 0) {
+      const noteImportanceIdx = (IMPORTANCE_ORDER as readonly string[]).indexOf(noteImportance);
+      if (noteImportanceIdx < minImportanceIdx) continue;
+    }
+
+    // Bayesian validity: filter quarantined, penalize stale.
+    let validityPenalty = 1.0;
+    let validityScore: number | undefined;
+    let validityStale = false;
+    if (config.memoryValidity) {
+      const v = computeValidity({ validity_alpha: meta.validity_alpha, validity_beta: meta.validity_beta });
+      if (v.quarantined) continue;
+      validityScore = v.validity;
+      if (v.stale) { validityPenalty = VALIDITY_STALE_RANK_PENALTY; validityStale = true; }
+    }
+
+    // Heat boost: numeric heat_score (0-16) mapped onto 0.5..1.5, else bucket.
+    const heatScore = typeof meta.heat_score === 'number' ? meta.heat_score : undefined;
+    const tempBoost = heatScore !== undefined
+      ? 0.5 + Math.min(Math.max(heatScore, 0), 16) / 16
+      : (TEMPERATURE_BOOST[noteTemperature] ?? 1.0);
+    const impBoost = IMPORTANCE_BOOST[noteImportance] ?? 1.0;
+
+    // Temporal decay: category half-life on last_accessed.
+    let recencyBoost = 1.0;
+    if (meta.last_accessed) {
+      const lastAccessedTime = new Date(meta.last_accessed).getTime();
+      if (!isNaN(lastAccessedTime)) {
+        const daysSinceLastAccess = (Date.now() - lastAccessedTime) / (1000 * 60 * 60 * 24);
+        const halfLifeDays = CATEGORY_HALF_LIFE_DAYS[noteCategory] ?? DEFAULT_HALF_LIFE_DAYS;
+        recencyBoost = 1 / (1 + daysSinceLastAccess / halfLifeDays);
+      }
+    }
+
+    const body = meta.content ?? '';
+
+    // relatedTo boost: frontmatter `related`, tags, or a body [[wiki-link]]
+    // to one of the requested paths.
+    let relBoost = 1.0;
+    if (relatedSet) {
+      const noteRelated = Array.isArray(meta.related) ? meta.related : [];
+      let hasRelation = noteRelated.some((r: string) => relatedSet.has(normalizeLinkTarget(r)));
+      if (!hasRelation && Array.isArray(meta.tags)) {
+        hasRelation = meta.tags.some((t) => relatedSet.has(normalizeLinkTarget(String(t))));
+      }
+      if (!hasRelation && body) {
+        const lower = body.toLowerCase();
+        for (const rel of relatedSet) {
+          if (lower.includes(`[[${rel}]]`) || lower.includes(`[[${rel}|`) || lower.includes(`[[${rel}.md]]`)) {
+            hasRelation = true;
+            break;
+          }
+        }
+      }
+      if (hasRelation) relBoost = 2.0;
+    }
+
+    // Context boost: reward notes containing keywords from contextSnippet.
+    let contextBoost = 1.0;
+    if (contextKeywords.length > 0) {
+      const bodyLower = body.toLowerCase();
+      let matchCount = 0;
+      for (const kw of contextKeywords) if (bodyLower.includes(kw)) matchCount++;
+      if (matchCount > 0) contextBoost = Math.min(1.0 + 0.1 * matchCount, 1.5);
+    }
+
+    const inboundLinks = inboundCounts?.get(result.path) ?? 0;
+    const centBoost = inboundCounts ? centralityBoost(inboundLinks, config.recallCentralityWeight) : 1.0;
+    const sourcePenalty = meta.archived ? 0.35 : 1;
+    const finalScore = result.score * tempBoost * impBoost * relBoost * recencyBoost * contextBoost * validityPenalty * centBoost * sourcePenalty;
+
+    scored.push({
+      path: result.path,
+      title: meta.title || result.title,
+      category: noteCategory,
+      temperature: noteTemperature,
+      importance: noteImportance,
+      archived: meta.archived,
+      consolidatedInto: meta.consolidated_into,
+      score: finalScore,
+      lexicalScore: result.lexicalScore,
+      semanticScore: result.semanticScore,
+      fusedScore: result.fusedScore,
+      snippet: body.slice(0, 200),
+      signals: explain
+        ? explainRecall({
+            lexicalScore: result.lexicalScore,
+            semanticScore: result.semanticScore,
+            temperature: noteTemperature,
+            heatScore,
+            recency: recencyBoost,
+            inboundLinks,
+            validity: validityScore,
+            stale: validityStale,
+            related: relBoost > 1,
+          })
+        : undefined,
+    });
+  }
+
+  // Sort, then co-recall spreading activation from the top seeds, then MMR.
+  scored.sort((a, b) => b.score - a.score);
+  if (opts.coRecall ?? true) {
+    const seeds = scored.slice(0, 5).map((s) => s.path);
+    const coBoosts = coRecallBoosts(seeds);
+    if (coBoosts.size > 0) {
+      for (const s of scored) {
+        const boost = coBoosts.get(s.path);
+        if (boost && boost > 1) {
+          s.score *= boost;
+          if (s.signals) {
+            s.signals.coRecall = Math.round((boost - 1) * 1000) / 1000;
+            s.signals.reason += '; co-recalled with top matches';
+          }
+        }
+      }
+      scored.sort((a, b) => b.score - a.score);
+    }
+  }
+  return mmrSelect(scored, opts.limit);
+}
+
+/**
+ * Fire-and-forget access bump for recalled memories: increments
+ * `access_count` and stamps `last_accessed` once per day per note. Access is
+ * a salience signal only; validity is never touched here. Never throws and
+ * never blocks the caller.
+ */
+export function touchRecalledMemories(paths: string[]): void {
+  const today = new Date().toISOString().slice(0, 10);
+  for (const resultPath of paths) {
+    (async () => {
+      try {
+        const { content: noteContent, etag } = await readNote(resultPath);
+        const { data, body } = parseFrontmatter(noteContent);
+        const currentCount = typeof data.access_count === 'number' ? data.access_count : 0;
+        const currentAccessed = data.last_accessed as string | undefined;
+        if (currentAccessed === today && currentCount > 0) return; // already tracked today
+        data.access_count = currentCount + 1;
+        data.last_accessed = today;
+        await writeNote(resultPath, stringifyFrontmatter(data, body), etag);
+      } catch {
+        // best-effort tracking
+      }
+    })();
+  }
 }

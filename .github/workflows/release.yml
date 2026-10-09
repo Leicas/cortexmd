@@ -3,11 +3,27 @@ name: release
 # Continuous release driven by semantic-release (Conventional Commits).
 #
 # On every push to main:
-#   1. semantic-release analyzes commits, and if a release is warranted, creates
-#      the GitHub Release + git tag vX.Y.Z and the release notes.
+#   1. semantic-release analyzes commits, and if a release is warranted:
+#        a. @semantic-release/exec runs scripts/bump-version.mjs, writing X.Y.Z
+#           into crates/cli/Cargo.toml, Cargo.lock, packages/server/package.json,
+#           package.json and plugin/cortexmd/.claude-plugin/plugin.json;
+#        b. @semantic-release/git commits those files to main as
+#           "chore(release): X.Y.Z [skip ci]" (no second workflow run);
+#        c. the GitHub Release + git tag vX.Y.Z (on the bump commit) + notes.
 #   2. If (and only if) a release was published, build + push the server Docker
 #      image to GHCR (ghcr.io/<owner>/cortexmd:X.Y.Z + :latest), and build the
 #      Rust `cortexmd` binaries and attach them to the release.
+#
+# Version sources of truth after a release:
+#   - server image: APP_VERSION build-arg (the docker job checks out github.sha,
+#     i.e. the commit BEFORE the bump commit, so package.json there is stale);
+#   - cortexmd binaries: Cargo.toml at tag vX.Y.Z (the binaries job checks out
+#     the tag, so `cortexmd --version` / clientInfo report the released version).
+#
+# Requirement: the GITHUB_TOKEN must be allowed to push to main (branch
+# protection must not require PRs for github-actions[bot], or use a PAT with
+# bypass as GITHUB_TOKEN). Otherwise @semantic-release/git fails and no release
+# is cut.
 #
 # Deploy side: a host that runs `image: ghcr.io/<owner>/cortexmd:latest` (e.g. a
 # Komodo stack with auto-update) pulls the new image automatically — no build on
@@ -46,11 +62,13 @@ jobs:
         id: semantic
         uses: cycjimmy/semantic-release-action@v4
         with:
-          # Config lives in .releaserc.json (commit-analyzer + notes + github;
-          # NO npm publish).
+          # Config lives in .releaserc.json (commit-analyzer + notes + exec
+          # (version bump) + git (bump commit) + github; NO npm publish).
           extra_plugins: |
             @semantic-release/commit-analyzer
             @semantic-release/release-notes-generator
+            @semantic-release/exec
+            @semantic-release/git
             @semantic-release/github
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -64,6 +82,9 @@ jobs:
       contents: read
       packages: write        # push to GHCR
     steps:
+      # github.sha = the commit that triggered the run, i.e. BEFORE the version
+      # bump commit. The server's version comes from APP_VERSION (below), not
+      # from package.json, so this is intentional and keeps the build cache warm.
       - uses: actions/checkout@v4
       - name: Lowercase image name
         id: img
@@ -118,7 +139,12 @@ jobs:
             target: x86_64-pc-windows-msvc
             ext: ".exe"
     steps:
+      # Check out the release tag (created on the version-bump commit) so the
+      # --locked build sees the bumped Cargo.toml/Cargo.lock and the binary
+      # reports the released version (CARGO_PKG_VERSION).
       - uses: actions/checkout@v4
+        with:
+          ref: v${{ needs.release.outputs.version }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}

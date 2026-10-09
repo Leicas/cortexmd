@@ -9,6 +9,7 @@
     "test:server": "npm -w packages/server run test",
     "dev:server": "npm -w packages/server run dev",
     "test:hooks": "node --test \"crates/cli/hooks/__tests__/*.test.mjs\"",
+    "test:scripts": "node --test \"scripts/__tests__/*.test.mjs\"",
     "sync-plugin-hooks": "node scripts/sync-plugin-hooks.mjs",
     "check-plugin-hooks": "node scripts/sync-plugin-hooks.mjs --check"
   }

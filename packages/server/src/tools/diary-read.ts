@@ -33,7 +33,7 @@ Pass agentName to read that agent's recent entries. Pass empty string to list al
           content: [
             {
               type: 'text' as const,
-              text: JSON.stringify({ agents, count: agents.length }, null, 2),
+              text: JSON.stringify({ agents, count: agents.length }),
             },
           ],
         };

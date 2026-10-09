@@ -17,6 +17,7 @@
 import {
   diaryAgentName, diaryLinkContext, readStdin, logError,
   sessionStatePath, readState, writeState, HOOK_DISABLED,
+  isServerUnreachable,
 } from './_mcp_rest.mjs';
 
 const passthrough = () => {
@@ -57,6 +58,11 @@ async function main() {
   }
 
   if (stopHookActive) return passthrough();
+
+  // Server found unreachable earlier this session (marker still fresh): the
+  // handoff write would fail, so pass through WITHOUT consuming the one-shot —
+  // a later PreCompact can still ask once the server is back.
+  if (sessionId && isServerUnreachable(sessionId)) return passthrough();
 
   const statePath = sessionStatePath('precompact', sessionId);
   if (readState(statePath).blocked === true) return passthrough();

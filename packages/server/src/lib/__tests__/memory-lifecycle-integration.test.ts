@@ -102,7 +102,7 @@ describe('memory lifecycle integration', () => {
     expect(again.errors).toEqual([]);
     expect(again.canonical).toBe(result.canonical);
     expect((await readNote(result.canonical)).content).toBe(canonical.content);
-    const recalled = await toolHandler(registerRecall)({ query: 'Hidden blue sapphire detail', limit: 5 }, {});
+    const recalled = await toolHandler(registerRecall)({ query: 'Hidden blue sapphire detail', limit: 5, explain: true }, {});
     const payload = JSON.parse(recalled.content[0].text.split('\n\n').at(-1));
     expect(payload.results.map((r: { path: string }) => r.path)).toContain(first);
   });

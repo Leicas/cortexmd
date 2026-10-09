@@ -28,6 +28,8 @@ edition = "2021"
 license = "MIT"
 description = "cortexmd CLI: indexes repos, queries the symbol DB, drives session hooks, and bootstraps Claude Code/Codex/Cursor integrations."
 repository = "https://github.com/Leicas/cortexmd"
+# `cargo run -- ...` targets the real binary, not the deprecated alias.
+default-run = "cortexmd"
 
 [[bin]]
 name = "cortexmd"

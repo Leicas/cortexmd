@@ -37,7 +37,7 @@ Returns { error: "not_found" } if no team file matches.`,
         content: [
           {
             type: 'text' as const,
-            text: JSON.stringify(team, null, 2),
+            text: JSON.stringify(team),
           },
         ],
       };

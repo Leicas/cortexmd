@@ -164,6 +164,12 @@ export function getCodeDb(): BetterSqlite3.Database {
       requested_at  INTEGER NOT NULL,
       claimed_at    INTEGER,
       completed_at  INTEGER,
+      -- Number of times the request has been served to a daemon (claim or
+      -- reclaim). Once it reaches MAX_INDEX_ATTEMPTS the row flips to 'failed'
+      -- and is never re-served (see lib/code-nav/index-requests.ts).
+      attempts      INTEGER NOT NULL DEFAULT 0,
+      -- Last error reported by the daemon via failIndexRequest / the REST route.
+      last_error    TEXT,
       FOREIGN KEY (repo_id) REFERENCES repos(id) ON DELETE CASCADE
     );
     CREATE INDEX IF NOT EXISTS idx_index_requests_machine_status
@@ -195,6 +201,22 @@ export function getCodeDb(): BetterSqlite3.Database {
     }
   }
   handle.exec(`CREATE INDEX IF NOT EXISTS idx_repos_git_origin_id ON repos(git_origin_id)`);
+
+  // Guarded ALTERs for index_requests attempt tracking (I-3). Older code.db
+  // files predate these columns; the CREATE TABLE above only covers fresh DBs.
+  for (const ddl of [
+    `ALTER TABLE index_requests ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0`,
+    `ALTER TABLE index_requests ADD COLUMN last_error TEXT`,
+  ]) {
+    try {
+      handle.exec(ddl);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (!/duplicate column/i.test(msg)) {
+        logger.warn('index_requests schema migration failed', { ddl, error: msg });
+      }
+    }
+  }
 
   // Backfill: any row with NULL git_origin_id but non-NULL git_origin gets it computed.
   try {

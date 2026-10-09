@@ -2062,7 +2062,7 @@ export function registerCodeCheckStaleness(server: McpServer): void {
 export function registerCodeIndexRequestsPoll(server: McpServer): void {
   server.tool(
     'code_index_requests_poll',
-    'Claim pending proxy-index requests for a machine. The owning machine\'s hud-line daemon calls this each tick to fetch re-index work that was enqueued when code-nav queries came up stale/empty against a repo checked out on that machine. Returns (and marks `claimed`) up to `limit` requests as `{requests:[{id, repoId, slug, absPath, reason, requestedAt}]}`. The daemon re-indexes each absPath and pushes via `code_ingest_repo`, which clears the request.',
+    'Claim pending proxy-index requests for a machine. The owning machine\'s hud-line daemon calls this each tick to fetch re-index work that was enqueued when code-nav queries came up stale/empty against a repo checked out on that machine. Returns (and marks `claimed`) up to `limit` requests as `{requests:[{id, repoId, slug, absPath, reason, requestedAt, attempts, lastError}]}`. The daemon re-indexes each absPath and pushes via `code_ingest_repo`, which clears the request; after 3 failed attempts a request is marked failed and no longer served.',
     {
       machine_id: z.string().min(1),
       limit: z.number().int().positive().max(100).optional().default(20),
@@ -2089,6 +2089,8 @@ export function registerCodeIndexRequestsPoll(server: McpServer): void {
           absPath: r.abs_path,
           reason: r.reason,
           requestedAt: r.requested_at,
+          attempts: r.attempts,
+          lastError: r.last_error ?? null,
         };
       });
       return {

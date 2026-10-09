@@ -61,7 +61,7 @@ export function register(server: McpServer): void {
         content: [
           {
             type: "text",
-            text: `${summary}\n\n${JSON.stringify({ tags, total }, null, 2)}`,
+            text: `${summary}\n\n${JSON.stringify({ tags, total })}`,
           },
         ],
       };

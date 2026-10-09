@@ -20,6 +20,8 @@ let activeTab = 'overview';
 let data = {};               // latest SSE payload
 let lastUpdateTs = 0;        // wall-clock of last SSE message (for "updated Ns ago")
 let es = null;               // the single EventSource
+let health = null;           // latest GET /health JSON (polled; no auth needed)
+const HEALTH_POLL_MS = 30000;
 
 /** Register a tab module (called from app.js for each tab). */
 export function registerTab(mod) { tabs.set(mod.id, mod); }
@@ -94,6 +96,8 @@ export function setLive(id, text) {
 /** Context passed to every tab init/refresh. `data` is a live payload getter. */
 export const ctx = {
   get data() { return data; },
+  /** Latest GET /health JSON (null until the first poll succeeds). */
+  get health() { return health; },
   $, esc, escAttr, on, fmt, charts,
   toast, postAction, fetchJson, copyLogLine, setLive, switchTab,
 };
@@ -218,11 +222,41 @@ function reconnect() {
   connectSse();
 }
 
-/** Boot the dashboard: wire tab bar, start clock, connect SSE, activate default tab. */
+// ── /health polling (version · commit in the header, Server card on Overview) ─
+// GET /health needs no auth and is cheap; it is polled every HEALTH_POLL_MS
+// independently of the SSE payload so the header shows the running version
+// even before the first SSE push (and keeps the last snapshot on failure).
+
+function renderServerVersion(h) {
+  var sv = $('serverVersion');
+  if (!sv) return;
+  var v = h && h.version ? 'v' + h.version : '';
+  var c = h && typeof h.commit === 'string' && h.commit && h.commit !== 'unknown' ? h.commit.slice(0, 7) : '';
+  sv.textContent = (v && c) ? v + ' · ' + c : (v || c || '—');
+  sv.setAttribute('title', 'Server ' + (v || '?') + (c ? ' · commit ' + c : '') + ' (from /health)');
+}
+
+function pollHealth() {
+  fetch('/health', { cache: 'no-store' })
+    .then(function (r) { return r.ok ? r.json() : null; })
+    .then(function (h) {
+      if (!h || typeof h !== 'object') return;
+      health = h;
+      renderServerVersion(h);
+      var mod = tabs.get(activeTab);
+      var el = $('tab-' + activeTab);
+      if (mod && el && mod.refresh) mod.refresh(el, ctx);
+    })
+    .catch(function () { /* unreachable: keep the last snapshot */ });
+}
+
+/** Boot the dashboard: wire tab bar, start clock, connect SSE, poll /health, activate default tab. */
 export function boot() {
   wireTabBar();
   startClock();
   on($('refreshBtn'), 'click', reconnect);
   connectSse();
+  pollHealth();
+  setInterval(pollHealth, HEALTH_POLL_MS);
   switchTab(activeTab);
 }

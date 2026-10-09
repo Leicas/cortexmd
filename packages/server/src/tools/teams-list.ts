@@ -20,7 +20,7 @@ Optionally filter by tag.`,
         content: [
           {
             type: 'text' as const,
-            text: JSON.stringify({ teams, total: teams.length }, null, 2),
+            text: JSON.stringify({ teams, total: teams.length }),
           },
         ],
       };

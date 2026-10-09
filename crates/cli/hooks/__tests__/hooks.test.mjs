@@ -318,7 +318,9 @@ describe('(e) wakeup_directive_hook', () => {
   test('source:"startup" → standard preset + project link + bare tool name', () => {
     const c = ctx(run('wakeup_directive_hook.mjs', { cwd: repoRoot, source: 'startup' }));
     assert.ok(c.includes('preset="standard"'), c);
-    assert.ok(/memory_wakeup\(agentName="Claude Code \(.+\)", preset="standard"\)/.test(c), c);
+    // project=/machine= are appended when known (wakeup directive hook); both forms are valid.
+    assert.ok(/memory_wakeup\(agentName="Claude Code \(.+\)", preset="standard"(, project="[^"]+")?(, machine="[^"]+")?\)/.test(c), c);
+    assert.ok(c.includes('project="fixture-repo"'), c);
     assert.ok(c.includes('[[Projects/fixture-repo]]'));
     assert.ok(c.includes('[[Machines/'));
     assert.ok(!c.includes('mcp__'), 'tool names must be bare');
@@ -381,6 +383,82 @@ describe('(g) precompact_diary_hook', () => {
     const other = run('precompact_diary_hook.mjs', { ...evt, session_id: 'pc-B', trigger: 'manual' });
     assert.equal(other.decision, 'block');
     assert.ok(other.reason.includes('(manual)'));
+  });
+});
+
+describe('(i) server unreachable — one notice per session, then quiet', () => {
+  const UNREACHABLE = 'cortexmd server unreachable — memory features off this session';
+  const prompt = 'How does hybridSearch rank memories vs notes in search.ts?';
+
+  test('first failing prompt → notice; second → {} without spawning; diary/precompact hooks pass through', () => {
+    const sid = 'unr-A';
+    const first = run('userprompt_hook.mjs', { prompt, session_id: sid, cwd: repoRoot }, { FAKE_CORTEXMD_FAIL: '1' });
+    assert.equal(ctx(first), UNREACHABLE);
+    assert.ok(existsSync(join(stateHome, 'cortexmd', 'sessions', sid, 'unreachable.json')), 'marker missing');
+
+    resetLog();
+    assert.deepEqual(run('userprompt_hook.mjs', { prompt, session_id: sid, cwd: repoRoot }, { FAKE_CORTEXMD_FAIL: '1' }), {});
+    assert.equal(stubCalls('recall').length, 0, 'must not spawn the CLI again while the marker is fresh');
+
+    // Diary nudges would only produce a failed tool call: skipped (one-shot not consumed).
+    assert.deepEqual(run('diary_stop_hook.mjs', { cwd: repoRoot, session_id: sid }, { DIARY_STOP_EVERY: '1' }), {});
+    assert.deepEqual(run('precompact_diary_hook.mjs', { cwd: repoRoot, session_id: sid, trigger: 'auto' }), {});
+    assert.ok(!existsSync(join(stateHome, 'cortexmd', 'sessions', sid, 'precompact.json')), 'precompact one-shot consumed');
+  });
+
+  test('a successful recall clears the marker; another session is unaffected', () => {
+    const sid = 'unr-B';
+    assert.equal(ctx(run('userprompt_hook.mjs', { prompt, session_id: sid }, { FAKE_CORTEXMD_FAIL: '1' })), UNREACHABLE);
+    // Server is back: the marker must be cleared on the next successful call…
+    // (a fresh marker skips the spawn, so expire it first)
+    const marker = join(stateHome, 'cortexmd', 'sessions', sid, 'unreachable.json');
+    writeFileSync(marker, JSON.stringify({ unreachable: true, at: new Date(Date.now() - 3600_000).toISOString() }));
+    const ok = run('userprompt_hook.mjs', { prompt, session_id: sid });
+    assert.ok(ctx(ok).startsWith(RECALL_HEADER), ctx(ok));
+    assert.ok(!existsSync(marker), 'marker not cleared after success');
+    // Independent session still gets its own single notice.
+    assert.equal(ctx(run('userprompt_hook.mjs', { prompt, session_id: 'unr-C' }, { FAKE_CORTEXMD_FAIL: '1' })), UNREACHABLE);
+  });
+
+  test('without a session_id the hook stays silent on failure (nothing to dedupe on)', () => {
+    assert.deepEqual(run('userprompt_hook.mjs', { prompt }, { FAKE_CORTEXMD_FAIL: '1' }), {});
+  });
+});
+
+describe('(j) seen-set — a memory is injected once per session', () => {
+  const DECISION = 'Memories/decision/2026-09-01-use-node-test-runner.md';
+  test('second prompt passes --seen/--project and does not re-inject the first prompt\'s items', () => {
+    const sid = 'seen-A';
+    resetLog();
+    const first = run('userprompt_hook.mjs', { prompt: 'How does hybridSearch rank memories vs notes in search.ts?', session_id: sid, cwd: repoRoot });
+    assert.ok(ctx(first).includes(`[[${DECISION}]]`), ctx(first));
+    let rc = stubCalls('recall');
+    assert.equal(rc.length, 1);
+    assert.ok(!rc[0].argv.includes('--seen'), 'nothing seen yet');
+    assert.equal(rc[0].argv[rc[0].argv.indexOf('--project') + 1], 'fixture-repo');
+    assert.equal(rc[0].argv[rc[0].argv.indexOf('--min-importance') + 1], 'medium');
+    const seenFile = join(stateHome, 'cortexmd', 'sessions', sid, 'seen.json');
+    assert.ok(existsSync(seenFile));
+    const seen = JSON.parse(readFileSync(seenFile, 'utf8')).paths;
+    assert.ok(seen.includes(DECISION), JSON.stringify(seen));
+    assert.ok(seen.includes('Projects/cortexmd.md'));
+
+    resetLog();
+    const second = run('userprompt_hook.mjs', { prompt: 'Now explain the co-recall spreading activation in detail please.', session_id: sid, cwd: repoRoot });
+    rc = stubCalls('recall');
+    assert.equal(rc.length, 1);
+    const a = rc[0].argv;
+    assert.ok(a.includes('--seen'), 'seen paths not forwarded');
+    assert.equal(a[a.indexOf('--seen') + 1], DECISION);
+    assert.equal(a[a.indexOf('--limit') + 1], '7', 'over-fetch by the seen count');
+    // The stub ignores --seen, so the client-side filter must drop the repeats.
+    assert.ok(!ctx(second).includes(DECISION), `re-injected: ${ctx(second)}`);
+    assert.ok(!ctx(second).includes('Projects/cortexmd.md'));
+  });
+
+  test('sessions keep independent seen-sets', () => {
+    const c = ctx(run('userprompt_hook.mjs', { prompt: 'How does hybridSearch rank memories vs notes in search.ts?', session_id: 'seen-B', cwd: repoRoot }));
+    assert.ok(c.includes(`[[${DECISION}]]`), c);
   });
 });
 

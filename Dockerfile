@@ -33,9 +33,15 @@ RUN npm run build
 # --- Stage 2: runtime -------------------------------------------------------
 FROM node:22-slim AS runtime
 WORKDIR /app
+# NODE_OPTIONS: without it Node 22 caps the old-space heap at ~792 MB
+# regardless of the container limit, and a vault-sized index + embeddings
+# OOM-crash well under a 1.5 GiB mem_limit. Override at runtime (compose
+# `NODE_OPTIONS`) — keep the container limit >= heap cap + ~500 MB for
+# native (HNSW, sqlite, model) memory. See docs/deploy-http.md §5.
 ENV NODE_ENV=production \
     API_PORT=3000 \
-    DATA_DIR=/app/data
+    DATA_DIR=/app/data \
+    NODE_OPTIONS="--max-old-space-size=1024"
 
 # Release version + commit, injected at build time by CI (release.yml). Default
 # to "dev"/"unknown" for local builds. Surfaced via /health and the MCP server

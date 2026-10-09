@@ -142,6 +142,13 @@ fn open_session(
     Ok((server, key, session_id, source))
 }
 
+/// Best-effort `DELETE /mcp` for a session opened with [`open_session`] /
+/// `mcp::initialize`. Errors are ignored: the server reaps idle sessions on
+/// its own; closing eagerly just keeps its session map small.
+fn close_session(server: &str, key: &str, session_id: &str) {
+    let _ = mcp::delete_session(server, key, session_id);
+}
+
 /// Extract the inner JSON-RPC text content from a tools/call response shape.
 /// MCP wraps tool output as `{ content: [{ type: "text", text: "<json>" }] }`.
 fn unwrap_tool_text(result: &Value) -> Option<Value> {
@@ -173,8 +180,12 @@ fn is_unknown_tool_error(err: &anyhow::Error) -> bool {
 // ── status ─────────────────────────────────────────────────────────────────
 
 pub fn cmd_status() -> Result<()> {
+    // /health is unauthenticated and cheap: print the server identity before
+    // anything that can fail on auth, so a bad token still shows what we hit.
+    let (server_pre, _, _) = resolve_or_bail(None, None)?;
+    let health = fetch_health(&server_pre);
     let (server, key, session_id, source) = open_session(None, None)?;
-    println!("Server  {}  (auth: {}{})", server, source, oauth_expiry_suffix());
+    print_server_header(&server, &source, health.as_ref());
     println!("Machine {} (override via MACHINE_ID)", detect_machine_id());
     println!();
 
@@ -215,7 +226,180 @@ pub fn cmd_status() -> Result<()> {
         }
     }
 
+    close_session(&server, &key, &session_id);
     Ok(())
+}
+
+/// `GET /health` (no auth, 3 s connect / 30 s global via the shared agent).
+/// `None` when the server is unreachable or the body is not JSON.
+fn fetch_health(server: &str) -> Option<Value> {
+    let url = format!("{}/health", server.trim_end_matches('/'));
+    let mut resp = mcp::http_agent()
+        .get(&url)
+        .header("Accept", "application/json")
+        .call()
+        .ok()?;
+    if resp.status().as_u16() >= 400 {
+        return None;
+    }
+    let text = resp.body_mut().read_to_string().ok()?;
+    serde_json::from_str::<Value>(&text).ok()
+}
+
+/// Header lines for `cortexmd status` (I-1 /health shape):
+///   Server  <url>  v<version> (<commit[..7]>)  (auth: ...)
+///   heap/sessions line
+///   cli v<CARGO_PKG_VERSION>[ — update available: vX.Y.Z]
+fn print_server_header(server: &str, source: &str, health: Option<&Value>) {
+    let auth = format!("(auth: {}{})", source, oauth_expiry_suffix());
+    match health {
+        Some(h) => {
+            let version = h.get("version").and_then(|v| v.as_str()).unwrap_or("?");
+            let commit = h
+                .get("commit")
+                .and_then(|v| v.as_str())
+                .map(|c| c.chars().take(7).collect::<String>())
+                .filter(|c| !c.is_empty());
+            match commit {
+                Some(c) => println!("Server  {}  v{} ({})  {}", server, version, c, auth),
+                None => println!("Server  {}  v{}  {}", server, version, auth),
+            }
+            if let Some(line) = health_detail_line(h) {
+                println!("        {}", line);
+            }
+        }
+        None => println!("Server  {}  (no /health response)  {}", server, auth),
+    }
+    let cli_version = env!("CARGO_PKG_VERSION");
+    match latest_release_version() {
+        Some(latest) if semver_newer(&latest, cli_version) => println!(
+            "cli     v{}  — update available: v{} (https://github.com/Leicas/cortexmd/releases/latest)",
+            cli_version, latest
+        ),
+        _ => println!("cli     v{}", cli_version),
+    }
+}
+
+/// `heap 123/1024 MB · sessions 3/200 active, 41 persisted · uptime 2d 3h ·
+/// last index +12/-1 in 340 ms` — every part optional, built from I-1 fields.
+fn health_detail_line(h: &Value) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(heap) = h.get("heap") {
+        let used = heap.get("usedMb").and_then(|v| v.as_f64());
+        let limit = heap.get("limitMb").and_then(|v| v.as_f64());
+        match (used, limit) {
+            (Some(u), Some(l)) => parts.push(format!("heap {:.0}/{:.0} MB", u, l)),
+            (Some(u), None) => parts.push(format!("heap {:.0} MB", u)),
+            _ => {}
+        }
+    }
+    if let Some(s) = h.get("sessions") {
+        let active = s.get("active").and_then(|v| v.as_u64());
+        let max = s.get("maxActive").and_then(|v| v.as_u64());
+        let persisted = s.get("persisted").and_then(|v| v.as_u64());
+        if let Some(a) = active {
+            let mut t = match max {
+                Some(m) => format!("sessions {}/{} active", a, m),
+                None => format!("sessions {} active", a),
+            };
+            if let Some(p) = persisted {
+                t.push_str(&format!(", {} persisted", p));
+            }
+            parts.push(t);
+        }
+    } else if let Some(a) = h.get("activeSessions").and_then(|v| v.as_u64()) {
+        parts.push(format!("sessions {} active", a));
+    }
+    if let Some(up) = h.get("uptime").and_then(|v| v.as_f64()) {
+        parts.push(format!("uptime {}", fmt_uptime(up)));
+    }
+    if let Some(li) = h.get("lastIndexUpdate").filter(|v| v.is_object()) {
+        let updated = li.get("updated").and_then(|v| v.as_u64()).unwrap_or(0);
+        let removed = li.get("removed").and_then(|v| v.as_u64()).unwrap_or(0);
+        let ms = li.get("ms").and_then(|v| v.as_u64());
+        let mut t = format!("last index +{}/-{}", updated, removed);
+        if let Some(ms) = ms {
+            t.push_str(&format!(" in {} ms", ms));
+        }
+        if let Some(c) = li.get("collisions").and_then(|v| v.as_u64()).filter(|c| *c > 0) {
+            t.push_str(&format!(" ({} collisions)", c));
+        }
+        parts.push(t);
+    }
+    if let Some(le) = h
+        .get("restarts")
+        .and_then(|r| r.get("lastExit"))
+        .filter(|v| v.is_object())
+    {
+        let reason = le.get("reason").and_then(|v| v.as_str()).unwrap_or("?");
+        let at = le.get("at").and_then(|v| v.as_str()).unwrap_or("?");
+        parts.push(format!("last exit {} at {}", reason, at));
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" · "))
+    }
+}
+
+fn fmt_uptime(seconds: f64) -> String {
+    let s = seconds.max(0.0) as u64;
+    let (d, h, m) = (s / 86_400, (s % 86_400) / 3_600, (s % 3_600) / 60);
+    if d > 0 {
+        format!("{}d {}h", d, h)
+    } else if h > 0 {
+        format!("{}h {}m", h, m)
+    } else {
+        format!("{}m", m)
+    }
+}
+
+/// Latest published release tag on GitHub (`vX.Y.Z` → `X.Y.Z`). Short timeout,
+/// silent on any failure — offline machines must not slow `status` down.
+fn latest_release_version() -> Option<String> {
+    if std::env::var_os("CORTEXMD_NO_UPDATE_CHECK").is_some() {
+        return None;
+    }
+    let url = "https://api.github.com/repos/Leicas/cortexmd/releases/latest";
+    let mut resp = mcp::http_agent()
+        .get(url)
+        .config()
+        .timeout_global(Some(std::time::Duration::from_secs(3)))
+        .build()
+        .header("Accept", "application/vnd.github+json")
+        .header("User-Agent", concat!("cortexmd-cli/", env!("CARGO_PKG_VERSION")))
+        .call()
+        .ok()?;
+    if resp.status().as_u16() >= 400 {
+        return None;
+    }
+    let text = resp.body_mut().read_to_string().ok()?;
+    let v: Value = serde_json::from_str(&text).ok()?;
+    let tag = v.get("tag_name").and_then(|t| t.as_str())?;
+    let tag = tag.trim().trim_start_matches('v');
+    if tag.is_empty() {
+        None
+    } else {
+        Some(tag.to_string())
+    }
+}
+
+/// Parse `MAJOR.MINOR.PATCH[-pre]` into a comparable triple (pre-release
+/// suffix ignored). Non-numeric parts default to 0.
+fn semver_triple(v: &str) -> (u64, u64, u64) {
+    let core = v.trim().trim_start_matches('v');
+    let core = core.split(['-', '+']).next().unwrap_or("");
+    let mut it = core.split('.').map(|p| p.parse::<u64>().unwrap_or(0));
+    (
+        it.next().unwrap_or(0),
+        it.next().unwrap_or(0),
+        it.next().unwrap_or(0),
+    )
+}
+
+/// True when `latest` is strictly newer than `current`.
+fn semver_newer(latest: &str, current: &str) -> bool {
+    semver_triple(latest) > semver_triple(current)
 }
 
 /// Returns ", token expires in 29d 4h" or ", token EXPIRED — re-run auth oauth-login"
@@ -545,7 +729,9 @@ impl Registry {
 /// that hasn't been updated yet.
 fn fetch_registry() -> Result<Registry> {
     let (server, key, session_id, _source) = open_session(None, None)?;
-    let result = mcp::tools_call(&server, &key, &session_id, "code_repo_list", &Value::Object(Default::default()))?;
+    let result = mcp::tools_call(&server, &key, &session_id, "code_repo_list", &Value::Object(Default::default()));
+    close_session(&server, &key, &session_id);
+    let result = result?;
     let Some(payload) = unwrap_tool_text(&result) else {
         return Ok(Registry::default());
     };
@@ -863,7 +1049,9 @@ fn sum_indexed_counts(paths: &[PathBuf]) -> Result<(i64, i64, i64)> {
         &sid,
         "code_repo_list",
         &Value::Object(Default::default()),
-    )?;
+    );
+    close_session(&server, &key, &sid);
+    let v = v?;
     let payload = unwrap_tool_text(&v)
         .ok_or_else(|| anyhow!("code_repo_list returned an unrecognized response shape"))?;
     let repos = payload
@@ -1179,10 +1367,10 @@ fn write_custom_line(config_path: &Path, new_line: &str) -> Result<()> {
 
 fn fetch_hud_stats(server: &str, api_key: &str) -> Result<Value> {
     let url = format!("{}/api/hud-stats", server.trim_end_matches('/'));
-    let req = ureq::get(&url)
+    let mut resp = mcp::http_agent()
+        .get(&url)
         .header("Authorization", format!("Bearer {}", api_key))
-        .header("Accept", "application/json");
-    let mut resp = req
+        .header("Accept", "application/json")
         .call()
         .with_context(|| format!("GET {} failed", url))?;
     let status = resp.status();
@@ -1204,6 +1392,10 @@ struct ClaimedIndexRequest {
     abs_path: String,
     slug: Option<String>,
     reason: Option<String>,
+    /// Server-side claim counter (I-3); `None` on servers that predate it.
+    attempts: Option<u64>,
+    /// Error text we reported on an earlier attempt, if any.
+    last_error: Option<String>,
 }
 
 /// Claim this machine's pending proxy-index requests via the REST mirror of the
@@ -1233,6 +1425,13 @@ fn claim_index_requests(
             abs_path,
             slug: v.get("slug").and_then(|s| s.as_str()).map(str::to_string),
             reason: v.get("reason").and_then(|s| s.as_str()).map(str::to_string),
+            attempts: v.get("attempts").and_then(|a| a.as_u64()),
+            last_error: v
+                .get("lastError")
+                .or_else(|| v.get("last_error"))
+                .and_then(|s| s.as_str())
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
         });
     }
     Ok(out)
@@ -1245,11 +1444,73 @@ fn claim_index_requests(
 /// missing/non-git path or a failed re-index is logged and skipped so one bad
 /// entry can't stall the rest (a skipped claim is reclaimed by the server after
 /// the grace window). Returns the number of repos actually re-indexed.
+/// How long a path that failed to re-index is left alone before the daemon
+/// tries it again, even if the server keeps re-serving the claim.
+const INDEX_FAIL_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+/// Backoff memory for proxy-index requests that failed locally (bad path,
+/// parse error, server rejected the payload...). Keyed by `abs_path`.
+type FailedIndexPaths = HashMap<String, Instant>;
+
+/// True when `abs_path` failed less than `backoff` ago. Entries older than the
+/// backoff are dropped so the map can't grow without bound.
+fn index_path_in_backoff(
+    failed: &mut FailedIndexPaths,
+    abs_path: &str,
+    now: Instant,
+    backoff: std::time::Duration,
+) -> bool {
+    match failed.get(abs_path) {
+        Some(&at) if now.saturating_duration_since(at) < backoff => true,
+        Some(_) => {
+            failed.remove(abs_path);
+            false
+        }
+        None => false,
+    }
+}
+
+/// Tell the server a claimed proxy-index request could not be fulfilled
+/// (`POST /api/code-index-requests/fail`, I-3). The server bumps `attempts`
+/// and parks the row as `failed` after `MAX_INDEX_ATTEMPTS`, so it stops
+/// re-serving the same broken claim every poll. Returns the server's
+/// `{ id, attempts, status }` when the route exists, `Ok(None)` on a 404
+/// (older server without the route, or no outstanding row) — never fatal.
+fn report_index_request_failure(
+    server: &str,
+    key: &str,
+    abs_path: &str,
+    machine_id: &str,
+    error: &str,
+) -> Result<Option<Value>> {
+    // Keep the error short: it is stored in a TEXT column and echoed back in
+    // the poll response.
+    let error: String = error.chars().take(500).collect();
+    let payload = serde_json::json!({
+        "abs_path": abs_path,
+        "machine_id": machine_id,
+        "error": error,
+    });
+    let (status, text) = post_json_status(server, "/api/code-index-requests/fail", key, &payload)?;
+    if status == 404 {
+        return Ok(None);
+    }
+    if status >= 400 {
+        anyhow::bail!(
+            "POST /api/code-index-requests/fail returned {}: {}",
+            status,
+            text.chars().take(200).collect::<String>()
+        );
+    }
+    Ok(Some(parse_json_body(&text, "/api/code-index-requests/fail")?))
+}
+
 fn poll_and_fulfill_index_requests(
     server: &str,
     key: &str,
     machine_id: &str,
     index_fn: &impl Fn(IndexArgs) -> Result<()>,
+    failed: &mut FailedIndexPaths,
 ) -> Result<usize> {
     let requests = claim_index_requests(server, key, machine_id, 20)?;
     if requests.is_empty() {
@@ -1261,19 +1522,40 @@ fn poll_and_fulfill_index_requests(
         if !seen.insert(req.abs_path.clone()) {
             continue; // dedup repeated paths within a single batch
         }
-        let path = PathBuf::from(&req.abs_path);
-        if !path.exists() {
-            eprintln!("[hud-line] proxy-index: skip missing path {}", req.abs_path);
+        let now = Instant::now();
+        if index_path_in_backoff(failed, &req.abs_path, now, INDEX_FAIL_BACKOFF) {
+            eprintln!(
+                "[hud-line] proxy-index: skip {} (failed <1h ago; attempts={})",
+                req.abs_path,
+                req.attempts.map(|a| a.to_string()).unwrap_or_else(|| "?".into())
+            );
             continue;
         }
-        if !path.join(".git").exists() {
-            eprintln!("[hud-line] proxy-index: skip non-git path {}", req.abs_path);
+        let path = PathBuf::from(&req.abs_path);
+        let precheck: Option<String> = if !path.exists() {
+            Some("path does not exist on this machine".to_string())
+        } else if !path.join(".git").exists() {
+            Some("path is not a git checkout".to_string())
+        } else {
+            None
+        };
+        if let Some(why) = precheck {
+            eprintln!("[hud-line] proxy-index: skip {} ({})", req.abs_path, why);
+            failed.insert(req.abs_path.clone(), now);
+            note_index_failure(server, key, &req.abs_path, machine_id, &why);
             continue;
         }
         eprintln!(
-            "[hud-line] proxy-index: re-indexing {} (reason: {})",
+            "[hud-line] proxy-index: re-indexing {} (reason: {}{}{})",
             req.abs_path,
             req.reason.as_deref().unwrap_or("stale query"),
+            req.attempts
+                .map(|a| format!(", attempt {}", a))
+                .unwrap_or_default(),
+            req.last_error
+                .as_deref()
+                .map(|e| format!(", last error: {}", e.chars().take(80).collect::<String>()))
+                .unwrap_or_default(),
         );
         let args = IndexArgs {
             repo_path: Some(path),
@@ -1286,14 +1568,39 @@ fn poll_and_fulfill_index_requests(
             verbose: false,
         };
         match index_fn(args) {
-            Ok(()) => fulfilled += 1,
-            Err(e) => eprintln!(
-                "[hud-line] proxy-index: re-index of {} failed: {}",
-                req.abs_path, e
-            ),
+            Ok(()) => {
+                fulfilled += 1;
+                failed.remove(&req.abs_path);
+            }
+            Err(e) => {
+                let msg = format!("{:#}", e);
+                eprintln!(
+                    "[hud-line] proxy-index: re-index of {} failed: {}",
+                    req.abs_path, msg
+                );
+                failed.insert(req.abs_path.clone(), now);
+                note_index_failure(server, key, &req.abs_path, machine_id, &msg);
+            }
         }
     }
     Ok(fulfilled)
+}
+
+/// Best-effort wrapper around [`report_index_request_failure`]: logs the
+/// outcome, never propagates (a failure to report must not stall the poll).
+fn note_index_failure(server: &str, key: &str, abs_path: &str, machine_id: &str, error: &str) {
+    match report_index_request_failure(server, key, abs_path, machine_id, error) {
+        Ok(Some(v)) => eprintln!(
+            "[hud-line] proxy-index: reported failure for {} (attempts={}, status={})",
+            abs_path,
+            v.get("attempts").and_then(|a| a.as_u64()).unwrap_or(0),
+            v.get("status").and_then(|s| s.as_str()).unwrap_or("?")
+        ),
+        Ok(None) => eprintln!(
+            "[hud-line] proxy-index: server has no /api/code-index-requests/fail route (or no outstanding row) — local 1h backoff only"
+        ),
+        Err(e) => eprintln!("[hud-line] proxy-index: failure report for {} failed: {}", abs_path, e),
+    }
 }
 
 pub fn cmd_hud_line(args: HudLineArgs, index_fn: impl Fn(IndexArgs) -> Result<()>) -> Result<()> {
@@ -1391,6 +1698,7 @@ pub fn cmd_hud_line(args: HudLineArgs, index_fn: impl Fn(IndexArgs) -> Result<()
 
     let mut last_line = String::new();
     let interval = std::time::Duration::from_secs(args.interval.max(1));
+    let mut failed_paths: FailedIndexPaths = HashMap::new();
 
     loop {
         if let Some(cfg) = &hud_config {
@@ -1416,7 +1724,7 @@ pub fn cmd_hud_line(args: HudLineArgs, index_fn: impl Fn(IndexArgs) -> Result<()
 
         // Proxy-indexing consumer: fulfill any re-index requests the server
         // enqueued for this machine when a code-nav query came up stale/empty.
-        match poll_and_fulfill_index_requests(&server, &key, &machine_id, &index_fn) {
+        match poll_and_fulfill_index_requests(&server, &key, &machine_id, &index_fn, &mut failed_paths) {
             Ok(n) if n > 0 => eprintln!("[hud-line] proxy-index: re-indexed {} repo(s)", n),
             Ok(_) => {}
             Err(e) => eprintln!("[hud-line] proxy-index poll failed: {}", e),
@@ -1439,26 +1747,45 @@ pub fn cmd_hud_line(args: HudLineArgs, index_fn: impl Fn(IndexArgs) -> Result<()
 // ── recall / store-memory (Claude Code hook bridge) ───────────────────────
 
 fn post_json_simple(server: &str, path: &str, key: &str, payload: &Value) -> Result<Value> {
+    let (status, text) = post_json_status(server, path, key, payload)?;
+    if status >= 400 {
+        anyhow::bail!(
+            "POST {}{} returned {}: {}",
+            server.trim_end_matches('/'),
+            path,
+            status,
+            text
+        );
+    }
+    parse_json_body(&text, path)
+}
+
+/// POST compact JSON through the shared agent (3 s connect / 30 s global
+/// timeouts, see mcp.rs) and return `(status, body)` without treating 4xx/5xx
+/// as an error — callers that need to special-case a status (404 from a route
+/// an older server doesn't have yet) use this directly.
+fn post_json_status(server: &str, path: &str, key: &str, payload: &Value) -> Result<(u16, String)> {
     let url = format!("{}{}", server.trim_end_matches('/'), path);
-    let body = serde_json::to_string(payload).context("serialize payload")?;
-    let mut resp = ureq::post(&url)
+    let body = serde_json::to_vec(payload).context("serialize payload")?;
+    let mut resp = mcp::http_agent()
+        .post(&url)
         .header("Authorization", format!("Bearer {}", key))
         .header("Content-Type", "application/json")
-        .send(body.as_bytes())
+        .send(&body[..])
         .with_context(|| format!("POST {} failed", url))?;
-    let status = resp.status();
+    let status = resp.status().as_u16();
     let text = resp
         .body_mut()
         .read_to_string()
         .with_context(|| format!("read body {}", url))?;
-    if status.as_u16() >= 400 {
-        anyhow::bail!("POST {} returned {}: {}", url, status, text);
-    }
-    if text.is_empty() {
+    Ok((status, text))
+}
+
+fn parse_json_body(text: &str, what: &str) -> Result<Value> {
+    if text.trim().is_empty() {
         return Ok(Value::Object(Default::default()));
     }
-    serde_json::from_str::<Value>(&text)
-        .with_context(|| format!("parse JSON from {}", url))
+    serde_json::from_str::<Value>(text).with_context(|| format!("parse JSON from {}", what))
 }
 
 // ── recall rendering (shared contract with crates/cli/hooks/_mcp_rest.mjs) ──
@@ -1683,11 +2010,22 @@ pub fn cmd_recall(args: RecallArgs) -> Result<()> {
         anyhow::bail!("--query is required and cannot be empty");
     }
     let (server, key, _source) = resolve_or_bail(args.server.as_deref(), args.api_key.as_deref())?;
-    let payload = serde_json::json!({
+    let mut payload = serde_json::json!({
         "query": args.query,
         "limit": args.limit,
         "kinds": args.kinds,
     });
+    // Optional ranking filters (forwarded verbatim; the server ignores unknown
+    // keys, so an older server keeps working).
+    if !args.seen.is_empty() {
+        payload["seen"] = serde_json::json!(args.seen);
+    }
+    if let Some(project) = args.project.as_deref().filter(|s| !s.trim().is_empty()) {
+        payload["project"] = serde_json::json!(project);
+    }
+    if let Some(level) = args.min_importance.as_deref().filter(|s| !s.trim().is_empty()) {
+        payload["minImportance"] = serde_json::json!(level);
+    }
     let resp = post_json_simple(&server, "/api/recall", &key, &payload)?;
 
     match args.format.as_str() {
@@ -2388,8 +2726,9 @@ fn post_or_mcp_fallback(
         Ok(v) => Ok(v),
         Err(e) if is_http_404(&e) => {
             let (session_id, _) = mcp::initialize(server, key)?;
-            let raw = mcp::tools_call(server, key, &session_id, mcp_tool, payload)?;
-            Ok(unwrap_mcp_text_content(raw))
+            let raw = mcp::tools_call(server, key, &session_id, mcp_tool, payload);
+            close_session(server, key, &session_id);
+            Ok(unwrap_mcp_text_content(raw?))
         }
         Err(e) => Err(e),
     }
@@ -2720,6 +3059,7 @@ pub fn cmd_gain(args: GainArgs) -> Result<()> {
         "code_nav_stats",
         &Value::Object(Default::default()),
     );
+    close_session(&server, &key, &session_id);
     match result {
         Ok(v) => {
             let payload = unwrap_tool_text(&v)
@@ -2765,7 +3105,9 @@ pub fn cmd_pull(args: PullArgs) -> Result<()> {
         &session_id,
         "code_sync_pull",
         &Value::Object(tool_args),
-    )?;
+    );
+    close_session(&server, &key, &session_id);
+    let result = result?;
 
     let payload_text = result
         .get("content")
@@ -3043,5 +3385,67 @@ mod tests {
             shell_subcommands("a && b || c; d | e\nf"),
             vec!["a", "b", "c", "d", "e", "f"]
         );
+    }
+}
+
+#[cfg(test)]
+mod proxy_index_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn failed_path_backoff_window() {
+        let mut failed: FailedIndexPaths = HashMap::new();
+        let t0 = Instant::now();
+        let backoff = Duration::from_secs(3600);
+        let p = "D:/dev/broken";
+
+        // Unknown path: not in backoff.
+        assert!(!index_path_in_backoff(&mut failed, p, t0, backoff));
+
+        // Just failed: skipped for the whole window...
+        failed.insert(p.to_string(), t0);
+        assert!(index_path_in_backoff(&mut failed, p, t0, backoff));
+        assert!(index_path_in_backoff(&mut failed, p, t0 + Duration::from_secs(3599), backoff));
+        // ...a different path is unaffected...
+        assert!(!index_path_in_backoff(&mut failed, "D:/dev/other", t0, backoff));
+        // ...and once the window elapses the entry is retried AND evicted.
+        assert!(!index_path_in_backoff(&mut failed, p, t0 + backoff, backoff));
+        assert!(!failed.contains_key(p));
+    }
+
+    #[test]
+    fn semver_compare_for_update_check() {
+        assert!(semver_newer("1.19.0", "1.18.2"));
+        assert!(semver_newer("v2.0.0", "1.99.99"));
+        assert!(semver_newer("1.18.3", "1.18.2"));
+        assert!(!semver_newer("1.18.2", "1.18.2"));
+        assert!(!semver_newer("1.18.1", "1.18.2"));
+        assert!(!semver_newer("0.2.0", "1.0.0"));
+        // Pre-release suffixes are ignored, garbage parses as 0.
+        assert!(semver_newer("1.19.0-rc.1", "1.18.2"));
+        assert!(!semver_newer("garbage", "0.0.1"));
+        assert_eq!(semver_triple("v1.2.3+build"), (1, 2, 3));
+    }
+
+    #[test]
+    fn health_detail_line_renders_i1_fields() {
+        let h = serde_json::json!({
+            "status": "ok", "version": "1.18.0", "commit": "abcdef0123",
+            "uptime": 93784.0,
+            "heap": { "usedMb": 123.4, "totalMb": 200.0, "rssMb": 300.0, "limitMb": 1024.0 },
+            "sessions": { "active": 3, "persisted": 41, "maxActive": 200, "timeoutMs": 1800000 },
+            "lastIndexUpdate": { "at": "2026-10-09T10:00:00Z", "updated": 12, "removed": 1, "ms": 340, "collisions": 0 },
+            "restarts": { "lastExit": null }
+        });
+        let line = health_detail_line(&h).unwrap();
+        assert_eq!(
+            line,
+            "heap 123/1024 MB · sessions 3/200 active, 41 persisted · uptime 1d 2h · last index +12/-1 in 340 ms"
+        );
+        // Older server: only activeSessions, nothing else.
+        let old = serde_json::json!({ "status": "ok", "activeSessions": 2 });
+        assert_eq!(health_detail_line(&old).as_deref(), Some("sessions 2 active"));
+        assert_eq!(health_detail_line(&serde_json::json!({})), None);
     }
 }

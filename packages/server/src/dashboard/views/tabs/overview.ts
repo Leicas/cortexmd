@@ -78,6 +78,36 @@ export function renderOverviewTab(): string {
     })}</div>
   </div>`;
 
+  // ── Band B′ — Server card ─────────────────────────────────────────────────
+  // Filled from GET /health (polled client-side by core.js, no auth). Reads the
+  // I-1 shape (heap / sessions / lastIndexUpdate / restarts) and degrades to
+  // the legacy shape (version, commit, uptime, activeSessions, indexedNotes).
+  const serverCard = `
+  <div class="grid">
+    <div class="col-12 card" id="serverCard">
+      <div class="section-head">
+        <div class="section-title" style="margin:0">Server</div>
+        <span class="card-sub" id="srvVersion" style="margin:0">—</span>
+      </div>
+      <div class="grid" style="margin-top:.5rem">
+        <div class="col-4">
+          <div class="card-label">Heap</div>
+          <div class="card-sub" id="srvHeap" style="margin:0 0 .3rem">—</div>
+          <div class="stacked-bar stacked-bar--sm" id="srvHeapBar" role="img" aria-label="Heap used vs limit"></div>
+        </div>
+        <div class="col-4">
+          <div class="card-label">Sessions</div>
+          <div class="card-sub" id="srvSessions" style="margin:0">—</div>
+        </div>
+        <div class="col-4">
+          <div class="card-label">Last index update</div>
+          <div class="card-sub" id="srvIndex" style="margin:0">—</div>
+        </div>
+      </div>
+      <div class="card-sub" id="srvLastExit" style="margin-top:.5rem;display:none"></div>
+    </div>
+  </div>`;
+
   // ── Band C — Attention feed (col-8 / col-4 split) ─────────────────────────
   const attention = `
   <div class="grid">
@@ -132,5 +162,5 @@ export function renderOverviewTab(): string {
     </div>
   </div>`;
 
-  return statusStrip + kpiRow1 + kpiRow2 + attention + detail;
+  return statusStrip + kpiRow1 + kpiRow2 + serverCard + attention + detail;
 }

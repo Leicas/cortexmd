@@ -25,6 +25,7 @@
 import {
   diaryAgentName, diaryLinkContext, readStdin, logError,
   sessionStatePath, readState, writeState, purgeOldSessions, HOOK_DISABLED,
+  isServerUnreachable,
 } from './_mcp_rest.mjs';
 
 const INTERVAL = Math.max(1, Number.parseInt(process.env.DIARY_STOP_EVERY ?? '5', 10) || 5);
@@ -74,6 +75,11 @@ async function main() {
   }
 
   if (counter % INTERVAL !== 0) return passthrough();
+
+  // The UserPromptSubmit hook found the server unreachable earlier in this
+  // session (marker still fresh): asking for a diary line would only produce a
+  // failed tool call. The counter has advanced, so the nudge returns later.
+  if (sessionId && isServerUnreachable(sessionId)) return passthrough();
 
   const agent = diaryAgentName();
   let links = { project: '', machine: '', suffix: '' };

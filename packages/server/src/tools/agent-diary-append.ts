@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { appendJournalEntry } from '../lib/journal.js';
 import { wrapToolHandler } from '../lib/tool-wrapper.js';
 import { sanitizeContent } from '../lib/sanitize.js';
+import { trimWords, DIARY_WORD_LIMIT, DIARY_WORD_LIMIT_TOPIC } from './diary-trim.js';
 
 export function register(server: McpServer): void {
   server.tool(
@@ -58,8 +59,14 @@ agentName must be the machine-scoped name ("Claude Code (<hostname>)" on Claude 
         };
       }
 
-      const rawEntry = sanitizeContent(params.entry as string, 5000);
       const topic = params.topic as string | undefined;
+      // ≤60 words for a Stop recap, ≤120 for a PreCompact handoff (topic set):
+      // every diary line is re-read by memory_wakeup on each session start.
+      const trimmed = trimWords(
+        sanitizeContent(params.entry as string, 5000),
+        topic ? DIARY_WORD_LIMIT_TOPIC : DIARY_WORD_LIMIT,
+      );
+      const rawEntry = trimmed.text;
       const userTags = (params.tags as string[] | undefined) ?? [];
       const silent = (params.silent as boolean | undefined) ?? false;
       const source = params.source as string | undefined;
@@ -100,6 +107,7 @@ agentName must be the machine-scoped name ("Claude Code (<hostname>)" on Claude 
               silent,
               ...(project ? { project } : {}),
               ...(machine ? { machine } : {}),
+              ...(trimmed.truncated ? { truncated: true, words: trimmed.words, limit: trimmed.limit } : {}),
             }),
           },
         ],

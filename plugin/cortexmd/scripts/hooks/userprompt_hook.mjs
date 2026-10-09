@@ -16,9 +16,11 @@
 // All best-effort. Failures are non-blocking (`{}`).
 
 import {
-  readStdin, passthrough, logError, recall, storeMemory, formatMemoryBlock,
-  RECALL_HEADER, RECALL_HEADER_MINIMAL,
+  readStdin, passthrough, logError, recall, storeMemory, formatMemoryBlock, selectRecallItems,
+  RECALL_HEADER, RECALL_HEADER_MINIMAL, RECALL_SEEN_MAX,
   HOOK_DISABLED, MEMORY_DISABLED, HOOK_MINIMAL,
+  sessionStatePath, readState, writeState, projectSlug,
+  isServerUnreachable, notifyUnreachableOnce, clearUnreachable, lastCortexmdFailure,
 } from './_mcp_rest.mjs';
 
 if (HOOK_DISABLED) passthrough();
@@ -102,27 +104,51 @@ async function main() {
   if (cleaned.length < 20) return passthrough();
   if (CONVERSATIONAL.test(cleaned)) return passthrough();
 
+  const sessionId = typeof evt.session_id === 'string' ? evt.session_id : '';
+  const cwd = typeof evt.cwd === 'string' ? evt.cwd : '';
+
   // Capture first so the memory exists by the time we recall.
   let captureNote = '';
   try { captureNote = await captureTrigger(cleaned); }
   catch (err) { logError('UserPromptSubmit:captureTrigger', err); }
 
+  // Recall. Per session we keep `seen.json` = the paths already injected, so
+  // the same memory is not re-injected on every prompt (passed as `seen` to
+  // the server, and filtered client-side as a fallback), and `project` so the
+  // server boosts notes linked to [[Projects/<slug>]]. When the server was
+  // found unreachable earlier in the session we skip the spawn (and the single
+  // "memory off" notice was already emitted).
   let block = '';
-  if (!MEMORY_DISABLED) {
+  let notice = '';
+  if (!MEMORY_DISABLED && !(sessionId && isServerUnreachable(sessionId))) {
     const query = cleaned.replace(/\n/g, ' ').slice(0, 300);
+    const seenPath = sessionId ? sessionStatePath('seen', sessionId) : '';
+    const seenState = seenPath ? readState(seenPath) : {};
+    const seen = Array.isArray(seenState.paths) ? seenState.paths.filter((p) => typeof p === 'string') : [];
+    let project = '';
+    try { project = projectSlug(cwd); } catch { /* best-effort */ }
     try {
-      const res = await recall({ query, limit: 5, kinds: 'both' });
+      const res = await recall({ query, limit: Math.min(5 + seen.length, 10), kinds: 'both', seen, project, minImportance: 'medium' });
       if (res && typeof res === 'object') {
+        if (sessionId) clearUnreachable(sessionId);
         const memories = Array.isArray(res.memories) ? res.memories : [];
         const notes = Array.isArray(res.notes) ? res.notes : [];
         block = formatMemoryBlock(memories, notes, HOOK_MINIMAL ? RECALL_HEADER_MINIMAL : RECALL_HEADER, 400);
+        if (block && seenPath) {
+          const shown = selectRecallItems(memories, notes).map((x) => x.path);
+          const paths = [...new Set([...seen, ...shown])].slice(-RECALL_SEEN_MAX);
+          writeState(seenPath, { paths });
+        }
+      } else if (sessionId) {
+        const failure = lastCortexmdFailure();
+        if (failure && failure.unreachable) notice = notifyUnreachableOnce(sessionId);
       }
     } catch (err) {
       logError('UserPromptSubmit:recall', err);
     }
   }
 
-  const additionalContext = [block, captureNote].filter(Boolean).join('\n');
+  const additionalContext = [block, captureNote, notice].filter(Boolean).join('\n');
   if (!additionalContext) return passthrough();
   emit(additionalContext);
 }

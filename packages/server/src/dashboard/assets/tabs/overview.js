@@ -46,6 +46,7 @@ export default {
 
     renderStatusStrip(ctx, d);
     renderKpis(ctx, d, dv);
+    renderServer(ctx);
     renderAttention(el, ctx, d, dv);
     renderDetail(el, ctx, d, dv);
 
@@ -194,6 +195,87 @@ function renderTempBar(ctx, mt, tot) {
     return '<div class="seg ' + cls + '" style="width:' + ((n / tot) * 100).toFixed(1) + '%"></div>';
   }
   bar.innerHTML = seg('seg-hot', mt.hot) + seg('seg-warm', mt.warm) + seg('seg-cold', mt.cold);
+}
+
+// ── Band B′ — Server card (GET /health) ──────────────────────────────────────
+// Reads the I-1 shape ({ heap, sessions, lastIndexUpdate, restarts }) and
+// degrades gracefully to the legacy one ({ version, commit, uptime,
+// activeSessions, indexedNotes }) — every field is optional.
+
+function num(v) { return typeof v === 'number' && isFinite(v) ? v : null; }
+
+function renderServer(ctx) {
+  var $ = ctx.$, fmt = ctx.fmt, setLive = ctx.setLive;
+  var h = ctx.health;
+  if (!h || typeof h !== 'object') return;
+
+  var v = h.version ? 'v' + h.version : '';
+  var c = typeof h.commit === 'string' && h.commit && h.commit !== 'unknown' ? h.commit.slice(0, 7) : '';
+  var up = num(h.uptime) != null ? 'up ' + fmt.fmtUptime(h.uptime) : '';
+  setLive('srvVersion', [v, c, up].filter(Boolean).join(' · ') || '—');
+
+  // Heap: used / limit bar (limitMb = V8 heap_size_limit).
+  var heap = h.heap || {};
+  var used = num(heap.usedMb), limit = num(heap.limitMb), rss = num(heap.rssMb);
+  if (used != null) {
+    var hp = [used + ' MB used'];
+    if (limit != null) hp.push('limit ' + limit + ' MB');
+    if (rss != null) hp.push('rss ' + rss + ' MB');
+    setLive('srvHeap', hp.join(' · '));
+  } else {
+    setLive('srvHeap', 'n/a (older server)');
+  }
+  var bar = $('srvHeapBar');
+  if (bar) {
+    if (used != null && limit) {
+      var pct = Math.max(0, Math.min(100, (used / limit) * 100));
+      var cls = pct >= 85 ? 'seg-hot' : pct >= 60 ? 'seg-warm' : 'seg-cold';
+      bar.innerHTML = '<div class="seg ' + cls + '" style="width:' + pct.toFixed(1) + '%"></div>';
+      bar.setAttribute('aria-label', 'Heap ' + Math.round(pct) + '% of limit');
+    } else {
+      bar.innerHTML = '';
+    }
+  }
+
+  // Sessions: active / maxActive · persisted · timeout.
+  var s = h.sessions || {};
+  var active = num(s.active) != null ? num(s.active) : num(h.activeSessions);
+  var sp = [];
+  if (active != null) sp.push(active + (num(s.maxActive) != null ? ' / ' + s.maxActive : '') + ' active');
+  if (num(s.persisted) != null) sp.push(s.persisted + ' persisted');
+  if (num(s.timeoutMs) != null) sp.push('timeout ' + Math.round(s.timeoutMs / 60000) + ' min');
+  setLive('srvSessions', sp.join(' · ') || '—');
+
+  // Last index update (null = none since boot; undefined = older server).
+  var li = h.lastIndexUpdate;
+  if (li && typeof li === 'object') {
+    var ip = [fmt.fmtAgo(li.at)];
+    if (num(li.updated) != null) ip.push('+' + li.updated);
+    if (num(li.removed) != null) ip.push('−' + li.removed);
+    if (num(li.ms) != null) ip.push(li.ms + ' ms');
+    if (num(li.collisions)) ip.push(li.collisions + ' collision' + (li.collisions === 1 ? '' : 's'));
+    setLive('srvIndex', ip.join(' · '));
+  } else if (li === null) {
+    setLive('srvIndex', 'none since boot');
+  } else {
+    setLive('srvIndex', num(h.indexedNotes) != null ? fmt.fmt(h.indexedNotes) + ' notes indexed' : '—');
+  }
+
+  // Last exit (crash / signal) recorded by the previous process.
+  var le = h.restarts && h.restarts.lastExit;
+  var leEl = $('srvLastExit');
+  if (leEl) {
+    if (le && typeof le === 'object') {
+      leEl.textContent = 'Last exit: ' + (le.reason || 'unknown')
+        + (le.signal ? ' (' + le.signal + ')' : '')
+        + (le.at ? ' · ' + fmt.fmtAgo(le.at) : '')
+        + (num(le.heapUsedMb) != null ? ' · heap ' + le.heapUsedMb + ' MB' : '');
+      leEl.style.display = '';
+    } else {
+      leEl.textContent = '';
+      leEl.style.display = 'none';
+    }
+  }
 }
 
 /** Threshold classification mirrored from model/derive THRESHOLDS (kept in sync). */

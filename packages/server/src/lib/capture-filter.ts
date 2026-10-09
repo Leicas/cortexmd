@@ -16,7 +16,10 @@ export const DEFAULT_NOISE_PATTERNS: readonly RegExp[] = [
   /^systemctl (start|stop)\b/,
   /^(git commit|chmod \+x)/,
   // Automated email captures
-  /^Email - (\[Vault\.local\]|New activity|Your team made progress|Invitation( mise à jour)?|Accepté|Refusé|Événement annulé|NOTIFICATION: ANTOINE|\d{6} is your)/,
+  /^Email - (\[Vault\.local\]|New activity|Your team made progress|Invitation( mise à jour)?|Updated invitation|Canceled event|Accepté|Refusé|Événement annulé|NOTIFICATION: ANTOINE|\d{6} is your)/,
+  // Calendar exhaust pushed as bare subjects (no "Email - " prefix): the
+  // n8n triage forwards Google/Outlook invitation subjects verbatim.
+  /^(Invitation: |Invitation mise à jour|Updated invitation|Canceled event)/,
 ];
 
 let extraCache: { source: readonly string[]; patterns: RegExp[] } | undefined;

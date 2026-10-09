@@ -571,7 +571,7 @@ Categories: observation, decision, insight, conversation, fact, preference, plan
         content: [
           {
             type: "text",
-            text: `${summary}\n\n${JSON.stringify(responseData, null, 2)}`,
+            text: `${summary}\n\n${JSON.stringify(responseData)}`,
           },
         ],
       };

@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
+import v8 from 'node:v8';
 import { readdir, access, stat } from 'node:fs/promises';
-import { constants as fsConstants, realpathSync } from 'node:fs';
+import { constants as fsConstants, realpathSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import nodePath from 'node:path';
 import express from 'express';
 import type { Request, Response, NextFunction } from 'express';
@@ -17,6 +18,7 @@ import { SERVER_INSTRUCTIONS } from './lib/server-instructions.js';
 import { apiKeyMiddleware, dashboardAuthMiddleware, SESSION_COOKIE_NAME } from './auth.js';
 import { mintDashboardSession } from './oauth.js';
 import { rebuildIndex, getIndexedNoteCount, getDocMeta, getVaultHealth, reindexSourceVaults, getIndexHealth } from './lib/search.js';
+import * as searchLib from './lib/search.js';
 import {
   onSourceVaultsChanged,
   listSourceVaults,
@@ -44,6 +46,7 @@ import {
 } from './lib/metrics.js';
 import { saveSessions, loadSessions } from './lib/persistence.js';
 import type { PersistedSession } from './lib/persistence.js';
+import { selectSessionsToEvict, pruneStaleSessionMeta, capSessionRecords } from './lib/session-lru.js';
 import { cleanupExpired, checkRateLimit } from './lib/rate-limit.js';
 import type { RequestCategory } from './lib/metrics.js';
 import { dashboardRouter } from './dashboard/index.js';
@@ -322,8 +325,90 @@ const MAX_SESSION_LAST_TOOLS = 5;
 // When a client reconnects with a known session ID, we restore this metadata.
 const persistedSessionMeta = new Map<string, PersistedSession>();
 
+// Dirty flag for session persistence: set on create / close / tool call, so the
+// periodic flush only serializes when something actually changed.
+let sessionsDirty = false;
+function markSessionsDirty(): void {
+  sessionsDirty = true;
+}
+
 /**
- * Serialize active sessions (and not-yet-reconnected persisted sessions) for disk persistence.
+ * Close + forget a live session (transport close, DELETE, idle sweep, LRU
+ * eviction). Also drops any persisted metadata for the id so a closed session
+ * is never re-emitted to sessions.json forever.
+ */
+function dropSession(sessionId: string, closeTransport: boolean): void {
+  const entry = sessions.get(sessionId);
+  if (entry && closeTransport) {
+    try {
+      entry.transport.close?.();
+    } catch {
+      // ignore close errors
+    }
+  }
+  sessions.delete(sessionId);
+  persistedSessionMeta.delete(sessionId);
+  markSessionsDirty();
+}
+
+/**
+ * Make room for `incoming` new sessions: evict the least-recently-active live
+ * sessions once the map would exceed config.maxActiveSessions.
+ */
+function evictLruSessions(incoming = 1): void {
+  const victims = selectSessionsToEvict(sessions, config.maxActiveSessions, incoming);
+  if (victims.length === 0) return;
+  for (const sid of victims) dropSession(sid, true);
+  setActiveSessionsCount(sessions.size);
+  logger.warn('Session LRU eviction', {
+    evicted: victims.length,
+    maxActive: config.maxActiveSessions,
+    remaining: sessions.size,
+  });
+}
+
+// ── Last-exit marker (<dataDir>/last-exit.json) ──────────────────────────────
+// Written on graceful shutdown AND on fatal errors so the next boot (and
+// /health `restarts.lastExit`) can say why the previous process went away.
+interface LastExitInfo {
+  at: string;
+  reason: string;
+  signal?: string;
+  message?: string;
+  heapUsedMb?: number;
+}
+let lastExitInfo: LastExitInfo | null = null;
+const LAST_EXIT_FILE = 'last-exit.json';
+
+function writeLastExit(info: Omit<LastExitInfo, 'at' | 'heapUsedMb'>): void {
+  try {
+    mkdirSync(config.dataDir, { recursive: true });
+    const payload: LastExitInfo = {
+      at: new Date().toISOString(),
+      ...info,
+      heapUsedMb: Math.round(process.memoryUsage().heapUsed / 1048576),
+    };
+    writeFileSync(nodePath.join(config.dataDir, LAST_EXIT_FILE), JSON.stringify(payload));
+  } catch {
+    // best-effort: never let the exit marker itself throw during shutdown
+  }
+}
+
+function readLastExit(): LastExitInfo | null {
+  try {
+    const raw = readFileSync(nodePath.join(config.dataDir, LAST_EXIT_FILE), 'utf-8');
+    const parsed = JSON.parse(raw) as Partial<LastExitInfo>;
+    if (!parsed || typeof parsed.at !== 'string' || typeof parsed.reason !== 'string') return null;
+    return parsed as LastExitInfo;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Serialize active sessions (and not-yet-reconnected persisted sessions) for
+ * disk persistence. Newest `lastActivity` first, capped at
+ * config.maxPersistedSessions.
  */
 function getSessionsForPersistence(): PersistedSession[] {
   const result: PersistedSession[] = [];
@@ -340,10 +425,11 @@ function getSessionsForPersistence(): PersistedSession[] {
     });
   }
   // Also include persisted sessions that haven't reconnected yet
-  for (const [, meta] of persistedSessionMeta) {
+  for (const [sid, meta] of persistedSessionMeta) {
+    if (sessions.has(sid)) continue;
     result.push(meta);
   }
-  return result;
+  return capSessionRecords(result, config.maxPersistedSessions);
 }
 
 function updateSessionActivity(sessionId: string): void {
@@ -363,6 +449,7 @@ function recordSessionToolCall(sessionId: string, toolName: string): void {
   entry.toolCounts[toolName] = (entry.toolCounts[toolName] ?? 0) + 1;
   entry.lastTools.push(toolName);
   if (entry.lastTools.length > MAX_SESSION_LAST_TOOLS) entry.lastTools.shift();
+  markSessionsDirty();
 }
 
 // Wire up the session-level tool tracking hook (avoids circular deps)
@@ -403,14 +490,8 @@ export function getSessionSnapshots(): SessionSnapshot[] {
  * Kill a session by ID: close the transport and remove from the map.
  */
 export function killSession(sessionId: string): boolean {
-  const entry = sessions.get(sessionId);
-  if (!entry) return false;
-  try {
-    entry.transport.close?.();
-  } catch {
-    // ignore close errors
-  }
-  sessions.delete(sessionId);
+  if (!sessions.has(sessionId)) return false;
+  dropSession(sessionId, true);
   setActiveSessionsCount(sessions.size);
   return true;
 }
@@ -488,9 +569,25 @@ app.use((req: Request, res: Response, next: NextFunction) => {
 // /authorize is protected by Authelia via Traefik; others are open.
 app.use(oauthRouter);
 
-// Health check (no auth)
+// Health check (no auth). Shape is the I-1 contract consumed by the dashboard
+// "Server" card and `cortexmd status` — keep field names stable.
 app.get('/health', (_req, res) => {
   const metrics = getMetrics();
+  const mem = process.memoryUsage();
+  const toMb = (bytes: number): number => Math.round(bytes / 1048576);
+
+  // lib/search.ts exports getLastIndexUpdate() once DEV-B lands; guard so
+  // /health never breaks on an older build.
+  let lastIndexUpdate: unknown = null;
+  const getLastIndexUpdateFn = (searchLib as Record<string, unknown>).getLastIndexUpdate;
+  if (typeof getLastIndexUpdateFn === 'function') {
+    try {
+      lastIndexUpdate = (getLastIndexUpdateFn as () => unknown)() ?? null;
+    } catch {
+      lastIndexUpdate = null;
+    }
+  }
+
   res.json({
     status: 'ok',
     version: config.appVersion,
@@ -498,6 +595,20 @@ app.get('/health', (_req, res) => {
     uptime: metrics.uptime,
     activeSessions: sessions.size,
     indexedNotes: getIndexedNoteCount(),
+    heap: {
+      usedMb: toMb(mem.heapUsed),
+      totalMb: toMb(mem.heapTotal),
+      rssMb: toMb(mem.rss),
+      limitMb: toMb(v8.getHeapStatistics().heap_size_limit),
+    },
+    sessions: {
+      active: sessions.size,
+      persisted: persistedSessionMeta.size,
+      maxActive: config.maxActiveSessions,
+      timeoutMs: config.sessionTimeoutMs,
+    },
+    lastIndexUpdate,
+    restarts: { lastExit: lastExitInfo },
   });
 });
 
@@ -700,57 +811,23 @@ app.get('/api/hud-stats', apiKeyMiddleware, async (_req, res) => {
 // hybridSearch ranking memory_recall uses.
 app.post('/api/recall', apiKeyMiddleware, async (req: Request, res: Response) => {
   try {
-    const body = req.body as {
-      query?: string;
-      limit?: number;
-      kinds?: 'memory' | 'notes' | 'both';
-      excludeArchived?: boolean;
-    };
-    const query = (body.query ?? '').trim();
+    const body = (req.body ?? {}) as Partial<import('./lib/recall-api.js').RecallBody>;
+    const query = (typeof body.query === 'string' ? body.query : '').trim();
     if (!query) {
       res.status(400).json({ error: 'query required' });
       return;
     }
-    const limit = Math.max(1, Math.min(10, body.limit ?? 5));
-    const kinds = body.kinds ?? 'both';
-    const excludeArchived = body.excludeArchived ?? true;
 
-    const { hybridSearch } = await import('./lib/search.js');
-    const results = await hybridSearch(query, { limit: limit * 3, excludeArchived });
-
-    const memories: Array<{
-      path: string; title: string; snippet: string;
-      category?: string; temperature?: string; score: number;
-    }> = [];
-    const notes: Array<{ path: string; title: string; snippet: string; score: number }> = [];
-
-    const dm = getDocMeta();
-    for (const r of results) {
-      const meta = dm.get(r.path);
-      const isMemory = meta?.type === 'memory';
-      const entry = {
-        path: r.path,
-        title: r.title,
-        snippet: r.snippet.slice(0, 200),
-        score: Math.round(r.score * 10000) / 10000,
-      };
-      if (isMemory) {
-        if (kinds === 'notes') continue;
-        if (memories.length >= limit) continue;
-        memories.push({
-          ...entry,
-          category: meta?.category,
-          temperature: meta?.temperature,
-        });
-      } else {
-        if (kinds === 'memory') continue;
-        if (notes.length >= limit) continue;
-        notes.push(entry);
-      }
-    }
-
-    res.json({ query, memories, notes });
+    // Ranking, project boost, seen-set exclusion and the access bump live in
+    // lib/recall-api.ts (I-5); the handler only owns transport concerns.
+    const { recallForHook } = await import('./lib/recall-api.js');
+    const result = await recallForHook({ ...body, query });
+    res.json(result);
   } catch (err: any) {
+    if (err && typeof err.status === 'number' && typeof err.message === 'string' && err.status < 500) {
+      res.status(err.status).json({ error: err.message });
+      return;
+    }
     logger.error('api/recall failed', { error: err.message });
     res.status(500).json({ error: err.message });
   }
@@ -762,79 +839,25 @@ app.post('/api/recall', apiKeyMiddleware, async (req: Request, res: Response) =>
 // Use the full memory_store tool for agent-driven captures.
 app.post('/api/store-memory', apiKeyMiddleware, async (req: Request, res: Response) => {
   try {
-    const body = req.body as {
-      content?: string;
-      category?: string;
-      title?: string;
-      tags?: string[];
-      source?: string;
-    };
-    const content = (body.content ?? '').trim();
+    const body = (req.body ?? {}) as Partial<import('./lib/store-memory-api.js').StoreMemoryBody>;
+    const content = (typeof body.content === 'string' ? body.content : '').trim();
     if (!content) {
       res.status(400).json({ error: 'content required' });
       return;
     }
-    const category = body.category ?? 'observation';
-    const allowed = new Set([
-      'observation', 'decision', 'insight', 'conversation',
-      'fact', 'preference', 'plan', 'reflection',
-    ]);
-    if (!allowed.has(category)) {
-      res.status(400).json({ error: `invalid category: ${category}` });
-      return;
-    }
 
-    const { writeNote } = await import('./lib/vault.js');
-    const { stringifyFrontmatter } = await import('./lib/frontmatter.js');
-    const { indexNote } = await import('./lib/search.js');
-    const { v4: uuidv4 } = await import('uuid');
-
-    const now = new Date();
-    const today = now.toISOString().slice(0, 10);
-    const year = String(now.getFullYear());
-    const month = String(now.getMonth() + 1).padStart(2, '0');
-    const TIMELESS = new Set(['fact', 'preference']);
-    const subdir = TIMELESS.has(category) ? '' : `${year}/${month}/`;
-
-    const { matchCaptureNoise, isSlugTitle } = await import('./lib/capture-filter.js');
-    const firstLine = content.split('\n')[0].replace(/^#+\s*/, '').trim();
-    // A filename-slug title is a stub: fall back to the content's first line
-    const rawTitle = body.title && !isSlugTitle(body.title) ? body.title : firstLine;
-    const title = rawTitle.slice(0, 80) || 'Auto-captured';
-    // Shell-command stubs and automated emails never become memories
-    const noise = matchCaptureNoise(title);
-    if (noise) {
-      res.json({ stored: false, reason: 'capture_noise', title, pattern: noise.source });
-      return;
-    }
-    const slug = title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 60);
-    const notePath = `Memories/${category}/${subdir}${today}-${slug}.md`;
-
-    const tags = Array.from(new Set([...(body.tags ?? []), 'auto-capture', `source:${body.source ?? 'hook'}`]));
-
-    const frontmatter: Record<string, unknown> = {
-      id: uuidv4(),
-      type: 'memory',
-      category,
-      title,
-      importance: 'low',
-      temperature: 'warm',
-      heat_score: 6,
-      access_count: 1,
-      last_accessed: today,
-      created: today,
-      last_updated: today,
-      tags,
-      source: body.source ?? 'hook',
-    };
-    const noteBody = `# ${title}\n\n${content}\n`;
-    const noteContent = stringifyFrontmatter(frontmatter, noteBody);
-    await writeNote(notePath, noteContent);
-    try { await indexNote(notePath); } catch { /* best-effort */ }
-    markActivity(); // capture counts as activity → resets the idle-dream timer
-
-    res.json({ stored: true, path: notePath, category });
+    // Noise filter, EmailLog routing, title/semantic dedup, graph update and
+    // frontmatter live in lib/store-memory-api.ts (I-5); category/importance
+    // validation there throws { status: 400, message }.
+    const { storeMemoryFromApi } = await import('./lib/store-memory-api.js');
+    const result = await storeMemoryFromApi({ ...body, content });
+    if (result.stored) markActivity(); // capture counts as activity → resets the idle-dream timer
+    res.json(result);
   } catch (err: any) {
+    if (err && typeof err.status === 'number' && typeof err.message === 'string' && err.status < 500) {
+      res.status(err.status).json({ error: err.message });
+      return;
+    }
     logger.error('api/store-memory failed', { error: err.message });
     res.status(500).json({ error: err.message });
   }
@@ -1030,6 +1053,9 @@ app.post('/api/code-index-requests', apiKeyMiddleware, async (req: Request, res:
         slug = row?.slug ?? r.repo_id;
         slugById.set(r.repo_id, slug);
       }
+      // `attempts` / `last_error` columns arrive with the I-3 contract
+      // (lib/code-nav/index-requests.ts); default them for older rows.
+      const extra = r as { attempts?: number; last_error?: string | null };
       return {
         id: r.id,
         repoId: r.repo_id,
@@ -1037,11 +1063,49 @@ app.post('/api/code-index-requests', apiKeyMiddleware, async (req: Request, res:
         absPath: r.abs_path,
         reason: r.reason,
         requestedAt: r.requested_at,
+        attempts: extra.attempts ?? 0,
+        lastError: extra.last_error ?? null,
       };
     });
     res.json({ machineId, requests });
   } catch (err: any) {
     logger.error('api/code-index-requests failed', { error: err.message });
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// I-3: the owning machine reports that a claimed re-index attempt failed.
+// Increments `attempts` / records `last_error`; after MAX_INDEX_ATTEMPTS the
+// row flips to status='failed' and is never re-served. 404 when no outstanding
+// (pending/claimed) row matches { abs_path, machine_id }.
+app.post('/api/code-index-requests/fail', apiKeyMiddleware, async (req: Request, res: Response) => {
+  try {
+    const body = req.body as { abs_path?: string; machine_id?: string; error?: string };
+    const absPath = (body.abs_path ?? '').toString().trim();
+    const machineId = (body.machine_id ?? '').toString().trim();
+    if (!absPath || !machineId) {
+      res.status(400).json({ error: 'abs_path and machine_id are required' });
+      return;
+    }
+    const errorText = (body.error ?? '').toString().slice(0, 2000);
+
+    const mod = await import('./lib/code-nav/index-requests.js');
+    const failFn = (mod as Record<string, unknown>).failIndexRequest as
+      | ((req: { abs_path: string; machine_id: string }, error: string, nowMs: number) =>
+          { id: number; attempts: number; status: string } | null)
+      | undefined;
+    if (typeof failFn !== 'function') {
+      res.status(501).json({ error: 'failIndexRequest not available on this server build' });
+      return;
+    }
+    const result = failFn({ abs_path: absPath, machine_id: machineId }, errorText, Date.now());
+    if (!result) {
+      res.status(404).json({ error: 'no outstanding index request for that path/machine' });
+      return;
+    }
+    res.json({ id: result.id, attempts: result.attempts, status: result.status });
+  } catch (err: any) {
+    logger.error('api/code-index-requests/fail failed', { error: err.message });
     res.status(500).json({ error: err.message });
   }
 });
@@ -1944,7 +2008,7 @@ app.post('/mcp', async (req, res) => {
 
     transport.onclose = () => {
       const sid = transport.sessionId;
-      if (sid) sessions.delete(sid);
+      if (sid) dropSession(sid, false);
       setActiveSessionsCount(sessions.size);
     };
 
@@ -1952,6 +2016,7 @@ app.post('/mcp', async (req, res) => {
 
     const sid = transport.sessionId;
     if (sid) {
+      evictLruSessions(1);
       const user = res.locals.user as { sub?: string; clientId?: string } | undefined;
       const ip = req.headers['x-forwarded-for'] as string | undefined ?? req.socket.remoteAddress;
       sessions.set(sid, {
@@ -1964,6 +2029,7 @@ app.post('/mcp', async (req, res) => {
         toolCounts: { ...(meta?.toolCounts ?? {}) },
         lastTools: [...(meta?.lastTools ?? [])],
       });
+      markSessionsDirty();
       setActiveSessionsCount(sessions.size);
       logger.info('Session restored on reinit', { sessionId: sid, hadMeta: !!meta });
     }
@@ -1977,7 +2043,7 @@ app.post('/mcp', async (req, res) => {
       error: { code: -32000, message: 'Session expired — please reconnect' },
       id: null,
     });
-    persistedSessionMeta.delete(sessionId);
+    if (persistedSessionMeta.delete(sessionId)) markSessionsDirty();
     return;
   } else {
     // Create new transport and server for this session
@@ -1991,7 +2057,7 @@ app.post('/mcp', async (req, res) => {
     // Store transport once session ID is assigned
     transport.onclose = () => {
       const sid = transport.sessionId;
-      if (sid) sessions.delete(sid);
+      if (sid) dropSession(sid, false);
       setActiveSessionsCount(sessions.size);
     };
 
@@ -2001,6 +2067,7 @@ app.post('/mcp', async (req, res) => {
     // After handling, store the transport by its assigned session ID
     const sid = transport.sessionId;
     if (sid) {
+      evictLruSessions(1);
       const user = res.locals.user as { sub?: string; clientId?: string } | undefined;
       const ip = req.headers['x-forwarded-for'] as string | undefined ?? req.socket.remoteAddress;
       sessions.set(sid, {
@@ -2013,6 +2080,7 @@ app.post('/mcp', async (req, res) => {
         toolCounts: {},
         lastTools: [],
       });
+      markSessionsDirty();
       setActiveSessionsCount(sessions.size);
     }
     return;
@@ -2044,7 +2112,7 @@ app.delete('/mcp', async (req, res) => {
 
   const entry = sessions.get(sessionId)!;
   await entry.transport.handleRequest(req, res, req.body);
-  sessions.delete(sessionId);
+  dropSession(sessionId, false);
   setActiveSessionsCount(sessions.size);
 });
 
@@ -2053,12 +2121,28 @@ app.use((_req: Request, res: Response) => {
   res.status(404).json({ error: 'Not found' });
 });
 
-// Global error handling middleware
-app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
-  logger.error('Unhandled error', { error: err.message });
-  if (!res.headersSent) {
-    res.status(500).json({ error: 'Internal server error' });
+// Global error handling middleware. body-parser errors carry `status` + `type`
+// (e.g. 413 / 'entity.too.large'); surface them with the configured limit so
+// an oversized CLI ingest is diagnosable from the log line alone.
+app.use((err: Error & { status?: number; statusCode?: number; type?: string }, req: Request, res: Response, _next: NextFunction) => {
+  const status = Number(err.status ?? err.statusCode) || 500;
+  const forwarded = req.headers['x-forwarded-for'];
+  const ip = (typeof forwarded === 'string' ? forwarded.split(',')[0].trim() : req.socket?.remoteAddress) ?? 'unknown';
+  logger.error('Unhandled error', {
+    error: err.message,
+    method: req.method,
+    path: req.path,
+    contentLength: req.headers['content-length'],
+    ip,
+    status,
+    type: err.type,
+  });
+  if (res.headersSent) return;
+  if (err.type === 'entity.too.large') {
+    res.status(status).json({ error: 'Payload too large', limit: config.maxRequestSize });
+    return;
   }
+  res.status(status).json({ error: status < 500 && err.message ? err.message : 'Internal server error' });
 });
 
 // Session cleanup interval
@@ -2069,20 +2153,15 @@ let sourceRefreshInterval: ReturnType<typeof setInterval> | undefined;
 
 function cleanupSessions(): void {
   const timeout = config.sessionTimeoutMs;
+  const now = Date.now();
   // timeout === 0 disables idle-based session eviction — sessions live until
-  // their transport closes or a DELETE arrives.
+  // their transport closes, a DELETE arrives, or the LRU cap evicts them.
   if (timeout > 0) {
-    const now = Date.now();
     let cleaned = 0;
 
     for (const [sid, entry] of sessions) {
       if (now - entry.lastActivity > timeout) {
-        try {
-          entry.transport.close?.();
-        } catch {
-          // ignore close errors
-        }
-        sessions.delete(sid);
+        dropSession(sid, true);
         cleaned++;
       }
     }
@@ -2093,8 +2172,28 @@ function cleanupSessions(): void {
     }
   }
 
+  // Persisted (not-yet-reconnected) metadata ages out after sessionRetentionMs
+  // so sessions.json cannot grow without bound across restarts.
+  const pruned = pruneStaleSessionMeta(persistedSessionMeta, config.sessionRetentionMs, now);
+  if (pruned > 0) {
+    markSessionsDirty();
+    logger.info('Pruned stale persisted session metadata', { pruned, remaining: persistedSessionMeta.size });
+  }
+
   // Clean up expired rate-limit entries
   cleanupExpired(3_600_000);
+}
+
+/** Flush session metadata to disk only when something changed since the last flush. */
+function persistSessionsIfDirty(force = false): void {
+  if (!force && !sessionsDirty) return;
+  sessionsDirty = false;
+  try {
+    saveSessions(config.dataDir, getSessionsForPersistence(), config.maxPersistedSessions);
+  } catch (err) {
+    sessionsDirty = true; // retry on the next tick
+    logger.warn('Session persistence failed', { error: err instanceof Error ? err.message : String(err) });
+  }
 }
 
 // Start server
@@ -2134,18 +2233,26 @@ async function main(): Promise<void> {
   // Load persisted metrics + sessions early so they're available when the server starts
   initMetricsFromDisk(config.dataDir);
 
+  // Why did the previous process exit? Surfaced via /health `restarts.lastExit`.
+  lastExitInfo = readLastExit();
+  if (lastExitInfo) {
+    logger.info('Previous process exit', { ...lastExitInfo });
+  }
+
   // Restore session metadata from previous run. Retention is independent of the
   // idle-sweep timeout (which may be 0/disabled) — we keep persisted metadata
-  // for sessionRetentionMs (default 30d) so clients that reconnect with an old
-  // session ID on initialize can recover their metadata.
+  // for sessionRetentionMs (default 7d) so clients that reconnect with an old
+  // session ID on initialize can recover their metadata. Capped at
+  // maxPersistedSessions (newest first) so a bloated legacy file is bounded.
   const restoredSessions = loadSessions(config.dataDir);
-  for (const s of restoredSessions) {
+  for (const s of capSessionRecords(restoredSessions, config.maxPersistedSessions)) {
     if (Date.now() - s.lastActivity < config.sessionRetentionMs) {
       persistedSessionMeta.set(s.sessionId, s);
     }
   }
   if (restoredSessions.length > 0) {
     logger.info('Restored session metadata', { count: persistedSessionMeta.size, total: restoredSessions.length });
+    if (restoredSessions.length > persistedSessionMeta.size) markSessionsDirty(); // rewrite the trimmed file
   }
 
   // ── Start accepting connections NOW ────────────────────────────────────
@@ -2247,9 +2354,7 @@ async function main(): Promise<void> {
   }
 
   startMetricsSampling(config.metricsFlushIntervalMs, config.dataDir);
-  sessionPersistInterval = setInterval(() => {
-    saveSessions(config.dataDir, getSessionsForPersistence());
-  }, config.metricsFlushIntervalMs);
+  sessionPersistInterval = setInterval(() => persistSessionsIfDirty(), config.metricsFlushIntervalMs);
   indexRebuildInterval = setInterval(() => {
     rebuildIndex().catch((err) => {
       logger.error('Background index rebuild failed', {
@@ -2294,14 +2399,18 @@ async function main(): Promise<void> {
   }
 
   // AGENT-C scheduler wiring: nightly dream + 12h temperature refresh.
-  // Gated behind DREAM_SCHEDULE=on so it's opt-in until the user has
-  // confirmed the server is happy running these at scale.
-  if ((process.env.DREAM_SCHEDULE ?? 'off').toLowerCase() === 'on') {
+  // Opt-in: DREAM_SCHEDULE=on, or DREAM_SCHEDULE=<cron> (5 whitespace-separated
+  // fields, as docker-compose.yml / deploy-http.md document it). A cron value
+  // doubles as the schedule unless DREAM_CRON overrides it.
+  const dreamScheduleRaw = (process.env.DREAM_SCHEDULE ?? 'off').trim();
+  const dreamScheduleIsCron = dreamScheduleRaw.split(/\s+/).filter(Boolean).length === 5;
+  const dreamScheduleEnabled = dreamScheduleRaw.toLowerCase() === 'on' || dreamScheduleIsCron;
+  if (dreamScheduleEnabled) {
     // TODO: parseSimpleCron only accepts "M H * * *". Use a full cron parser
     // if we ever need weekday/month specifiers.
     registerJob({
       name: 'memory_dream',
-      cron: process.env.DREAM_CRON ?? '0 3 * * *',
+      cron: process.env.DREAM_CRON ?? (dreamScheduleIsCron ? dreamScheduleRaw : '0 3 * * *'),
       handler: async () => {
         const report = await runDreamCycle({
           autoDecay: true,
@@ -2327,9 +2436,12 @@ async function main(): Promise<void> {
       },
     });
 
-    logger.info('Scheduler enabled (DREAM_SCHEDULE=on)');
+    logger.info('Scheduler enabled', {
+      dreamSchedule: dreamScheduleRaw,
+      cron: process.env.DREAM_CRON ?? (dreamScheduleIsCron ? dreamScheduleRaw : '0 3 * * *'),
+    });
   } else {
-    logger.info('Scheduler disabled — set DREAM_SCHEDULE=on to enable nightly dream + temperature refresh');
+    logger.info('Scheduler disabled — set DREAM_SCHEDULE=on (or a 5-field cron) to enable nightly dream + temperature refresh');
   }
 
   // Idle-edge dream (gap #8): consolidate promptly after a work burst instead of
@@ -2440,9 +2552,14 @@ async function main(): Promise<void> {
     logger.warn('Benchmark failed', { error: err instanceof Error ? err.message : String(err) });
   });
 
-  // Graceful shutdown
-  function shutdown(signal: string): void {
+  // Graceful shutdown. `exit` overrides the last-exit marker for fatal paths
+  // (uncaughtException / unhandledRejection); plain signals record `reason: signal`.
+  let shuttingDown = false;
+  function shutdown(signal: string, exit?: { reason: string; message?: string }): void {
+    if (shuttingDown) return;
+    shuttingDown = true;
     logger.info(`Received ${signal}, shutting down gracefully`);
+    writeLastExit(exit ? { ...exit, signal } : { reason: signal, signal });
 
     // Close knowledge graph
     if (config.kgEnabled) {
@@ -2455,7 +2572,7 @@ async function main(): Promise<void> {
     }
 
     // Persist session metadata for restoration after restart
-    saveSessions(config.dataDir, getSessionsForPersistence());
+    try { persistSessionsIfDirty(true); } catch { /* best-effort during shutdown */ }
 
     // Flush metrics to disk before shutting down
     persistMetricsToDisk(config.dataDir);
@@ -2484,9 +2601,10 @@ async function main(): Promise<void> {
       sessions.delete(sid);
     }
 
+    const exitCode = exit ? 1 : 0;
     server.close(() => {
       logger.info('Server shut down');
-      process.exit(0);
+      process.exit(exitCode);
     });
 
     // Force exit after 10s if graceful shutdown hangs
@@ -2498,6 +2616,27 @@ async function main(): Promise<void> {
 
   process.on('SIGTERM', () => shutdown('SIGTERM'));
   process.on('SIGINT', () => shutdown('SIGINT'));
+
+  // Fatal errors: log with stack, record why we died (<dataDir>/last-exit.json
+  // → next boot's /health `restarts.lastExit`), then shut down cleanly instead
+  // of letting Node abort with no trace in the container log.
+  const fatal = (reason: 'uncaughtException' | 'unhandledRejection', err: unknown): void => {
+    const message = err instanceof Error ? err.message : String(err);
+    logger.error(reason, {
+      error: message,
+      stack: err instanceof Error ? err.stack : undefined,
+      heapUsedMb: Math.round(process.memoryUsage().heapUsed / 1048576),
+    });
+    if (shuttingDown) return;
+    try {
+      shutdown(reason, { reason, message });
+    } catch {
+      writeLastExit({ reason, message });
+      process.exit(1);
+    }
+  };
+  process.on('uncaughtException', (err) => fatal('uncaughtException', err));
+  process.on('unhandledRejection', (err) => fatal('unhandledRejection', err));
 }
 
 main().catch((err) => {

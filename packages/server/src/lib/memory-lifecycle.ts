@@ -659,7 +659,29 @@ export const TEMPLATED_ARCHIVE_SAFE_TAGS = new Set([
   'auto-save',
   'hook',
   'dream-cycle',
+  // Hook / n8n exhaust written through POST /api/store-memory and the email
+  // triage — thousands per month, no unique content once a session is over.
+  'auto-capture',
+  'matrimail',
 ]);
+
+/**
+ * Exhaust tags whose `importance: low` notes archive on the shorter
+ * `lowImportanceDays` clock (default 30 d) instead of waiting to go cold
+ * for `coldDaysThreshold` days. Anything promoted to medium+ importance
+ * falls back to the normal cold path.
+ */
+export const LOW_IMPORTANCE_ARCHIVE_TAGS = new Set(['auto-capture', 'matrimail']);
+
+export interface AutoArchiveOptions {
+  /** Days since last access after which low-importance exhaust archives (default 30). */
+  lowImportanceDays?: number;
+}
+
+function isLowImportanceExhaust(importance: unknown, tags: unknown): boolean {
+  if (importance !== 'low') return false;
+  return Array.isArray(tags) && tags.some((t) => LOW_IMPORTANCE_ARCHIVE_TAGS.has(String(t)));
+}
 
 /**
  * Auto-archive cold memories.
@@ -672,24 +694,39 @@ export const TEMPLATED_ARCHIVE_SAFE_TAGS = new Set([
  *       exhaust — structurally duplicative by nature)
  * Unique cold notes are left in place. They can be surfaced via
  * graph_orphans for manual review.
+ *
+ * Low-importance exhaust (`importance: low` + a LOW_IMPORTANCE_ARCHIVE_TAGS
+ * tag) uses the shorter `lowImportanceDays` clock and does not need to be
+ * cold first (only not hot) — auto-capture notes are written warm and GC
+ * never reached them before.
  */
 export async function autoArchiveColdMemories(
   coldDaysThreshold = 90,
-): Promise<{ archived: string[]; skippedUnique: number }> {
+  opts: AutoArchiveOptions = {},
+): Promise<{ archived: string[]; skippedUnique: number; archivedLowImportance: number }> {
   const now = Date.now();
-  const thresholdDate = new Date(now - coldDaysThreshold * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  const lowImportanceDays = opts.lowImportanceDays ?? 30;
+  const dayMs = 24 * 60 * 60 * 1000;
+  const thresholdDate = new Date(now - coldDaysThreshold * dayMs).toISOString().slice(0, 10);
+  const lowThresholdDate = new Date(now - lowImportanceDays * dayMs).toISOString().slice(0, 10);
   const archived: string[] = [];
   let skippedUnique = 0;
+  let archivedLowImportance = 0;
   const todayStr = new Date().toISOString().slice(0, 10);
 
   // Pre-filter using indexed metadata
   const dm = getDocMeta();
   const candidates: string[] = [];
   for (const [filePath, meta] of dm) {
-    if (meta.temperature !== 'cold') continue;
     if (meta.archived === true) continue;
     if (!meta.last_accessed) continue;
-    if (meta.last_accessed > thresholdDate) continue;
+    if (isLowImportanceExhaust(meta.importance, meta.tags)) {
+      if (meta.temperature === 'hot') continue;
+      if (meta.last_accessed > lowThresholdDate) continue;
+    } else {
+      if (meta.temperature !== 'cold') continue;
+      if (meta.last_accessed > thresholdDate) continue;
+    }
     candidates.push(filePath);
   }
 
@@ -698,8 +735,9 @@ export async function autoArchiveColdMemories(
       const { content } = await readNote(f);
       const { data, body } = parseFrontmatter(content);
 
-      if (data.temperature !== 'cold') continue;
       if (data.archived === true) continue;
+      const lowExhaust = isLowImportanceExhaust(data.importance, data.tags);
+      if (lowExhaust ? data.temperature === 'hot' : data.temperature !== 'cold') continue;
 
       const lastAccessed = data.last_accessed || data.last_updated || data.updated;
       if (!lastAccessed) continue;
@@ -707,8 +745,8 @@ export async function autoArchiveColdMemories(
       const accessedDate = new Date(lastAccessed).getTime();
       if (isNaN(accessedDate)) continue;
 
-      const daysSince = (now - accessedDate) / (1000 * 60 * 60 * 24);
-      if (daysSince <= coldDaysThreshold) continue;
+      const daysSince = (now - accessedDate) / dayMs;
+      if (daysSince <= (lowExhaust ? lowImportanceDays : coldDaysThreshold)) continue;
 
       // Archival eligibility gate — see function doc.
       const hasConsolidationTarget =
@@ -726,6 +764,7 @@ export async function autoArchiveColdMemories(
       const updated = stringifyFrontmatter(data, body);
       await writeNote(f, updated);
       archived.push(f);
+      if (lowExhaust) archivedLowImportance++;
     } catch {
       // skip
     }
@@ -738,5 +777,5 @@ export async function autoArchiveColdMemories(
     });
   }
 
-  return { archived, skippedUnique };
+  return { archived, skippedUnique, archivedLowImportance };
 }

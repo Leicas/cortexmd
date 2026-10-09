@@ -304,6 +304,15 @@ pub struct RecallArgs {
     /// What to return: memory | notes | both (default).
     #[arg(long, default_value = "both")]
     pub kinds: String,
+    /// Vault paths already shown this session; the server skips them (repeatable).
+    #[arg(long = "seen")]
+    pub seen: Vec<String>,
+    /// Project slug (git repo name) — boosts memories linked to [[Projects/<slug>]].
+    #[arg(long)]
+    pub project: Option<String>,
+    /// Minimum importance: low | medium | high | critical.
+    #[arg(long = "min-importance")]
+    pub min_importance: Option<String>,
     /// Output format: `json` (default) or `block` (markdown context block).
     #[arg(long, default_value = "json")]
     pub format: String,

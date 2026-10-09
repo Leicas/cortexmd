@@ -29,7 +29,7 @@ Optionally filter by tag, or by a case-insensitive substring match against the t
         content: [
           {
             type: 'text' as const,
-            text: JSON.stringify({ skills, total: skills.length }, null, 2),
+            text: JSON.stringify({ skills, total: skills.length }),
           },
         ],
       };

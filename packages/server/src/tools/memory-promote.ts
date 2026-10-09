@@ -99,7 +99,7 @@ export function register(server: McpServer): void {
           type: 'text',
           text: `${action} applied to ${results.length} memories` +
             (errors.length > 0 ? ` (${errors.length} errors)` : '') +
-            `\n\n${JSON.stringify(output, null, 2)}`,
+            `\n\n${JSON.stringify(output)}`,
         }],
       };
     })

@@ -192,6 +192,9 @@ SOURCE_VAULTS="notes=git+https://git.example.com/me/notes.git#main:Public/**"
 | `SESSION_TIMEOUT_MS` | no | Idle MCP sessions are closed after this (default `1800000` = 30 min; `0` disables). |
 | `MAX_ACTIVE_SESSIONS` | no | Cap on live MCP sessions; the least-recently-active one is evicted first (default `200`, `0` disables). |
 | `MAX_PERSISTED_SESSIONS` | no | Max records kept in `sessions.json` (default `500`, newest first). `SESSION_RETENTION_MS` (default 7 d) ages the rest out. |
+| `CAPTURE_ENTITY_LINKS` | no | Email / chat captures (`/api/store-memory`, `memory_store` with the `matrimail` tag) link their `From`/`To`/`Cc` participants to person notes, register them as entities, seed the KG and add a timeline backlink on each person note (default `true`). |
+| `CRM_PEOPLE_DIR` | no | Vault dir of person notes (e.g. `CRM/People`). Empty = auto-detect a conventional dir (`05 CRM/Entities/People`, `CRM/People`, …). |
+| `CRM_INTERNAL_DOMAINS` | no | Comma-separated email domains whose unknown senders get a stub person note (coworkers). Empty = infer the dominant `work_email` domain of the existing person notes. External senders are linked only when a note already exists. |
 | `MAX_REQUEST_SIZE` | no | JSON body limit (default `10mb`); oversized bodies get a `413 {"error":"Payload too large","limit":…}`. |
 
 ### Health endpoint

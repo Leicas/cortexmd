@@ -6,7 +6,11 @@
  *
  *   - capture-noise filter (shell stubs, automated emails, calendar invites)
  *   - `matrimail` captures routed to EmailLog/ (+ per-month index link) so
- *     they neither flood Memories/ nor the graph
+ *     they do not flood Memories/
+ *   - email / chat captures link their participants (From/To/Cc headers) to
+ *     person notes, register them as entities, seed the KG and write a
+ *     timeline backlink on each person note (lib/capture-entities.ts); an
+ *     unknown coworker (internal domain) gets a stub person note
  *   - title dedup (Levenshtein on the slug, same category) and semantic dedup
  *     when embeddings are ready — the old route wrote blindly
  *   - incremental graph update so the note is not an orphan until next rebuild
@@ -28,6 +32,12 @@ import { sanitizeContent } from './sanitize.js';
 import { repairWikilinks } from './auto-link.js';
 import { MEMORY_CATEGORIES } from './categorize.js';
 import { logger } from './logger.js';
+import {
+  planCaptureEntityLinks,
+  renderCaptureEntitySection,
+  commitCaptureEntityLinks,
+  detectCaptureKind,
+} from './capture-entities.js';
 
 export type StoreMemoryImportance = 'low' | 'medium' | 'high';
 
@@ -51,6 +61,8 @@ export interface StoreMemoryResult {
   existingPath?: string;
   title?: string;
   pattern?: string;
+  /** Person notes linked from this capture (paths), when any resolved. */
+  entities?: string[];
 }
 
 export interface ApiValidationError {
@@ -176,6 +188,7 @@ export async function storeMemoryFromApi(body: StoreMemoryBody): Promise<StoreMe
 
   // n8n's email triage tags full-body captures `matrimail` → EmailLog/.
   const isEmailCapture = v.tags.includes(EMAIL_CAPTURE_TAG);
+  const captureKind = isEmailCapture ? 'email' : detectCaptureKind(v.tags, v.source);
   const baseDir = isEmailCapture ? 'EmailLog' : 'Memories';
   const memoryId = uuidv4();
   const notePath = `${baseDir}/${category}/${subdir}${today}-${slug}${isEmailCapture ? '' : `-${memoryId.slice(0, 8)}`}.md`;
@@ -211,6 +224,11 @@ export async function storeMemoryFromApi(body: StoreMemoryBody): Promise<StoreMe
   }
 
   const tags = Array.from(new Set([...v.tags, 'auto-capture', `source:${v.source}`]));
+
+  // Participants → person notes (stubs for internal-domain coworkers), planned
+  // BEFORE the write so the links land in the note's first version.
+  const plan = captureKind ? await planCaptureEntityLinks(content, captureKind) : null;
+
   const frontmatter: Record<string, unknown> = {
     id: memoryId,
     type: 'memory',
@@ -226,7 +244,10 @@ export async function storeMemoryFromApi(body: StoreMemoryBody): Promise<StoreMe
     tags,
     source: v.source,
   };
-  const noteBody = `# ${title}\n\n${content}\n`;
+  if (plan && plan.people.length > 0) {
+    frontmatter.auto_entities = plan.people.map((p) => `[[${p.path.replace(/\.md$/i, '')}]]`);
+  }
+  const noteBody = `# ${title}\n\n${content}${plan ? renderCaptureEntitySection(plan) : ''}\n`;
   const noteContent = stringifyFrontmatter(frontmatter, noteBody);
 
   try {
@@ -243,9 +264,12 @@ export async function storeMemoryFromApi(body: StoreMemoryBody): Promise<StoreMe
   try { await indexNote(notePath); } catch { /* best-effort */ }
   try { updateGraphForNote(notePath, noteContent); } catch { /* graph may not be built yet */ }
 
+  // Registry + KG + timeline backlinks on the person notes (needs the path).
+  if (plan) await commitCaptureEntityLinks(plan, { notePath, title, tags, date: today });
+
   if (isEmailCapture) {
-    // Email captures get no entity/related links; a per-month index keeps
-    // them from landing as orphans (parity with memory-store.ts).
+    // A per-month index keeps email captures from landing as orphans even
+    // when no participant resolved (parity with memory-store.ts).
     try {
       await linkFromIndex(
         { path: `EmailLog/EmailLog ${year}-${month}.md`, title: `EmailLog — ${year}-${month}` },
@@ -260,5 +284,7 @@ export async function storeMemoryFromApi(body: StoreMemoryBody): Promise<StoreMe
     }
   }
 
-  return { stored: true, path: notePath, category, title };
+  const result: StoreMemoryResult = { stored: true, path: notePath, category, title };
+  if (plan && plan.people.length > 0) result.entities = plan.people.map((p) => p.path);
+  return result;
 }

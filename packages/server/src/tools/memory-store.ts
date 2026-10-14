@@ -9,6 +9,7 @@ import { wrapToolHandler } from '../lib/tool-wrapper.js';
 import { sanitizeContent } from '../lib/sanitize.js';
 import { findSimilarNotes } from '../lib/similar-notes.js';
 import { autoLinkEntities, repairWikilinks, selectAutoRelated, seedEntityKg } from '../lib/auto-link.js';
+import { planCaptureEntityLinks, renderCaptureEntitySection, commitCaptureEntityLinks } from '../lib/capture-entities.js';
 import { isEmbeddingsReady, checkSemanticDuplicate } from '../lib/embeddings.js';
 import { extractPreferences, DetectedPreference } from '../lib/preference-detector.js';
 import { detectEntities, type DetectedEntity } from '../lib/entity-detector.js';
@@ -286,9 +287,12 @@ Categories: observation, decision, insight, conversation, fact, preference, plan
       } catch {
         highConfidence = [];
       }
-      // Skip auto-linking/KG-seeding for email captures — they'd spawn a node
-      // per sender. Curated memories still get linked + seeded into the graph.
+      // Email captures link their header participants (From/To/Cc) instead
+      // of body-detected names — a sender becomes a node only when a person
+      // note exists or they are a coworker (lib/capture-entities.ts). Curated
+      // memories still get body entities linked + seeded into the graph.
       const entityLinks = isEmailCapture || !config.autoLink ? [] : autoLinkEntities(highConfidence);
+      const capturePlan = isEmailCapture ? await planCaptureEntityLinks(content, 'email') : null;
 
       // Persist the (otherwise discarded) similarity signal as strippable
       // `## Related (auto)` backlinks. Computed before the body is built so the
@@ -352,7 +356,12 @@ Categories: observation, decision, insight, conversation, fact, preference, plan
           ? `\n\n## Related (auto)\n${autoRelated.map((l) => `- ${l}`).join('\n')}`
           : '';
 
-      const body = `# ${title}\n\n${content}${relatedSection}${entitySection}${autoRelatedSection}\n`;
+      const captureEntitySection = capturePlan ? renderCaptureEntitySection(capturePlan) : '';
+      if (capturePlan && capturePlan.people.length > 0) {
+        frontmatter.auto_entities = capturePlan.people.map((p) => `[[${p.path.replace(/\.md$/i, '')}]]`);
+      }
+
+      const body = `# ${title}\n\n${content}${relatedSection}${entitySection}${captureEntitySection}${autoRelatedSection}\n`;
 
       // Capture any [[code:...]] wiki-links into frontmatter for staleness checks.
       try {
@@ -376,8 +385,9 @@ Categories: observation, decision, insight, conversation, fact, preference, plan
       if (!isEmailCapture) {
         seedEntityKg(title, highConfidence, notePath);
       } else {
-        // Email captures get no entity/related links; a per-month index keeps
-        // them from landing as orphans.
+        // Registry + KG + timeline backlinks for the header participants, then
+        // the per-month index so the capture is never an orphan.
+        if (capturePlan) await commitCaptureEntityLinks(capturePlan, { notePath, title, tags, date: today });
         await linkFromIndex(
           { path: `EmailLog/EmailLog ${year}-${month}.md`, title: `EmailLog — ${year}-${month}` },
           notePath,

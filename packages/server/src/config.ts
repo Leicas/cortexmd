@@ -336,6 +336,25 @@ export const config = {
   autoLinkRelatedMax: parseInt(process.env.AUTO_LINK_RELATED_MAX ?? '3', 10),
   autoSeedKg: process.env.AUTO_SEED_KG !== 'false',
 
+  // Capture-time entity linking for email / chat captures (POST
+  // /api/store-memory and memory_store with the `matrimail` tag). Participants
+  // parsed from the capture headers (`From:` / `To:` / `Cc:` / `User:`) are
+  // linked to their person note, registered as entities and seeded into the
+  // KG; an unknown sender on an INTERNAL domain (a coworker) gets a stub
+  // person note. See lib/capture-entities.ts.
+  //   CAPTURE_ENTITY_LINKS=false      — disable (captures stay unlinked)
+  //   CRM_PEOPLE_DIR='CRM/People'     — where person notes live; empty =
+  //                                     auto-detect a conventional dir
+  //   CRM_INTERNAL_DOMAINS=acme.com   — comma-separated; empty = infer the
+  //                                     dominant work_email domain of the
+  //                                     existing person notes
+  captureEntityLinks: process.env.CAPTURE_ENTITY_LINKS !== 'false',
+  crmPeopleDir: (process.env.CRM_PEOPLE_DIR ?? '').trim().replace(/^\/+|\/+$/g, ''),
+  crmInternalDomains: (process.env.CRM_INTERNAL_DOMAINS ?? '')
+    .split(',')
+    .map((d) => d.trim().toLowerCase())
+    .filter(Boolean),
+
   // Capture-time noise filter (memory_store + /api/store-memory). Drops
   // memories whose title is a raw shell-command stub or an automated email
   // (see lib/capture-filter.ts for the built-in patterns).

@@ -156,6 +156,52 @@ export function mergeSection(
 }
 
 /**
+ * Append one line at the end of the section titled `sectionTitle` (## to
+ * ####), keeping the rest of the note intact. The line lands after the
+ * section's last non-blank line, before the next heading of the same or a
+ * higher level. A missing section is appended at the end of the note.
+ */
+export function appendLineToSection(
+  content: string,
+  sectionTitle: string,
+  line: string,
+): string {
+  const lines = content.split('\n');
+  const headingRegex = /^(#{2,4})\s+(.+)$/;
+  let sectionStart = -1;
+  let sectionEnd = lines.length;
+  let sectionLevel = 0;
+  for (let i = 0; i < lines.length; i++) {
+    const match = lines[i].match(headingRegex);
+    if (!match) continue;
+    const level = match[1].length;
+    if (sectionStart === -1) {
+      if (match[2].trim() === sectionTitle) {
+        sectionStart = i;
+        sectionLevel = level;
+      }
+    } else if (level <= sectionLevel) {
+      sectionEnd = i;
+      break;
+    }
+  }
+  if (sectionStart === -1) {
+    return `${content.trimEnd()}\n\n## ${sectionTitle}\n${line}\n`;
+  }
+  // Last non-blank line inside the section (the heading itself when empty).
+  let insertAfter = sectionStart;
+  for (let i = sectionEnd - 1; i > sectionStart; i--) {
+    if (lines[i].trim() !== '') { insertAfter = i; break; }
+  }
+  const before = lines.slice(0, insertAfter + 1);
+  const after = lines.slice(insertAfter + 1);
+  // Keep exactly one blank line between the new line and the next heading.
+  while (after.length > 0 && after[0].trim() === '' && sectionEnd < lines.length) after.shift();
+  const tail = sectionEnd < lines.length ? ['', ...after] : after;
+  return [...before, line, ...tail].join('\n');
+}
+
+/**
  * Append text at the end of content with a newline separator.
  */
 export function appendToContent(content: string, text: string): string {

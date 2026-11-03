@@ -206,6 +206,26 @@ describe('worker scope boundary', () => {
     );
     expect(read).not.toHaveBeenCalled();
   });
+  it('accepts a configured vault root alias while preserving relative note scope', async () => {
+    const vault = path.join(dir, 'actual-vault');
+    const alias = path.join(dir, 'configured-vault');
+    await mkdir(path.join(vault, 'Projects'), { recursive: true });
+    await writeFile(path.join(vault, 'Projects/a.md'), 'verified note');
+    // A root alias reproduces the canonical-vs-configured prefix difference
+    // introduced by Windows short temp paths without needing 8.3 support.
+    await symlink(vault, alias, 'junction');
+    const w = createWorkerTools(
+      { mode: 'knowledge-investigator', note_paths: ['Projects'] },
+      {
+        resolveNote: vi.fn().mockImplementation(async (p: string) => path.join(alias, p)),
+        vaultRoots: [alias],
+      },
+    );
+    const result = await w.executeTool('notes_get', { path: 'Projects/a.md' }, signal);
+    expect(result.content).toMatchObject({ path: 'Projects/a.md', content: 'verified note' });
+    await expect(w.executeTool('notes_get', { path: 'Projects-other/a.md' }, signal))
+      .rejects.toThrow('scope');
+  });
   it('marks filtered knowledge result truncation even below the search ceiling', async () => {
     await mkdir(path.join(dir, 'Projects'));
     const hits = await Promise.all(

@@ -237,10 +237,14 @@ export function createWorkerTools(scope: WorkerScope, deps: WorkerToolDependenci
       path.relative(path.resolve(selected), path.resolve(resolved)).replace(/\\/g, '/') !== p
     )
       throw new Error('Worker note aliases are not allowed');
-    // Reject symlink aliases even within the vault: they can cross the narrower worker scope.
-    if (path.resolve(await realpath(resolved)) !== path.resolve(resolved))
+    // Canonicalize the configured root as well: Windows temporary roots may use
+    // 8.3 names (RUNNER~1) which realpath expands. Only aliases *inside* the
+    // selected vault can cross this request's narrower relative-path scope.
+    const canonicalRoot = await realpath(selected);
+    const canonicalNote = await realpath(resolved);
+    if (path.resolve(canonicalNote) !== path.resolve(canonicalRoot, p))
       throw new Error('Worker note symlink aliases are not allowed');
-    return resolved;
+    return canonicalNote;
   }
   return {
     tools,

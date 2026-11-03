@@ -3,6 +3,7 @@
 //! alias) re-use the same entry point via [`run`] / [`run_with_args`].
 
 pub mod auth;
+pub mod ask;
 pub mod cli;
 pub mod contract;
 pub mod git;
@@ -67,6 +68,7 @@ fn dispatch(cli: Cli) -> Result<()> {
         },
         Some(Command::Index(args)) => run_index(args),
         Some(Command::Status) => inspect::cmd_status(),
+        Some(Command::Ask(args)) => ask::cmd_ask(args),
         Some(Command::Discover(args)) => inspect::cmd_discover(args),
         Some(Command::Scan(args)) => inspect::cmd_scan(args, run_index),
         Some(Command::Gain(args)) => inspect::cmd_gain(args),

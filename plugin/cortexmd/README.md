@@ -34,6 +34,10 @@ command: Claude Code exports every option as `CLAUDE_PLUGIN_OPTION_<KEY>` and
 `_mcp_rest.mjs` forwards `CLAUDE_PLUGIN_OPTION_SERVER_URL` to the CLI as
 `--server`.
 
+## Optional bounded investigations
+
+The `investigate` skill uses the optional `worker_run` tool to delegate scoped code or note investigation to a server-configured smaller model. See [worker configuration and boundaries](../../docs/workers.md). Normal navigation works without a worker; this feature is disabled by default and does not upload the local checkout.
+
 ## Prerequisites
 
 1. A **running cortexmd server** — `docs/deploy-local.md` (stdio, single

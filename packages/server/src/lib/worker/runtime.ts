@@ -169,6 +169,7 @@ export async function runWorker(request: WorkerRequest, deps: WorkerDependencies
       result.findings = final.findings.map((f: any) => ({ claim: f.claim, evidence_ids: [...new Set<string>(f.evidence_ids)] }));
       result.coverage.limitations.push(...final.limitations);
       if (!result.evidence.length) result.coverage.limitations.push('No source evidence was retrieved');
+      if (!result.findings.length) result.coverage.limitations.push('No evidence-backed findings were returned; the answer is not a validated synthesis');
       result.status = result.coverage.limitations.length ? 'partial' : 'complete';
       return result;
     }

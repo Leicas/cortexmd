@@ -34,6 +34,13 @@ describe('bounded worker runtime', () => {
     expect(result.status).toBe('failed');
     expect(result.findings).toEqual([]);
   });
+  it('does not report an uncited answer as complete after retrieving evidence', async () => {
+    const deps = dependencies([call(), { content: JSON.stringify({ answer: 'Everything is secure', findings: [], limitations: [] }) }]);
+    const result = await runWorker(request, deps);
+    expect(result.status).toBe('partial');
+    expect(result.evidence).toHaveLength(1);
+    expect(result.coverage.limitations.join(' ')).toContain('No evidence-backed findings');
+  });
   it.each(['notes_upsert', 'worker_run', 'shell'])('does not execute an unadvertised %s tool', async name => {
     const deps = dependencies([call(name)]);
     expect((await runWorker(request, deps)).status).toBe('failed');

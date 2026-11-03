@@ -400,6 +400,20 @@ export const config = {
   rerankerTimeoutMs: parseInt(process.env.RERANKER_TIMEOUT_MS ?? '1500', 10),
   anthropicApiKey: process.env.ANTHROPIC_API_KEY ?? '',
 
+  // Optional bounded investigators. Separate from reranking; never infer credentials or a model.
+  workerEnabled: process.env.WORKER_ENABLED === 'true',
+  workerProvider: process.env.WORKER_PROVIDER ?? '',
+  workerEndpoint: process.env.WORKER_ENDPOINT ?? '',
+  workerModel: process.env.WORKER_MODEL ?? '',
+  workerApiKey: process.env.WORKER_API_KEY ?? '',
+  workerMaxConcurrency: Number(process.env.WORKER_MAX_CONCURRENCY ?? '2'),
+  workerMaxToolCalls: Number(process.env.WORKER_MAX_TOOL_CALLS ?? '12'),
+  workerMaxRounds: Number(process.env.WORKER_MAX_ROUNDS ?? '8'),
+  workerMaxInputTokens: Number(process.env.WORKER_MAX_INPUT_TOKENS ?? '100000'),
+  workerMaxOutputTokens: Number(process.env.WORKER_MAX_OUTPUT_TOKENS ?? '4000'),
+  workerMaxToolResultBytes: Number(process.env.WORKER_MAX_TOOL_RESULT_BYTES ?? '16000'),
+  workerTimeoutMs: Number(process.env.WORKER_TIMEOUT_MS ?? '90000'),
+
   // Memory stack identity file
   identityFile: process.env.IDENTITY_FILE ?? '',
 

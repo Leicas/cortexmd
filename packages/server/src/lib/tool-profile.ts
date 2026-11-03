@@ -27,6 +27,7 @@ const TINY: ReadonlyArray<string> = [
 ];
 
 const NAV_EXTRAS: ReadonlyArray<string> = [
+  'worker_run',
   'code_symbol_get',
   'code_symbol_callers',
   'code_symbol_callees',

@@ -161,6 +161,8 @@ optional forward-auth), reverse-proxy setup, and `SOURCE_VAULTS` over git-pull.
 
 ## Docs
 
+- [`docs/workers.md`](./docs/workers.md) — optional smaller-model investigators with scoped read-only tools, evidence and budgets
+
 - [`docs/deploy-local.md`](./docs/deploy-local.md) — local-stdio quickstart (start here)
 - [`docs/deploy-http.md`](./docs/deploy-http.md) — self-hosted HTTP (advanced / team)
 - [`docs/brain-vault.md`](./docs/brain-vault.md) — the sole-writer / read-only-source model

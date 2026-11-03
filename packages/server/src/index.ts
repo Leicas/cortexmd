@@ -55,6 +55,7 @@ import { oauthRouter } from './oauth.js';
 // Tool registration imports
 import { register as registerNotesSearch } from './tools/notes-search.js';
 import { register as registerToolSearch } from './tools/tool-search.js';
+import { register as registerWorkerRun } from './tools/worker-run.js';
 import { snapshotTools, buildToolEmbeddings } from './lib/tool-meta.js';
 import { applyToolProfile, parseToolProfile } from './lib/tool-profile.js';
 import { register as registerNotesGet } from './tools/notes-get.js';
@@ -276,6 +277,7 @@ const allRegistrations = [
   registerCodeDetectBreakingChanges,
   // Defer-loading meta-tool (token-savior parity, Slice 1)
   registerToolSearch,
+  registerWorkerRun,
 ];
 
 // Server-level MCP `instructions` (lib/server-instructions.ts): surfaced to

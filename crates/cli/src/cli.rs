@@ -58,6 +58,8 @@ pub enum Command {
     /// Show server URL, auth method+expiry, registered repos, and token
     /// savings (when the server exposes `code_nav_stats`).
     Status,
+    /// Ask a bounded, read-only worker to investigate server-indexed code or notes.
+    Ask(AskArgs),
     /// List git repos under a root and mark which ones are registered.
     Discover(DiscoverArgs),
     /// Print token-savings stats fetched from the server's `code_nav_stats`
@@ -157,6 +159,30 @@ pub enum Command {
     /// idempotently patches `settings.json` with the SessionStart hook that
     /// keeps the HUD-line daemon alive.
     Init(InitArgs),
+}
+
+#[derive(clap::Args, Debug)]
+pub struct AskArgs {
+    /// Concrete investigation question. Source files are not uploaded by this command.
+    #[arg(long)]
+    pub question: String,
+    #[arg(long, default_value = "code-investigator", value_parser = ["code-investigator", "knowledge-investigator"])]
+    pub mode: String,
+    /// Registered repository slug (required for code investigations).
+    #[arg(long)]
+    pub repo: Option<String>,
+    /// Repository-relative path prefix; repeat to include multiple paths.
+    #[arg(long = "path")]
+    pub paths: Vec<String>,
+    /// Explicit vault-relative note prefix; required for knowledge investigations.
+    #[arg(long = "note-path")]
+    pub note_paths: Vec<String>,
+    /// Requested maximum tool calls; the server may impose a lower limit.
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
+    pub max_tool_calls: Option<u32>,
+    /// Requested wall-clock limit in seconds; the server may impose a lower limit.
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..=600))]
+    pub timeout_seconds: Option<u32>,
 }
 
 #[derive(clap::Args, Debug, Default)]

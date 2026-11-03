@@ -10,13 +10,13 @@ import {
   DEFAULT_TOOL_PROFILE,
 } from '../tool-profile.js';
 
-// I-6: the default `core` profile = TINY (6) + NAV_EXTRAS (8) + CORE_EXTRAS (17)
-// plus the CLI/hook dependencies (7) = 38 tools. (The plan's "29 → 36" counted
-// the old core as 29; it was 31.)
+// Core retains the I-6 set and adds the explicit bounded worker entry point:
+// TINY (6) + NAV_EXTRAS (9) + CORE_EXTRAS (17) + CLI/hook dependencies (7) = 39.
 const CORE_I6 = [
   // tiny
   'notes_search', 'memory_recall', 'memory_store', 'code_symbol_search', 'code_file_outline', 'tool_search',
   // nav
+  'worker_run',
   'code_symbol_get', 'code_symbol_callers', 'code_symbol_callees', 'code_change_impact',
   'code_full_context', 'code_audit_file', 'code_repo_list', 'code_project_symbol',
   // core
@@ -66,9 +66,9 @@ describe('parseToolProfile', () => {
 });
 
 describe('profile membership', () => {
-  it('core is exactly the I-6 set (36 tools)', () => {
+  it('core is exactly the I-6 set plus bounded worker execution (39 tools)', () => {
     expect(profileToolNames('core')).toEqual(CORE_I6);
-    expect(profileMembership('core')!.size).toBe(38);
+    expect(profileMembership('core')!.size).toBe(39);
   });
 
   it('profiles nest: tiny ⊂ nav ⊂ core ⊂ lean; full is unbounded', () => {
@@ -80,7 +80,9 @@ describe('profile membership', () => {
     for (const n of nav) expect(core.has(n)).toBe(true);
     for (const n of core) expect(lean.has(n)).toBe(true);
     expect(tiny.size).toBe(6);
-    expect(nav.size).toBe(14);
+    expect(nav.size).toBe(15);
+    expect(tiny.has('worker_run')).toBe(false);
+    expect(nav.has('worker_run')).toBe(true);
     expect(lean.size).toBeGreaterThan(core.size);
     expect(profileMembership('full')).toBeNull();
     expect(profileToolNames('full')).toBeNull();
@@ -94,7 +96,7 @@ describe('applyToolProfile (lazy loading: hidden but callable)', () => {
 
     const result = applyToolProfile(server, 'core');
     expect(result.profile).toBe('core');
-    expect(result.kept).toBe(38);
+    expect(result.kept).toBe(39);
     expect(result.hidden).toBe(HIDDEN_SAMPLE.length);
     expect(result.disabled).toBe(0);
 

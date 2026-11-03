@@ -1,6 +1,6 @@
 {
   "name": "@cortexmd/server",
-  "version": "1.19.1",
+  "version": "1.20.0",
   "description": "cortexmd MCP server: code-nav, memory, and vault read/write operations",
   "type": "module",
   "main": "dist/index.js",

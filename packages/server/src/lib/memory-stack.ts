@@ -83,6 +83,10 @@ export async function getIdentity(): Promise<string> {
       .join(', ');
 
     content = `Vault with ${noteCount} notes across ${collectionCounts.size} collections. Top collections: ${topCollections || 'none indexed yet'}.`;
+    // The server listens before the index is built, so an early caller can
+    // see an empty index. Do not cache that: it would pin "0 notes" for the
+    // whole TTL after every boot.
+    if (noteCount === 0) return content;
   }
 
   identityCache = { content, expires: now + IDENTITY_TTL_MS };

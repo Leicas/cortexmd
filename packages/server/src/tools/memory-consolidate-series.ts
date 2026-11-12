@@ -42,7 +42,7 @@ function slugifyTag(tag: string): string {
 export function register(server: McpServer): void {
   server.tool(
     'memory_consolidate_series',
-    "Fold older tagged memories into a rolling weekly summary at Memories/consolidated/{tag}-{YYYY-Www}.md. The originals remain at their paths and are archived with a link to the summary. Default dryRun=true returns a plan.",
+    "Fold older tagged memories into a rolling weekly digest (type: digest, low importance) at Memories/consolidated/{tag}-{YYYY-Www}.md. The originals remain at their paths and are archived with a link to the digest. Default dryRun=true returns a plan.",
     {
       tag: z.string().min(1).describe("Required. Tag that identifies the series (e.g. 'cron-run', 'email-recap')."),
       titleTemplate: z.string().optional().describe("Optional regex applied to note titles for additional matching (e.g. '^Cron run '). Combined with tag match (both must pass)."),
@@ -182,7 +182,10 @@ export function register(server: McpServer): void {
             const { data, body } = parseFrontmatter(content);
             const when = data.date || data.last_accessed || data.created || '';
             const heading = `### ${src.title}${when ? ` — ${when}` : ''}`;
-            const pathRef = `*Folded from [[${src.path}]]*`;
+            // Plain path, not a [[wikilink]]: a digest linking every source
+            // would become a graph hub and inflate each source's centrality.
+            // Provenance lives in the `consolidated_from` frontmatter list.
+            const pathRef = `*Folded from \`${src.path}\`*`;
             const trimmedBody = body.trim();
             chunks.push(`${heading}\n\n${pathRef}\n\n${trimmedBody}\n`);
             foldedSources.push(src.path);
@@ -200,17 +203,27 @@ export function register(server: McpServer): void {
         const todayStr = new Date().toISOString().slice(0, 10);
         const mergedSources = Array.from(new Set([...existingSources, ...foldedSources]));
 
+        // A digest is derived exhaust, not a memory: `type: digest` keeps it
+        // out of the memory tier (recall treats it as low priority, wakeup
+        // skips it), it is low importance unless someone raised it, and a fold
+        // is a machine write — it must not look like an access (no
+        // `last_accessed` bump, which would keep the digest artificially hot).
         const newData: Record<string, any> = {
           ...existingData,
-          type: 'memory',
+          type: 'digest',
           title: existingData.title || `${tag} — ${bucketKey}`,
-          category: existingData.category || 'insight',
+          importance: existingData.type === 'digest' && existingData.importance ? existingData.importance : 'low',
           tags: Array.from(new Set([...(Array.isArray(existingData.tags) ? existingData.tags : []), tag, 'consolidated-series'])).sort(),
           consolidated_from: mergedSources,
           series_tag: tag,
           last_updated: todayStr,
-          last_accessed: todayStr,
         };
+        // Digests written before this change were `type: memory, category:
+        // insight`: drop the memory-only fields the old writer stamped.
+        if (existingData.type !== 'digest') {
+          if (newData.category === 'insight') delete newData.category;
+          delete newData.last_accessed;
+        }
         if (!existingData.created) newData.created = todayStr;
 
         if (chunks.length > 0) {
@@ -232,7 +245,8 @@ export function register(server: McpServer): void {
         }
 
         // Archive originals only once the summary write succeeded. Stable
-        // source paths keep the summary's wiki links and full evidence valid.
+        // source paths keep the summary's `consolidated_from` list and the
+        // full evidence valid.
         for (const src of group) {
           if (!foldedSources.includes(src.path)) continue;
           try {

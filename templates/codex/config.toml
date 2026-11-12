@@ -1,6 +1,7 @@
 # where to put this: merge into ~/.codex/config.toml (Codex CLI and the Codex IDE extension
-# read the same file). Only the [mcp_servers.cortexmd] table is required; [features] is for
-# the optional hooks.json template.
+# read the same file). `cortexmd init --client codex` does this merge for you (format-preserving,
+# idempotent) — copy by hand only if you do not want the CLI to touch the file.
+# Only the [mcp_servers.cortexmd] table is required; [features] is for the optional hooks.
 #
 # References (verify against your Codex version — the config surface still moves):
 #   https://developers.openai.com/codex/config-reference        (mcp_servers.*, features, notify)
@@ -8,16 +9,23 @@
 #   https://github.com/openai/codex/blob/main/docs/config.md    (source of truth for the keys below)
 
 [mcp_servers.cortexmd]
-# Streamable HTTP endpoint of your cortexmd server (docs/deploy-http.md). For a local
-# stdio build use `command = "cortexmd"` / `args = ["mcp"]` instead of `url`.
-url = "http://localhost:3000/mcp"
+# Default: the `cortexmd mcp` stdio bridge. It forwards to <server>/mcp with the token the CLI
+# already holds (`cortexmd auth oauth-login --server URL`, refreshed automatically), so Codex
+# needs no login of its own. Works on Windows. Requires `cortexmd` on PATH.
+command = "cortexmd"
+args = ["mcp"]
 
-# Auth — pick one:
-#   * OAuth (default for HTTP servers): leave `bearer_token_env_var` commented and run
-#     `codex mcp login cortexmd` once; the server supports dynamic client registration.
-#   * Static API key (server started with API_KEY): export CORTEXMD_API_KEY=<key> in the
-#     environment Codex starts from and uncomment the next line.
-# bearer_token_env_var = "CORTEXMD_API_KEY"
+# Alternative A — Codex talks HTTP directly (no local bridge process):
+#   url = "http://localhost:3000/mcp"
+#   then `codex mcp login cortexmd` (OAuth, dynamic client registration), or for a server
+#   started with API_KEY: export CORTEXMD_API_KEY=<key> and
+#   bearer_token_env_var = "CORTEXMD_API_KEY"
+#
+# Alternative B — no server at all: run the server itself over stdio (local vault, no HTTP,
+# no auth; see docs/deploy-local.md):
+#   command = "node"
+#   args = ["/path/to/cortexmd/packages/server/dist/index.js", "--stdio"]
+#   env = { BRAIN_VAULT = "/path/to/brain" }
 
 # Server boot can take a few seconds on a cold vault (embeddings cache); code-nav and
 # memory_dream calls can be slow on large repos.
@@ -27,20 +35,22 @@ tool_timeout_sec = 120
 # Keep Codex usable when the server is down (the tools just disappear).
 required = false
 
-# cortexmd exposes ~90 tools. Trimming to the protocol set saves prompt tokens on every
-# turn; everything else stays reachable through `tool_search`. Uncomment to enable.
-# enabled_tools = [
-#   "memory_wakeup", "memory_recall", "memory_store",
-#   "agent_diary_append", "agent_diary_read",
-#   "notes_search", "notes_get", "notes_upsert", "kg_query",
-#   "code_repo_list", "code_file_outline", "code_symbol_search", "code_symbol_get",
-#   "code_symbol_callers", "code_symbol_callees", "code_change_impact", "code_call_chain",
-#   "code_index_repo", "tool_search",
-# ]
+# Lean protocol set: trimming the advertised tools saves prompt tokens on every turn. Codex
+# only calls tools in this list; everything else stays reachable through `tool_search` +
+# `tool_invoke` (servers that ship the dispatcher). Delete the key to expose every tool.
+enabled_tools = [
+  "memory_wakeup", "memory_recall", "memory_store",
+  "agent_diary_append", "agent_diary_read",
+  "notes_search", "notes_get", "notes_upsert", "kg_query",
+  "code_repo_list", "code_file_outline", "code_symbol_search", "code_symbol_get",
+  "code_symbol_callers", "code_symbol_callees", "code_change_impact", "code_call_chain",
+  "code_index_repo", "tool_search", "tool_invoke",
+]
 
 [features]
 # Codex hooks are experimental and gated behind this flag. When enabled, Codex reads
-# ~/.codex/hooks.json (see templates/codex/hooks.json). Not available on Windows.
+# ~/.codex/hooks.json (see templates/codex/hooks.json). Not available on Windows —
+# `cortexmd init --client codex` skips both there.
 hooks = true
 
 # NOTE: `notify = ["..."]` (top-level key) runs a program AFTER a turn completes

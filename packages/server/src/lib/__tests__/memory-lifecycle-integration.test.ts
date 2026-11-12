@@ -119,7 +119,20 @@ describe('memory lifecycle integration', () => {
     const parsed = JSON.parse(result.content[0].text);
     expect(parsed.totalArchived).toBe(1);
     const targetPath = parsed.results[0].targetPath as string;
-    expect((await readNote(targetPath)).content).toContain(`[[${sourcePath}]]`);
+    // The digest is derived exhaust, not a memory: `type: digest`, low
+    // importance, no access bump, and provenance as a `consolidated_from`
+    // frontmatter list — NOT a [[wikilink]] per source (which would make the
+    // digest a graph hub).
+    const digest = await readNote(targetPath);
+    const digestData = parseFrontmatter(digest.content).data;
+    expect(digestData.type).toBe('digest');
+    expect(digestData.importance).toBe('low');
+    expect(digestData.category).toBeUndefined();
+    expect(digestData.last_accessed).toBeUndefined();
+    expect(digestData.consolidated_from).toEqual([sourcePath]);
+    expect(digest.content).not.toContain(`[[${sourcePath}]]`);
+    expect(digest.content).toContain(`\`${sourcePath}\``);
+    expect(digest.content).toContain('Full historical observation that must remain.');
     const source = await readNote(sourcePath);
     expect(source.content).toContain('Full historical observation that must remain.');
     expect(parseFrontmatter(source.content).data.consolidated_into).toBe(targetPath);

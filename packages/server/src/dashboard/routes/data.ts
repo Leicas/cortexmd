@@ -15,6 +15,7 @@ import { sanitizePath } from '../../lib/sanitize.js';
 import { config } from '../../config.js';
 import { logger } from '../../lib/logger.js';
 import { getOAuthClients } from '../../oauth.js';
+import { getSseBuildStats, resetSseBuildStats } from '../model/perf.js';
 
 export function registerDataRoutes(router: Router): void {
   // Registered OAuth clients (secrets stripped) + the endpoint values an OAuth2
@@ -166,7 +167,14 @@ export function registerDataRoutes(router: Router): void {
     }
   });
 
-  router.get('/dashboard/api/agent-diary/:name', async (req: Request, res: Response) => {
+  // SSE payload build-time ring (p50/p95/max + avg bytes). `?reset=1` clears it.
+  router.get('/dashboard/api/perf', (req: Request, res: Response) => {
+    const stats = getSseBuildStats();
+    if (req.query.reset === '1') resetSseBuildStats();
+    res.json({ sse: stats });
+  });
+
+  router.get('/dashboard/api/agent-diary/:name',async (req: Request, res: Response) => {
     try {
       const raw = parseInt(String(req.query.limit ?? '20'), 10);
       const limit = Number.isFinite(raw) ? Math.min(Math.max(raw, 1), 200) : 20;

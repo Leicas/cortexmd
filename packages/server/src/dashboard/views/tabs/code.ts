@@ -70,7 +70,7 @@ export function renderCodeTab(): string {
         <div class="section-title" style="margin:0">Cumulative Savings</div>
         <span class="card-sub" id="codeRunRate" style="margin:0">—</span>
       </div>
-      <div class="chart-wrap"><svg id="codeSavingsTrend" viewBox="0 0 600 140" preserveAspectRatio="none" aria-hidden="true"></svg></div>
+      <div class="chart-wrap"><svg id="codeSavingsTrend" viewBox="0 0 600 140" preserveAspectRatio="none" role="img" aria-label="Chart (no data yet)" data-auto-label></svg></div>
       <div class="card-sub" id="codeSavingsSummary" style="margin-top:.6rem">No code-nav tool calls recorded yet.</div>
     </div>
     <div class="col-4 card">

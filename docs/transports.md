@@ -83,3 +83,35 @@ Whatever the transport, the per-source **default-deny index allowlist** applies
 to the vault-relative paths a transport yields (`name=path:glob1|glob2`), and
 the hard-blocked segments `.obsidian` / `.sync` / `.trash` are denied
 independently of any glob. See [`brain-vault.md`](./brain-vault.md#the-allowlist).
+
+## MCP client transports (stdio vs Streamable HTTP)
+
+Separate from the vault seam above: how an MCP *client* talks to the server.
+Both transports serve the same `McpServer` (`packages/server/src/mcp-server.ts`):
+same tools, resources, prompts and `TOOL_PROFILE`.
+
+| | `node dist/index.js --stdio` | `node dist/index.js` (HTTP, default) |
+|---|---|---|
+| Wire | JSON-RPC over stdin/stdout | Streamable HTTP on `POST/GET/DELETE /mcp` (`API_PORT`) |
+| Auth | none (the parent process owns the pipe) | `API_KEY` bearer or OAuth JWT |
+| Dashboard, REST hooks API | no | yes |
+| Sessions | one implicit session per process | `mcp-session-id`, idle sweep + LRU cap |
+| Logs | stderr only (stdout is reserved for JSON-RPC) | stdout/stderr |
+
+### HTTP sessions: no "Session expired" after idling
+
+Sessions are swept after `SESSION_TIMEOUT_MS` of inactivity (default 30 min),
+capped at `MAX_ACTIVE_SESSIONS` live sessions (default 200, least-recently-active
+evicted first), and their metadata is persisted for restarts, capped at
+`MAX_PERSISTED_SESSIONS` (default 500) and `SESSION_RETENTION_MS` (7 days).
+
+Per-session server state is disposable, so a request that carries an unknown or
+expired `mcp-session-id` is **not** answered with 404. Once the request has
+passed authentication, the server rebuilds the session in-process under the same
+id (new server, transport primed with an internal `initialize`) and serves the
+request. Clients that idle for longer than the sweep, or reconnect after a
+server restart, keep working with no re-initialize. The rebuilt session is
+registered like any other, so the idle sweep and both caps still bound memory.
+A 404 is returned only when the id is malformed or belongs to a different OAuth
+principal. Clients that re-`initialize` on 404 (which the spec requires) are
+unaffected.

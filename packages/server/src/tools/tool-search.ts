@@ -37,21 +37,21 @@ function substringScore(name: string, description: string, query: string): numbe
 export function register(server: McpServer): void {
   server.tool(
     'tool_search',
-    "Defer-loading tool discovery — semantic search over the full tool registry by name & description. Returns matched tools with their full inputSchema so you can find tools whose exact name you don't recall, or that aren't pre-loaded under a reduced OBSIDIAN_TOOL_PROFILE. Use this when you suspect a tool exists for what you need but you can't remember its name (e.g. 'how do I find related notes' → notes_search, graph_neighbors).",
+    'Find cortexmd tools by capability across ALL registered tools (kg_*, graph_*, tags_*, tasks_*, dream, …), including ones not in your tool list. Returns name, description, inputSchema; call an unlisted tool with tool_invoke(name, arguments).',
     {
       query: z
         .string()
-        .describe('Natural-language description of the capability you need (e.g. "find related notes", "store a memory")'),
+        .describe('Capability you need, e.g. "find related notes"'),
       top_k: z
         .number()
         .optional()
         .default(5)
-        .describe('Maximum number of tools to return (default 5).'),
+        .describe('Max tools (default 5)'),
       include_schema: z
         .boolean()
         .optional()
         .default(true)
-        .describe('Include each tool\'s inputSchema in the response (default true).'),
+        .describe('Include inputSchema (default true)'),
     },
     wrapToolHandler('tool_search', async (params) => {
       const query = String(params.query ?? '').trim();
@@ -132,6 +132,7 @@ export function register(server: McpServer): void {
               results,
               totalRegistered: tools.length,
               mode,
+              invoke: 'Call any result via tool_invoke({name, arguments}) if it is not in your tool list.',
             }),
           },
         ],

@@ -44,3 +44,6 @@ dream-restore-manifest.txt
 
 # hook runtime state (written next to the scripts by older hook versions / manual runs)
 .diary-stop-state.json
+
+# real-data recall eval set + results — never commit (private vault queries/paths)
+.realvault-eval/

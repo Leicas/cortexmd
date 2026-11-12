@@ -8,7 +8,21 @@ export type RerankerProvider = 'anthropic' | 'openai-compatible' | 'none';
 export interface RerankerCandidate {
   index: number;
   title: string;
+  /**
+   * The passage the model judges. Callers should pass the note's best-matching
+   * passage for the query (lib/search.ts `bestPassage`), not its first lines.
+   */
   snippet: string;
+}
+
+/** Characters of each candidate's passage shown to the reranker. */
+export const RERANK_PASSAGE_CHARS = 300;
+
+/** One numbered prompt line per candidate: `n. title — passage`. */
+export function formatRerankCandidates(candidates: RerankerCandidate[]): string {
+  return candidates
+    .map((c, i) => `${i + 1}. ${c.title} — ${c.snippet.replace(/\s+/g, ' ').trim().slice(0, RERANK_PASSAGE_CHARS)}`)
+    .join('\n');
 }
 
 export interface RerankerMetrics {
@@ -88,6 +102,11 @@ function breakerRecordFailure(): void {
 function resolveProvider(): RerankerProvider {
   // Explicitly disabled
   if (!config.enableReranker) {
+    return 'none';
+  }
+  // No model → every call would fail until the circuit breaker opens. Skip cleanly.
+  if (!config.rerankerModel) {
+    logger.warn('ENABLE_RERANKER=true but RERANKER_MODEL not set — reranker disabled');
     return 'none';
   }
 
@@ -219,9 +238,7 @@ async function rerankWithAnthropic(
   const { default: Anthropic } = await import('@anthropic-ai/sdk');
   const client = new Anthropic({ apiKey: config.anthropicApiKey });
 
-  const candidateList = candidates
-    .map((c, i) => `${i + 1}. ${c.title} — ${c.snippet.slice(0, 100)}`)
-    .join('\n');
+  const candidateList = formatRerankCandidates(candidates);
 
   const response = await client.messages.create({
     model: config.rerankerModel,
@@ -232,7 +249,7 @@ async function rerankWithAnthropic(
         content: buildRerankPrompt(query, candidateList),
       },
     ],
-  });
+  }, { timeout: config.rerankerTimeoutMs, maxRetries: 0 });
 
   const text = response.content
     .filter((block) => block.type === 'text')
@@ -254,9 +271,7 @@ async function rerankWithOpenAICompatible(
   const baseUrl = config.rerankerBaseUrl!;
   const url = `${baseUrl.replace(/\/+$/, '')}/v1/chat/completions`;
 
-  const candidateList = candidates
-    .map((c, i) => `${i + 1}. ${c.title} — ${c.snippet.slice(0, 100)}`)
-    .join('\n');
+  const candidateList = formatRerankCandidates(candidates);
 
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',

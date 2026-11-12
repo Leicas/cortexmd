@@ -27,8 +27,30 @@ describe('matchCaptureNoise', () => {
     'systemctl restart nginx after config change',
     'Email - Quote request from Acme',
     'cortexmd: sync bug root cause is the etag check',
+    'git rebase broke the release branch twice this week',
+    'npm audit shows three critical vulnerabilities',
+    'find the root cause of the flaky upload test',
   ])('keeps %s', (title) => {
     expect(matchCaptureNoise(title)).toBeUndefined();
+  });
+
+  it.each([
+    'git status',
+    'webapp: npm run build && npm test',
+    'kubectl get pods -n staging',
+    'the parser returns early.</result>',
+    '{"status": "ok", "count": 3}',
+  ])('drops echo title %s', (title) => {
+    expect(matchCaptureNoise(title)?.source).toBeDefined();
+  });
+
+  it('applies body rules only when the hook passes body/source', () => {
+    const commitBody = 'Made a commit with message: "chore: bump version"';
+    expect(matchCaptureNoise('Release prep for the mobile app')).toBeUndefined();
+    expect(matchCaptureNoise('Release prep for the mobile app', { content: commitBody })?.source).toBe('echo:git-commit-echo');
+    expect(matchCaptureNoise('three widgets', { content: 'three widgets', source: 'hook:UserPromptSubmit' })?.source)
+      .toBe('echo:prompt-fragment');
+    expect(matchCaptureNoise('three widgets', { content: 'three widgets', source: 'claude-code' })).toBeUndefined();
   });
 
   it('honours extra patterns and the kill switch', () => {

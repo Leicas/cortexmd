@@ -1,16 +1,17 @@
 /**
  * Recall ranking signals — pure, side-effect-free scoring helpers.
  *
- * These are the multiplicative "boost" factors `memory_recall` applies on top
- * of the fused lexical+semantic score. Keeping them here (rather than inline in
- * the tool) makes each signal independently unit-testable and documents the
- * shape of the recall ranker in one place.
+ * These are the prior terms `memory_recall` applies on top of the fused
+ * lexical+semantic relevance. Keeping them here (rather than inline in the
+ * tool) makes each signal independently unit-testable and documents the shape
+ * of the recall ranker in one place.
  *
  * Today this module owns the **graph-centrality** signal — the one recall
  * input that the in-tool scorer lacked. Heat, recency, validity, related, and
- * context boosts already live in `memory-recall.ts`; centrality joins them so a
- * well-connected note (many inbound `[[wikilinks]]`) ranks above an otherwise
- * equal orphan, matching the link-strength term other memory engines fuse in.
+ * context terms live in `lib/memory.ts` (`rescoreRecall`); centrality joins
+ * them so a well-connected note (many inbound `[[wikilinks]]`) ranks above an
+ * otherwise equal orphan, matching the link-strength term other memory engines
+ * fuse in.
  */
 
 /**
@@ -29,13 +30,14 @@ export function normalizeCentrality(inboundLinks: number, cap = CENTRALITY_SATUR
 }
 
 /**
- * Multiplicative recall boost from graph centrality.
+ * Multiplicative recall boost from graph centrality (legacy scoring).
  *
  *   boost = 1 + weight × normalizeCentrality(inboundLinks)
  *
  * With the default weight a note at/above the saturation point gets at most a
  * `+weight` (e.g. +15%) lift; an orphan (0 inbound) gets exactly 1.0 (no-op).
  * `weight = 0` disables the signal entirely (byte-for-byte unchanged ranking).
+ * Bounded scoring uses `normalizeCentrality` directly as a small additive prior.
  */
 export function centralityBoost(
   inboundLinks: number | undefined,
@@ -53,9 +55,16 @@ export function centralityBoost(
 // turns the per-result scoring inputs into a compact, human-readable breakdown
 // (opt-in, so it never inflates the default response).
 
+export type RecallArm = 'lexical' | 'semantic' | 'graph';
+
 export interface RecallSignalBreakdown {
-  /** Whether the hit came from semantic, lexical, or both retrieval arms. */
-  match: 'semantic' | 'lexical' | 'hybrid';
+  /**
+   * Which retrieval arm produced the hit: `lexical`, `semantic`, `graph` (PPR
+   * only — reached through links, no direct match) or `hybrid` (≥ 2 arms).
+   */
+  match: RecallArm | 'hybrid';
+  /** Contributing arms, in fixed order (set only for hybrid hits). */
+  arms?: RecallArm[];
   temperature: string;
   heatScore?: number;
   /** Inbound [[wikilink]] count (graph centrality). */
@@ -70,6 +79,10 @@ export interface RecallSignalBreakdown {
   related: boolean;
   /** Co-recall spreading-activation boost fraction (e.g. 0.12 = +12%), if any. */
   coRecall?: number;
+  /** Combined bounded prior applied to relevance (e.g. 0.08 = +8%). */
+  prior?: number;
+  /** Pool the note came from when it is not a plain memory: note | digest | email | episodic. */
+  tier?: string;
   /** One-line "why this surfaced" rationale. */
   reason: string;
 }
@@ -77,6 +90,8 @@ export interface RecallSignalBreakdown {
 export interface RecallSignalInputs {
   lexicalScore: number;
   semanticScore: number;
+  /** PPR graph-arm contribution (0 / undefined when the arm is off). */
+  graphScore?: number;
   temperature: string;
   heatScore?: number;
   recency: number;
@@ -84,26 +99,35 @@ export interface RecallSignalInputs {
   validity?: number;
   stale: boolean;
   related: boolean;
+  prior?: number;
+  tier?: string;
+  /** True when the note was demoted as low-priority tier (the episodic kind). */
+  lowTier?: boolean;
 }
 
 export function explainRecall(x: RecallSignalInputs): RecallSignalBreakdown {
-  const match: RecallSignalBreakdown['match'] =
-    x.lexicalScore > 0 && x.semanticScore > 0
-      ? 'hybrid'
-      : x.semanticScore > 0
-        ? 'semantic'
-        : 'lexical';
+  const arms: RecallArm[] = [];
+  if (x.lexicalScore > 0) arms.push('lexical');
+  if (x.semanticScore > 0) arms.push('semantic');
+  if ((x.graphScore ?? 0) > 0) arms.push('graph');
+  const match: RecallSignalBreakdown['match'] = arms.length > 1 ? 'hybrid' : (arms[0] ?? 'lexical');
 
   const parts: string[] = [];
-  parts.push(match === 'hybrid' ? 'lexical+semantic match' : `${match} match`);
+  parts.push(
+    arms.length > 1 ? `${arms.join('+')} match`
+      : match === 'graph' ? 'graph match (linked to top hits)'
+      : `${match} match`,
+  );
   if (x.temperature === 'hot' || x.temperature === 'warm') parts.push(x.temperature);
   if (x.related) parts.push('linked to context');
   if (x.inboundLinks > 0) parts.push(`central (${x.inboundLinks} link${x.inboundLinks === 1 ? '' : 's'})`);
   if (x.recency >= 0.5) parts.push('recent');
   if (x.stale) parts.push('stale (contradicted)');
+  if (x.tier && x.tier !== 'memory') parts.push(x.lowTier ? `${x.tier} (low priority)` : x.tier);
 
   return {
     match,
+    arms: arms.length > 1 ? arms : undefined,
     temperature: x.temperature,
     heatScore: x.heatScore,
     inboundLinks: x.inboundLinks,
@@ -111,6 +135,8 @@ export function explainRecall(x: RecallSignalInputs): RecallSignalBreakdown {
     validity: x.validity !== undefined ? Math.round(x.validity * 100) / 100 : undefined,
     stale: x.stale,
     related: x.related,
+    prior: x.prior !== undefined ? Math.round(x.prior * 1000) / 1000 : undefined,
+    tier: x.tier && x.tier !== 'memory' ? x.tier : undefined,
     reason: parts.join('; '),
   };
 }

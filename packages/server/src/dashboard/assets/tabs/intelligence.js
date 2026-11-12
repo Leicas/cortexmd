@@ -1,7 +1,7 @@
 // intelligence.js — Intelligence tab client module (ES module, no build).
 // Revamped onto the new design system (REVAMP.md §5 TAB 5). Reads only from
 // ctx.data (incl. ctx.data.derived). Action callbacks register into
-// window.cortex so the server-rendered onclick="cortex.*" bridge resolves.
+// window.cortex so the server-rendered data-cx-click="cortex.*" bridge resolves.
 // Follows the overview.js reference: drawGauge/drawMulti charts, threshold pills
 // mirrored from model/derive THRESHOLDS, setLive for the flash cue, and the
 // shared pill/delta/empty markup. See ARCHITECTURE.md §3/§4.
@@ -381,7 +381,7 @@ export default {
           + '<div class="rec-text"><strong>' + esc(srcShort.replace(/\.md$/, '')) + '</strong> ↔ <strong>' + esc(tgtShort.replace(/\.md$/, '')) + '</strong></div>'
           + '<div class="rec-confidence">' + esc(c.reason) + ' · ' + (c.confidence * 100).toFixed(0) + '% confidence</div>'
           + '</div>'
-          + '<div class="rec-actions"><button class="btn btn--sm" onclick="cortex.dismissRec(\'' + escAttr(dismissKey) + '\')">Dismiss</button></div>'
+          + '<div class="rec-actions"><button class="btn btn--sm" data-cx-click="cortex.dismissRec(\'' + escAttr(dismissKey) + '\')">Dismiss</button></div>'
           + '</div>');
       }
       var groups = dream.consolidationGroups || [];
@@ -394,7 +394,7 @@ export default {
           + '<div class="rec-text"><strong>' + esc(g.suggestedTitle) + '</strong> — ' + g.paths.length + ' notes</div>'
           + '<div class="rec-confidence">Tags: ' + g.commonTags.map(function (t) { return '#' + t; }).join(', ') + ' · avg heat: ' + (g.avgHeatScore || 0).toFixed(1) + '</div>'
           + '</div>'
-          + '<div class="rec-actions"><button class="btn btn--sm" onclick="cortex.dismissRec(\'' + escAttr(dismissKeyG) + '\')">Dismiss</button></div>'
+          + '<div class="rec-actions"><button class="btn btn--sm" data-cx-click="cortex.dismissRec(\'' + escAttr(dismissKeyG) + '\')">Dismiss</button></div>'
           + '</div>');
       }
     }

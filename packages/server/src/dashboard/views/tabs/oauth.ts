@@ -22,7 +22,7 @@ function settingRow(label: string, valueHtml: string): string {
 
 /** A click-to-copy mono span (reuses core's cortex.copyLogLine). */
 function copyVal(id: string): string {
-  return `<span class="mono" id="${id}" title="Click to copy" style="cursor:pointer;word-break:break-all" onclick="cortex.copyLogLine(this)">—</span>`;
+  return `<span class="mono" id="${id}" title="Click to copy" style="cursor:pointer;word-break:break-all" data-cx-click="cortex.copyLogLine(this)">—</span>`;
 }
 
 export function renderOAuthTab(): string {
@@ -56,7 +56,7 @@ export function renderOAuthTab(): string {
       <textarea class="textarea mono" id="oauthRedirectUris" rows="2"
         placeholder="https://your-n8n-host/rest/oauth2-credential/callback"></textarea>
     </div>
-    <button type="button" class="btn btn-primary" onclick="cortex.oauthCreate()">Create client</button>
+    <button type="button" class="btn btn-primary" data-cx-click="cortex.oauthCreate()">Create client</button>
     <div id="oauthCreateResult" style="margin-top:.75rem"></div>
   `);
 

@@ -20,6 +20,8 @@ import { detectMemoryConflicts, updateValidity, type MemoryConflict } from '../l
 import { config } from '../config.js';
 import { matchCaptureNoise, isSlugTitle } from '../lib/capture-filter.js';
 import { linkFromIndex } from '../lib/index-notes.js';
+import { provenanceFrontmatter } from '../lib/store-memory-api.js';
+import { memoryKindOf } from '../lib/memory-kind.js';
 
 // Local mutable tuple for z.enum (MEMORY_CATEGORIES is the shared readonly source of truth).
 const CATEGORIES = [...MEMORY_CATEGORIES] as [MemoryCategory, ...MemoryCategory[]];
@@ -86,13 +88,7 @@ function levenshteinDistance(a: string, b: string): number {
 export function register(server: McpServer): void {
   server.tool(
     "memory_store",
-    `Store a structured memory with auto-categorization, heat tracking, dedup detection, and entity extraction. Use this for knowledge worth recalling later — facts, decisions, observations, plans, preferences.
-
-NOT for raw note editing (use notes_upsert), NOT for session logs (use diary_write), NOT for event logging (use journal_append).
-
-Embed [[wiki-links]] to people, projects, and concepts — well-linked memories rank higher in recall and feed the knowledge graph. Use relatedPaths to auto-generate a Related section.
-
-Categories: observation, decision, insight, conversation, fact, preference, plan, reflection. Auto-detected from content if omitted. Temporal categories go to Memories/{cat}/YYYY/MM/, timeless (fact, preference) stay flat.`,
+    `Store one durable memory (fact, decision, observation, plan, preference…) with auto-categorization, dedup and entity extraction. Not for editing notes (notes_upsert) or session logs (agent_diary_append). Embed [[wiki-links]] to people/projects/concepts — linked memories rank higher in recall. Optional agent/machine/project record provenance.`,
     {
       content: z.string().describe("Memory content in markdown. Embed [[wiki-links]] to people, projects, and concepts mentioned in this memory"),
       category: z
@@ -119,8 +115,25 @@ Categories: observation, decision, insight, conversation, fact, preference, plan
         .boolean()
         .optional()
         .describe("Skip semantic duplicate detection. Use when you know the content is unique or want to force storage"),
+      agent: z.string().optional().describe('Agent name, e.g. "Claude Code (<hostname>)" (defaults to the MCP client name)'),
+      machine: z.string().optional().describe('Machine id (hostname)'),
+      project: z.string().optional().describe('Project slug (git repo name, as in [[Projects/<slug>]])'),
     },
     wrapToolHandler("memory_store", async (params) => {
+      // Provenance for the dashboard Memories filters. `client` (and the agent
+      // fallback) come from this session's MCP initialize clientInfo.
+      let clientName: string | undefined;
+      try {
+        clientName = server.server.getClientVersion()?.name;
+      } catch {
+        clientName = undefined;
+      }
+      const provenance = provenanceFrontmatter({
+        agent: params.agent ?? clientName,
+        machine: params.machine,
+        project: params.project,
+        client: clientName,
+      });
       // Title/registry-named links ([[Email - <subject>]]) → real paths
       const content = repairWikilinks(sanitizeContent(params.content as string));
       const category = (params.category as Category | undefined) ?? detectCategory(content);
@@ -311,6 +324,7 @@ Categories: observation, decision, insight, conversation, fact, preference, plan
         last_decayed: now.toISOString(),
         created: today,
         last_updated: today,
+        ...provenance,
       };
 
       if (contradictions.length > 0) {
@@ -337,6 +351,12 @@ Categories: observation, decision, insight, conversation, fact, preference, plan
       if (context) {
         frontmatter.context = context;
       }
+
+      // Episodic / semantic / procedural (explicit kinds are never passed in
+      // here, so this derives from category / source / path).
+      frontmatter.memory_kind = memoryKindOf(frontmatter, notePath, {
+        machineSourcePatterns: config.machineCaptureSourcePatterns,
+      });
 
       // Build body
       const relatedSection =
@@ -368,7 +388,29 @@ Categories: observation, decision, insight, conversation, fact, preference, plan
       // Update index and graph incrementally
       await indexNote(notePath);
       updateGraphForNote(notePath, noteContent);
-      if (config.memoryValidity) {
+      // Async LLM reconcile (RECONCILE_LLM, off by default): every heuristic
+      // hit is queued for a model verdict. When it is live (not dry-run) the
+      // verdict decides — a SUPERSEDE lowers the old note's validity — so the
+      // heuristic alone no longer penalises a possibly-complementary note.
+      let reconcileQueue: Awaited<ReturnType<typeof import('../lib/reconcile.js').getReconcileQueue>> = null;
+      if (config.reconcileEnabled && (contradictions.length > 0 || (potential_conflicts?.length ?? 0) > 0)) {
+        try {
+          const { getReconcileQueue } = await import('../lib/reconcile.js');
+          reconcileQueue = await getReconcileQueue();
+        } catch {
+          reconcileQueue = null;
+        }
+      }
+      if (reconcileQueue) {
+        for (const c of contradictions) {
+          reconcileQueue.enqueue({ newPath: notePath, existingPath: c.path, signal: { source: 'contradiction', cosine: c.score } });
+        }
+        for (const c of potential_conflicts ?? []) {
+          reconcileQueue.enqueue({ newPath: notePath, existingPath: c.path, signal: { source: 'title_conflict' } });
+        }
+      }
+      const reconcileDecides = reconcileQueue !== null && !config.reconcileDryRun;
+      if (config.memoryValidity && !reconcileDecides) {
         for (const conflict of contradictions) {
           updateValidity(conflict.path, 'failure').catch(() => undefined);
         }
@@ -498,6 +540,7 @@ Categories: observation, decision, insight, conversation, fact, preference, plan
               related: [`[[${notePath}]]`],
               auto_extracted: true,
               preference_type: pref.type,
+              memory_kind: 'procedural',
             };
 
             const prefBody = `# ${prefTitle}\n\n${pref.statement}\n\n## Source\nExtracted from [[${notePath}]]\n`;

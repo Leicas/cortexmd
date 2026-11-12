@@ -61,7 +61,7 @@ describe('storeMemoryFromApi', () => {
     expect(updated).toMatchObject({ stored: false, reason: 'capture_noise' });
   });
 
-  it('stores an observation under Memories/ with low importance, warm, heat 6 and auto-capture tags', async () => {
+  it('stores a machine (hook) capture born cold: low importance, heat 0, no source:* tag', async () => {
     const res = await storeMemoryFromApi({
       content: 'Build cache stale after dependency bump. The hook saw it on the second run.',
       tags: ['build'],
@@ -73,11 +73,71 @@ describe('storeMemoryFromApi', () => {
     expect(res.path).toMatch(new RegExp(`^Memories/observation/${ym}/\\d{4}-\\d{2}-\\d{2}-build-cache-stale-after-dependency-bump-[0-9a-f]{8}\\.md$`));
     const fm = await frontmatterOf(res.path!);
     expect(fm).toMatchObject({
-      type: 'memory', category: 'observation', importance: 'low', temperature: 'warm', heat_score: 6,
-      access_count: 1, source: 'posttooluse',
+      type: 'memory', category: 'observation', importance: 'low', temperature: 'cold', heat_score: 0,
+      source: 'posttooluse',
     });
-    expect(fm.tags).toEqual(expect.arrayContaining(['build', 'auto-capture', 'source:posttooluse']));
+    expect(fm.tags).toEqual(expect.arrayContaining(['build', 'auto-capture']));
+    expect(fm.tags).not.toContain('source:posttooluse');
+    expect(fm.memory_kind).toBe('episodic');
     expect(getDocMeta().get(res.path!)?.type).toBe('memory');
+  });
+
+  it('keeps the warm/6 start for a deliberate (non-machine) source', async () => {
+    const res = await storeMemoryFromApi({
+      content: 'Payment webhooks must be idempotent. Stripe retries for three days.',
+      source: 'claude-code',
+      importance: 'medium',
+    });
+    expect(res.stored).toBe(true);
+    expect(await frontmatterOf(res.path!)).toMatchObject({ temperature: 'warm', heat_score: 6, importance: 'medium', access_count: 1, memory_kind: 'semantic' });
+  });
+
+  it('honours an explicit importance on a machine capture but still starts cold', async () => {
+    const res = await storeMemoryFromApi({
+      content: 'Contract renewal deadline moved to March. Legal confirmed by mail.',
+      source: 'n8n:triage',
+      importance: 'high',
+    });
+    expect(await frontmatterOf(res.path!)).toMatchObject({ temperature: 'cold', heat_score: 0, importance: 'high' });
+  });
+
+  it('drops hook echoes: bare commands, tool-result fragments, commit bodies, prompt fragments', async () => {
+    expect(await storeMemoryFromApi({ content: 'kubectl get pods -n staging' })).toMatchObject({ stored: false, reason: 'capture_noise' });
+    expect(await storeMemoryFromApi({ title: 'the parser returns early.</result>', content: 'x' })).toMatchObject({ stored: false, reason: 'capture_noise' });
+    expect(await storeMemoryFromApi({ title: 'Release prep', content: 'Made a commit with message: "chore: bump"\nline two' }))
+      .toMatchObject({ stored: false, reason: 'capture_noise', pattern: 'echo:git-commit-echo' });
+    expect(await storeMemoryFromApi({ content: 'three widgets', source: 'hook:UserPromptSubmit' }))
+      .toMatchObject({ stored: false, reason: 'capture_noise', pattern: 'echo:prompt-fragment' });
+  });
+
+  it('supersedes a recurring machine capture with the same title stem + source', async () => {
+    const first = await storeMemoryFromApi({
+      title: 'Morning ops briefing — Mon 2026-11-09',
+      content: 'Two alerts overnight, both resolved.',
+      source: 'n8n:briefing',
+    });
+    expect(first.stored).toBe(true);
+    const second = await storeMemoryFromApi({
+      title: 'Morning ops briefing — Tue 2026-11-10',
+      content: 'Quiet night, one backup retried.',
+      source: 'n8n:briefing',
+    });
+    expect(second).toMatchObject({ stored: true, supersededPath: first.path });
+    const newFm = await frontmatterOf(second.path!);
+    expect(newFm.supersedes).toBe(first.path);
+    expect(newFm.valid_from).toBe(now.toISOString().slice(0, 10));
+    const oldFm = await frontmatterOf(first.path!);
+    expect(oldFm).toMatchObject({ superseded_by: second.path, archived: true, temperature: 'cold', heat_score: 0 });
+    expect(oldFm.valid_to).toBe(now.toISOString().slice(0, 10));
+
+    // A different source never supersedes (and a different stem stays separate).
+    const other = await storeMemoryFromApi({
+      title: 'Evening sales digest — Tue 2026-11-10',
+      content: 'Three quotes sent.',
+      source: 'n8n:sales',
+    });
+    expect(other.stored).toBe(true);
+    expect(other.supersededPath).toBeUndefined();
   });
 
   it('honours importance from the body and keeps timeless categories flat', async () => {

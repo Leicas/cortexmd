@@ -5,8 +5,10 @@ alwaysApply: true
 
 <!-- where to put this: <repo>/.cursor/rules/cortexmd.mdc (one project) or, for every
      project, Cursor Settings → Rules → User Rules (paste the body without the frontmatter).
-     Register the MCP server in .cursor/mcp.json or ~/.cursor/mcp.json:
-       { "mcpServers": { "cortexmd": { "url": "http://localhost:3000/mcp" } } }
+     `cortexmd init --client cursor` (run inside the repo) writes this file and registers the
+     MCP server in ~/.cursor/mcp.json as the stdio bridge that reuses the CLI login:
+       { "mcpServers": { "cortexmd": { "command": "cortexmd", "args": ["mcp"] } } }
+     (HTTP alternative: { "url": "http://localhost:3000/mcp" } + Cursor's own OAuth.)
      Reference: https://cursor.com/docs/context/rules  ·  https://cursor.com/docs/context/mcp -->
 
 # cortexmd — memory, diary, code-nav

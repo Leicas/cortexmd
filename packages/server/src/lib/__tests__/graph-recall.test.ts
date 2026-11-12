@@ -213,3 +213,55 @@ describe('pprRrfContribution', () => {
     expect(contrib.get('B.md')).toBeCloseTo(1 / 62, 10);
   });
 });
+
+describe('runPPR on a reused graph (cached transitions)', () => {
+  const chain = (n: number): Record<string, string[]> => {
+    const edges: Record<string, string[]> = {};
+    for (let i = 0; i < n; i++) edges[`N${i}.md`] = i + 1 < n ? [`N${i + 1}.md`] : [];
+    return edges;
+  };
+
+  it('returns identical rankings on repeated calls and per specificity flag', () => {
+    const g = buildRecallGraph({
+      linkGraph: linkGraph({ ...chain(30), 'Hub.md': ['N0.md', 'N5.md', 'N10.md', 'N15.md'] }),
+      titleToPath: new Map([['N3', 'N3.md'], ['N20', 'N20.md']]),
+      mentions: [{ subject: 'N3', object: 'Alice' }, { subject: 'N20', object: 'Alice' }],
+    });
+    const first = runPPR(g, ['N3.md'], { limit: 10 });
+    const second = runPPR(g, ['N3.md'], { limit: 10 });
+    expect(second).toEqual(first);
+    // A different seed on the SAME graph object must not be served stale state.
+    const other = runPPR(g, ['N20.md'], { limit: 10 });
+    expect(other[0].path).toBe('N20.md');
+    expect(other).not.toEqual(first);
+    // The two specificity variants are cached independently.
+    const plain = runPPR(g, ['N3.md'], { limit: 10, nodeSpecificity: false });
+    expect(runPPR(g, ['N3.md'], { limit: 10, nodeSpecificity: false })).toEqual(plain);
+    expect(runPPR(g, ['N3.md'], { limit: 10 })).toEqual(first);
+  });
+
+  it('keeps rank mass a probability distribution and reaches notes across an entity bridge', () => {
+    const g = buildRecallGraph({
+      linkGraph: linkGraph({ 'A.md': [], 'B.md': [], 'C.md': [] }),
+      titleToPath: new Map([['A', 'A.md'], ['B', 'B.md']]),
+      mentions: [{ subject: 'A', object: 'Alice' }, { subject: 'B', object: 'Alice' }],
+    });
+    const out = runPPR(g, ['A.md', 'A.md']); // duplicate seeds collapse
+    const byPath = new Map(out.map((r) => [r.path, r.score]));
+    expect(byPath.get('A.md')!).toBeGreaterThan(byPath.get('B.md')!);
+    expect(byPath.get('B.md')!).toBeGreaterThan(0);
+    expect(byPath.has('C.md')).toBe(false); // unreachable
+    for (const r of out) expect(r.score).toBeLessThanOrEqual(1);
+  });
+
+  it('stays fast on a 10k-node graph once the transitions are cached', () => {
+    const edges: Record<string, string[]> = {};
+    for (let i = 0; i < 10_000; i++) edges[`N${i}.md`] = [`N${(i * 7 + 1) % 10_000}.md`, `N${(i * 13 + 5) % 10_000}.md`];
+    const g = buildRecallGraph({ linkGraph: linkGraph(edges), titleToPath: new Map() });
+    runPPR(g, ['N0.md'], { limit: 50 }); // builds + caches
+    const t0 = performance.now();
+    for (let i = 1; i <= 5; i++) runPPR(g, [`N${i}.md`], { limit: 50 });
+    // ~2 ms per query in practice; the pre-cache Map-based walk took ~200 ms.
+    expect((performance.now() - t0) / 5).toBeLessThan(100);
+  });
+});

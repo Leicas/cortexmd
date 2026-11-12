@@ -47,6 +47,7 @@ export default {
     renderStatusStrip(ctx, d);
     renderKpis(ctx, d, dv);
     renderServer(ctx);
+    renderOpsSparks(ctx);
     renderAttention(el, ctx, d, dv);
     renderDetail(el, ctx, d, dv);
 
@@ -204,6 +205,38 @@ function renderTempBar(ctx, mt, tot) {
 
 function num(v) { return typeof v === 'number' && isFinite(v) ? v : null; }
 
+// ── Ops sparklines (payload.opsHistory ring, 30 s samples) ───────────────────
+// The ring is in-memory, so it starts at process boot: when the window reaches
+// back to boot, a dashed "restart" marker is drawn at x = bootAt.
+function renderOpsSparks(ctx) {
+  var oh = ctx.data && ctx.data.opsHistory;
+  if (!oh || !oh.samples) return;
+  var s = oh.samples;
+  var t0 = s.length ? s[0].t : Date.now();
+  var t1 = s.length ? s[s.length - 1].t : Date.now();
+  var showBoot = s.length > 1 && oh.bootAt >= t0 - oh.intervalMs;
+  [['heapMb', 'opsHeap', 'opsHeapTxt', 'var(--brand)'], ['sessions', 'opsSess', 'opsSessTxt', 'var(--brand-2)'],
+   ['notes', 'opsNotes', 'opsNotesTxt', 'var(--info)']].forEach(function (m) {
+    var vals = s.map(function (x) { return x[m[0]]; });
+    var txt = ctx.$(m[2]);
+    if (txt) txt.textContent = vals.length ? 'now ' + vals[vals.length - 1] + ' · max ' + Math.max.apply(null, vals) : '';
+    ctx.charts.drawChart(m[1], vals.map(function (v) { return { y: v }; }), m[3]);
+    var svg = ctx.$(m[1]);
+    if (svg && showBoot && t1 > t0) {
+      var x = Math.max(0, Math.min(600, ((oh.bootAt - t0) / (t1 - t0)) * 600));
+      svg.insertAdjacentHTML('beforeend', '<line x1="' + x.toFixed(1) + '" y1="0" x2="' + x.toFixed(1) + '" y2="140" ' +
+        'style="stroke:var(--warn)" stroke-width="1.5" stroke-dasharray="4 3" vector-effect="non-scaling-stroke"/>');
+    }
+  });
+  var w = ctx.$('opsWindow');
+  if (w) {
+    var mins = Math.round((t1 - t0) / 60000);
+    w.textContent = s.length < 2 ? 'Collecting samples (every ' + Math.round(oh.intervalMs / 1000) + ' s)…'
+      : 'Last ' + (mins < 1 ? '<1' : mins) + ' min · ' + s.length + ' samples' +
+        (showBoot ? ' · dashed line = process start (restart) ' + ctx.fmt.fmtAgo(oh.bootAt) : '');
+  }
+}
+
 function renderServer(ctx) {
   var $ = ctx.$, fmt = ctx.fmt, setLive = ctx.setLive;
   var h = ctx.health;
@@ -309,7 +342,7 @@ function renderAttention(el, ctx, d, dv) {
         return '<div class="error-item"><span class="e-ts">' + esc(fmt.fmtTime(it.ts)) + '</span>'
           + '<span class="e-tool">' + esc(it.tool) + '</span>'
           + '<span class="e-msg">' + esc(ctx.fmt.truncate(it.msg, 120)) + '</span></div>';
-      }).join('') + '<button type="button" class="btn btn--sm btn--ghost" onclick="window.cortex.switchTab(\'logs\')">View in Logs →</button>';
+      }).join('') + '<button type="button" class="btn btn--sm btn--ghost" data-cx-click="window.cortex.switchTab(\'logs\')">View in Logs →</button>';
     }
   }
 
@@ -330,7 +363,7 @@ function renderAttention(el, ctx, d, dv) {
 
 function signalRow(state, label, tab, tabLabel) {
   return '<button type="button" class="pill pill--' + state + '" style="margin:.2rem .2rem .2rem 0"'
-    + ' onclick="window.cortex.switchTab(\'' + tab + '\')" aria-label="' + label + ' — open ' + tabLabel + '">'
+    + ' data-cx-click="window.cortex.switchTab(\'' + tab + '\')" aria-label="' + label + ' — open ' + tabLabel + '">'
     + '<span class="dot" aria-hidden="true"></span>' + label + '</button>';
 }
 

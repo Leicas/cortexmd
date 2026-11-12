@@ -1,10 +1,11 @@
-import { readFile, writeFile, mkdir, lstat, realpath, access, unlink, rename } from 'node:fs/promises';
+import { readFile, mkdir, lstat, realpath, access, unlink } from 'node:fs/promises';
 import { constants, realpathSync } from 'node:fs';
 import path from 'node:path';
 import { glob } from 'glob';
 import { config } from '../config.js';
 import { listSourceVaultPaths } from './source-vaults.js';
 import { computeEtag } from './hash.js';
+import { atomicWriteFile, atomicCreateFile } from './atomic-write.js';
 
 // The server is the brain vault's sole writer. Serialize writes to one path so
 // an If-Match check and its write cannot interleave with another tool call.
@@ -472,7 +473,9 @@ export async function writeNote(
     }
 
     await mkdir(path.dirname(resolved), { recursive: true });
-    await writeFile(resolved, content, 'utf-8');
+    // tmp + fsync + rename in the same directory: a crash or OOM mid-write can
+    // no longer leave a truncated note (see atomic-write.ts).
+    await atomicWriteFile(resolved, content);
     return { etag: computeEtag(content) };
   });
 }
@@ -488,7 +491,8 @@ export async function createNote(notePath: string, content: string): Promise<{ e
   const vault = findVaultRoot(resolved);
   if (vault) await assertNoSymlinkEscape(resolved, vault);
   await mkdir(path.dirname(resolved), { recursive: true });
-  await writeFile(resolved, content, { encoding: 'utf-8', flag: 'wx' });
+  // Exclusive create, but the name only appears once the bytes are complete.
+  await atomicCreateFile(resolved, content);
   return { etag: computeEtag(content) };
 }
 
@@ -522,9 +526,7 @@ export async function moveNote(srcPath: string, dstPath: string): Promise<void> 
   const content = await readFile(srcResolved);
 
   await mkdir(path.dirname(dstResolved), { recursive: true });
-  const tmp = dstResolved + '.tmp';
-  await writeFile(tmp, content);
-  await rename(tmp, dstResolved);
+  await atomicWriteFile(dstResolved, content);
   await unlink(srcResolved);
 }
 
@@ -567,7 +569,7 @@ export async function writeBinaryFile(
   }
 
   await mkdir(path.dirname(resolved), { recursive: true });
-  await writeFile(resolved, buffer);
+  await atomicWriteFile(resolved, buffer);
 }
 
 /**

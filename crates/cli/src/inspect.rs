@@ -180,11 +180,19 @@ fn is_unknown_tool_error(err: &anyhow::Error) -> bool {
 // ── status ─────────────────────────────────────────────────────────────────
 
 pub fn cmd_status() -> Result<()> {
-    // /health is unauthenticated and cheap: print the server identity before
-    // anything that can fail on auth, so a bad token still shows what we hit.
-    let (server_pre, _, _) = resolve_or_bail(None, None)?;
-    let health = fetch_health(&server_pre);
-    let (server, key, session_id, source) = open_session(None, None)?;
+    // /health is cheap: print the server identity before anything that can
+    // fail on auth, so a bad token still shows what we hit. Unauthenticated it
+    // only returns {status, version, commit}; the bearer unlocks heap/sessions.
+    let (server_pre, key_pre, _) = resolve_or_bail(None, None)?;
+    let health = fetch_health(&server_pre, Some(&key_pre));
+    let (server, key, session_id, source) = match open_session(None, None) {
+        Ok(v) => v,
+        Err(e) => {
+            // Local hook latency is still useful (often the reason to look).
+            print!("{}", crate::hook_stats::status_block());
+            return Err(e);
+        }
+    };
     print_server_header(&server, &source, health.as_ref());
     println!("Machine {} (override via MACHINE_ID)", detect_machine_id());
     println!();
@@ -227,23 +235,83 @@ pub fn cmd_status() -> Result<()> {
     }
 
     close_session(&server, &key, &session_id);
+    println!();
+    print!("{}", crate::hook_stats::status_block());
     Ok(())
 }
 
-/// `GET /health` (no auth, 3 s connect / 30 s global via the shared agent).
-/// `None` when the server is unreachable or the body is not JSON.
-fn fetch_health(server: &str) -> Option<Value> {
+/// Outcome of a single `GET /health` attempt.
+enum HealthFetch {
+    Body(Value),
+    /// HTTP error status (e.g. 401 from a proxy that rejects the bearer).
+    HttpError,
+    /// Unreachable / unreadable / non-JSON.
+    Failed,
+}
+
+fn fetch_health_once(server: &str, key: Option<&str>) -> HealthFetch {
     let url = format!("{}/health", server.trim_end_matches('/'));
-    let mut resp = mcp::http_agent()
-        .get(&url)
-        .header("Accept", "application/json")
-        .call()
-        .ok()?;
-    if resp.status().as_u16() >= 400 {
-        return None;
+    let mut req = mcp::http_agent().get(&url).header("Accept", "application/json");
+    if let Some(k) = key {
+        req = req.header("Authorization", format!("Bearer {}", k));
     }
-    let text = resp.body_mut().read_to_string().ok()?;
-    serde_json::from_str::<Value>(&text).ok()
+    let mut resp = match req.call() {
+        Ok(r) => r,
+        Err(ureq::Error::StatusCode(_)) => return HealthFetch::HttpError,
+        Err(_) => return HealthFetch::Failed,
+    };
+    if resp.status().as_u16() >= 400 {
+        return HealthFetch::HttpError;
+    }
+    match resp
+        .body_mut()
+        .read_to_string()
+        .ok()
+        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+    {
+        Some(v) => HealthFetch::Body(v),
+        None => HealthFetch::Failed,
+    }
+}
+
+/// `GET /health` (3 s connect / 30 s global via the shared agent). With a
+/// credential the server returns the full I-1 payload (heap, sessions, index,
+/// …); without one — or if the authenticated attempt is rejected with an HTTP
+/// error — it falls back to the anonymous `{status, version, commit}`.
+/// `None` when the server is unreachable or the body is not JSON.
+fn fetch_health(server: &str, key: Option<&str>) -> Option<Value> {
+    if let Some(k) = key.map(str::trim).filter(|k| !k.is_empty()) {
+        match fetch_health_once(server, Some(k)) {
+            HealthFetch::Body(v) => return Some(v),
+            HealthFetch::Failed => return None,
+            HealthFetch::HttpError => {} // retry anonymously below
+        }
+    }
+    match fetch_health_once(server, None) {
+        HealthFetch::Body(v) => Some(v),
+        _ => None,
+    }
+}
+
+/// Human label for the `/health` `status` field: `ok`, `indexing` (boot index
+/// build still running — with `index.progress` when the payload carries it)
+/// or `degraded` (boot index build failed). `None` when absent.
+fn health_status_label(h: &Value) -> Option<String> {
+    let status = h.get("status").and_then(|v| v.as_str())?;
+    Some(match status {
+        "ok" => "ok".to_string(),
+        "indexing" => {
+            let prog = h.get("index").and_then(|i| i.get("progress"));
+            let done = prog.and_then(|p| p.get("done")).and_then(|v| v.as_u64());
+            let total = prog.and_then(|p| p.get("total")).and_then(|v| v.as_u64());
+            match (done, total) {
+                (Some(d), Some(t)) if t > 0 => format!("indexing {}/{} files", d, t),
+                _ => "indexing (boot index build running)".to_string(),
+            }
+        }
+        "degraded" => "DEGRADED (boot index build failed)".to_string(),
+        other => other.to_string(),
+    })
 }
 
 /// Header lines for `cortexmd status` (I-1 /health shape):
@@ -260,12 +328,21 @@ fn print_server_header(server: &str, source: &str, health: Option<&Value>) {
                 .and_then(|v| v.as_str())
                 .map(|c| c.chars().take(7).collect::<String>())
                 .filter(|c| !c.is_empty());
+            let status = health_status_label(h)
+                .map(|s| format!("  [{}]", s))
+                .unwrap_or_default();
             match commit {
-                Some(c) => println!("Server  {}  v{} ({})  {}", server, version, c, auth),
-                None => println!("Server  {}  v{}  {}", server, version, auth),
+                Some(c) => println!("Server  {}  v{} ({}){}  {}", server, version, c, status, auth),
+                None => println!("Server  {}  v{}{}  {}", server, version, status, auth),
             }
-            if let Some(line) = health_detail_line(h) {
-                println!("        {}", line);
+            match health_detail_line(h) {
+                Some(line) => println!("        {}", line),
+                // Minimal anonymous payload: the credential was not accepted
+                // for /health details (or the server predates them).
+                None if h.get("status").is_some() => {
+                    println!("        (heap/sessions unavailable: /health returned the unauthenticated payload)")
+                }
+                None => {}
             }
         }
         None => println!("Server  {}  (no /health response)  {}", server, auth),
@@ -3448,5 +3525,102 @@ mod proxy_index_tests {
         let old = serde_json::json!({ "status": "ok", "activeSessions": 2 });
         assert_eq!(health_detail_line(&old).as_deref(), Some("sessions 2 active"));
         assert_eq!(health_detail_line(&serde_json::json!({})), None);
+    }
+
+    #[test]
+    fn health_status_label_handles_new_states() {
+        let ok = serde_json::json!({ "status": "ok", "version": "1", "commit": "x" });
+        assert_eq!(health_status_label(&ok).as_deref(), Some("ok"));
+        let idx = serde_json::json!({ "status": "indexing", "index": { "state": "indexing", "progress": { "done": 40, "total": 100 } } });
+        assert_eq!(health_status_label(&idx).as_deref(), Some("indexing 40/100 files"));
+        let idx_min = serde_json::json!({ "status": "indexing" });
+        assert_eq!(
+            health_status_label(&idx_min).as_deref(),
+            Some("indexing (boot index build running)")
+        );
+        let deg = serde_json::json!({ "status": "degraded" });
+        assert_eq!(
+            health_status_label(&deg).as_deref(),
+            Some("DEGRADED (boot index build failed)")
+        );
+        assert_eq!(health_status_label(&serde_json::json!({})), None);
+    }
+
+    /// One-shot-per-connection fake `/health`: `respond(auth_header)` returns
+    /// (status code, body). Serves `n` requests then exits.
+    fn fake_health_server(
+        n: usize,
+        respond: fn(Option<&str>) -> (u16, String),
+    ) -> (String, std::thread::JoinHandle<Vec<Option<String>>>) {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = format!("http://{}", listener.local_addr().unwrap());
+        let handle = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            for _ in 0..n {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut auth: Option<String> = None;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
+                        break;
+                    }
+                    if let Some((k, v)) = line.split_once(':') {
+                        if k.eq_ignore_ascii_case("authorization") {
+                            auth = Some(v.trim().to_string());
+                        }
+                    }
+                }
+                let (code, body) = respond(auth.as_deref());
+                let resp = format!(
+                    "HTTP/1.1 {} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    code,
+                    body.len(),
+                    body
+                );
+                stream.write_all(resp.as_bytes()).unwrap();
+                seen.push(auth);
+            }
+            seen
+        });
+        (addr, handle)
+    }
+
+    #[test]
+    fn fetch_health_sends_bearer_and_gets_full_payload() {
+        let (addr, h) = fake_health_server(1, |auth| match auth {
+            Some("Bearer k-test") => (
+                200,
+                r#"{"status":"ok","version":"1","commit":"c","heap":{"usedMb":10,"limitMb":100},"sessions":{"active":1,"maxActive":5}}"#.into(),
+            ),
+            _ => (200, r#"{"status":"ok","version":"1","commit":"c"}"#.into()),
+        });
+        let v = fetch_health(&addr, Some("k-test")).unwrap();
+        assert_eq!(
+            health_detail_line(&v).as_deref(),
+            Some("heap 10/100 MB · sessions 1/5 active")
+        );
+        assert_eq!(h.join().unwrap(), vec![Some("Bearer k-test".to_string())]);
+    }
+
+    #[test]
+    fn fetch_health_falls_back_to_anonymous_on_http_error() {
+        let (addr, h) = fake_health_server(2, |auth| match auth {
+            Some(_) => (401, r#"{"error":"unauthorized"}"#.into()),
+            None => (200, r#"{"status":"indexing","version":"1","commit":"c"}"#.into()),
+        });
+        let v = fetch_health(&addr, Some("bad")).unwrap();
+        assert_eq!(v["status"], "indexing");
+        assert_eq!(health_detail_line(&v), None);
+        assert_eq!(h.join().unwrap(), vec![Some("Bearer bad".to_string()), None]);
+    }
+
+    #[test]
+    fn fetch_health_without_key_is_anonymous() {
+        let (addr, h) = fake_health_server(1, |_| (200, r#"{"status":"degraded","version":"1","commit":"c"}"#.into()));
+        let v = fetch_health(&addr, None).unwrap();
+        assert_eq!(v["status"], "degraded");
+        assert_eq!(h.join().unwrap(), vec![None]);
     }
 }

@@ -52,6 +52,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::cli::InitArgs;
+use crate::clients;
 
 const MARKDOWN_FILE: &str = "CORTEXMD.md";
 const CLAUDE_MD: &str = "CLAUDE.md";
@@ -344,9 +345,9 @@ preferences/corrections; cortexmd is for what must survive across projects, mach
 
 ## Rules
 
-1. **Session start.** The SessionStart hook gives you the exact `agentName` for this machine
-   (`Claude Code (<hostname>)`). Call `memory_wakeup(agentName, preset)` once before the first
-   non-trivial task — not on resumed sessions, not for a one-line question.
+1. **Session start.** The SessionStart hook injects the wakeup recap (diary, hot memories) for
+   this machine's `agentName` (`Claude Code (<hostname>)`) — do not call `memory_wakeup` again.
+   Only if it asks you to (server was unreachable): call `memory_wakeup(agentName, preset)` once.
 2. **Code in an indexed repo** (`code_repo_list` lists it): acquire information step by step —
    `code_file_outline(repo, path)` → `code_symbol_search(query, repo)` (~60 tokens/result) →
    `code_symbol_get(id)` (≤200 lines); `code_symbol_callers/callees(id)`, `code_change_impact(id)`,
@@ -373,6 +374,24 @@ preferences/corrections; cortexmd is for what must survive across projects, mach
 "#;
 
 pub fn cmd_init(args: InitArgs) -> Result<()> {
+    let client = if args.client.is_empty() { "claude" } else { args.client.as_str() };
+    if client != "claude" {
+        if args.show || args.uninstall {
+            anyhow::bail!(
+                "--show / --uninstall are only implemented for Claude Code; for {} edit the files listed by `cortexmd init --client {}`",
+                client,
+                client
+            );
+        }
+        let base = if args.no_mcp { None } else { ensure_creds(args.server.as_deref())? };
+        return match client {
+            "codex" => install_codex(&args, base.as_deref()),
+            "cursor" => install_cursor(&args, base.as_deref()),
+            "gemini" => install_gemini(&args, base.as_deref()),
+            other => anyhow::bail!("unknown --client {}", other),
+        };
+    }
+
     let claude_dir = resolve_claude_dir(args.global)?;
 
     if args.show {
@@ -383,16 +402,248 @@ pub fn cmd_init(args: InitArgs) -> Result<()> {
     }
 
     let mode = patch_mode(&args);
-    install(&claude_dir, args.hook_only, mode, args.global, args.verbose)
+    let hooks_ok = install(&claude_dir, args.hook_only, mode, args.global, args.verbose)?;
+
+    let mut report = clients::Report::default();
+    if hooks_ok {
+        report.done.push(format!(
+            "instructions + {} hooks installed in {}",
+            resolve_all_hooks(&claude_dir).len(),
+            claude_dir.display()
+        ));
+    } else {
+        report.warnings.push(format!("hooks not wired in {} (declined) — see the MANUAL STEP above", claude_dir.join(SETTINGS_JSON).display()));
+    }
+    if args.no_mcp {
+        report.done.push("MCP registration skipped (--no-mcp)".into());
+    } else {
+        match ensure_creds(args.server.as_deref())? {
+            Some(base) => {
+                let home = clients::home_dir()?;
+                // `claude mcp add-json` always writes the REAL home: never
+                // shell out when the home is overridden (tests, sandboxes).
+                let try_cli = std::env::var_os("CORTEXMD_HOME").is_none();
+                let r = clients::register_claude(&home, &base, try_cli)?;
+                merge_report(&mut report, r);
+            }
+            None => report.manual = Some(no_creds_step("cortexmd init -g")),
+        }
+    }
+    prereq_warnings(&mut report, true);
+    print_summary(
+        &format!("Claude Code, {}", if args.global { "global" } else { "local project" }),
+        &report,
+        "restart Claude Code (or run /mcp) to load the server and hooks; check with `cortexmd status`",
+    );
+    Ok(())
 }
 
+// ── shared init helpers (all clients) ─────────────────────────────────────
+
+fn merge_report(into: &mut clients::Report, r: clients::Report) {
+    into.done.extend(r.done);
+    into.warnings.extend(r.warnings);
+    if into.manual.is_none() {
+        into.manual = r.manual;
+    }
+}
+
+fn no_creds_step(rerun: &str) -> String {
+    format!(
+        "log the CLI in: `cortexmd auth oauth-login --server <URL>` (or `auth login --server <URL> --api-key <KEY>`), then re-run `{}` — or pass `--server <URL>` to do both at once",
+        rerun
+    )
+}
+
+/// Base server URL of the CLI's credentials. With `--server`, logs in via
+/// OAuth first when the CLI has no credentials for that server.
+fn ensure_creds(server_flag: Option<&str>) -> Result<Option<String>> {
+    let env = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
+    let current = crate::auth::resolve_creds(env("MCP_URL").as_deref(), env("MCP_API_KEY").as_deref())
+        .unwrap_or_else(|e| {
+            eprintln!("  (credential lookup failed: {})", e);
+            None
+        });
+    match (server_flag.map(str::trim).filter(|s| !s.is_empty()), current) {
+        (None, Some(c)) => Ok(Some(crate::bridge::normalize_base(&c.server))),
+        (None, None) => Ok(None),
+        (Some(flag), Some(c)) if clients::url_key(flag) == clients::url_key(&c.server) => {
+            Ok(Some(crate::bridge::normalize_base(&c.server)))
+        }
+        (Some(flag), _) => {
+            println!("  logging the CLI in to {} (OAuth, opens a browser)…", flag);
+            crate::oauth::cmd_oauth_login(Some(flag), true)?;
+            Ok(Some(crate::bridge::normalize_base(flag)))
+        }
+    }
+}
+
+/// `cortexmd` / `node` must be on PATH for hooks and helpers to run.
+fn prereq_warnings(report: &mut clients::Report, needs_node: bool) {
+    let exe = if cfg!(windows) { "cortexmd.exe" } else { "cortexmd" };
+    if clients::find_on_path(&[exe]).is_none() {
+        report.warnings.push(
+            "`cortexmd` is not on PATH — hooks, `cortexmd auth header` and `cortexmd mcp` call it by name (cargo install --path crates/cli)".into(),
+        );
+    }
+    let node = if cfg!(windows) { "node.exe" } else { "node" };
+    if needs_node && clients::find_on_path(&[node]).is_none() {
+        report.warnings.push("`node` (≥18) is not on PATH — the hook scripts will not run".into());
+    }
+}
+
+fn print_summary(label: &str, report: &clients::Report, next: &str) {
+    println!("\ncortexmd init complete ({}):", label);
+    for d in &report.done {
+        println!("  [ok] {}", d);
+    }
+    for w in &report.warnings {
+        println!("  [!!] {}", w);
+    }
+    match &report.manual {
+        Some(step) => println!("\nOne step left: {}.\nThen {}.", step, next),
+        None => println!("\nNext: {}.", next),
+    }
+}
+
+// ── Codex / Cursor / Gemini CLI ───────────────────────────────────────────
+
+/// Codex hooks (`~/.codex/hooks.json`): same scripts, Codex diary name.
+fn codex_hooks(codex_home: &Path) -> Vec<ResolvedHook> {
+    let dir = codex_home.join(HOOK_SCRIPT_SUBDIR);
+    let script = |name: &str| format!("CORTEXMD_AGENT_CLIENT=Codex {}", node_command_for(&dir.join(name)));
+    let h = |event, matcher, command: String, timeout, run_async| ResolvedHook {
+        event,
+        matcher,
+        command,
+        timeout,
+        status_message: None,
+        run_async,
+    };
+    vec![
+        h("SessionStart", None, script("code_nav_hint_hook.mjs"), 6, false),
+        h("SessionStart", None, script("wakeup_directive_hook.mjs"), 6, false),
+        h("UserPromptSubmit", None, script("userprompt_hook.mjs"), 8, false),
+        h("PreToolUse", Some("^Bash$"), "cortexmd rewrite --hook".to_string(), 6, false),
+        h("PostToolUse", Some("^Bash$"), script("posttooluse_hook.mjs"), 6, false),
+        h("Stop", None, script("diary_stop_hook.mjs"), 8, false),
+    ]
+}
+
+fn install_codex(args: &InitArgs, base: Option<&str>) -> Result<()> {
+    let home = clients::home_dir()?;
+    let codex_home = clients::codex_home(&home);
+    let hooks_supported = !cfg!(windows);
+    let mut report = clients::Report::default();
+
+    if args.no_mcp {
+        report.done.push("MCP registration skipped (--no-mcp)".into());
+    } else {
+        merge_report(&mut report, clients::register_codex(&codex_home, base, hooks_supported)?);
+    }
+
+    let block = clients::instruction_block("Codex", "codex", &crate::wakeup::machine_id());
+    match clients::install_instruction_block(&codex_home.join("AGENTS.md"), &block)? {
+        Some(line) => report.done.push(line),
+        None => report.done.push(format!("{} already has the cortexmd block", codex_home.join("AGENTS.md").display())),
+    }
+
+    if hooks_supported {
+        install_hook_scripts(&codex_home, args.verbose)?;
+        let hooks = codex_hooks(&codex_home);
+        let path = codex_home.join("hooks.json");
+        match patch_settings_json(&path, &hooks, patch_mode(args), args.verbose)? {
+            PatchResult::Patched => report.done.push(format!("wired {} hooks in {}", hooks.len(), path.display())),
+            PatchResult::AlreadyPresent => report.done.push(format!("{} already has the cortexmd hooks", path.display())),
+            PatchResult::Declined | PatchResult::Skipped => {
+                print_manual_hook_instructions(&path, &hooks);
+                report.warnings.push(format!("hooks not wired in {} (declined)", path.display()));
+            }
+        }
+    } else {
+        report.done.push(
+            "hooks skipped: Codex does not run hooks on Windows — AGENTS.md carries the protocol (wakeup, diary) instead".into(),
+        );
+    }
+
+    if !args.no_mcp && base.is_none() {
+        report.manual = Some(no_creds_step("cortexmd init --client codex"));
+    }
+    prereq_warnings(&mut report, hooks_supported);
+    print_summary("Codex", &report, "restart Codex; `/mcp` inside Codex should list cortexmd");
+    Ok(())
+}
+
+const CURSOR_RULE: &str = include_str!("../../../templates/cursor/cortexmd.mdc");
+
+fn install_cursor(args: &InitArgs, base: Option<&str>) -> Result<()> {
+    let home = clients::home_dir()?;
+    let mut report = clients::Report::default();
+    if args.no_mcp {
+        report.done.push("MCP registration skipped (--no-mcp)".into());
+    } else {
+        merge_report(&mut report, clients::register_json_stdio(&home.join(".cursor").join("mcp.json"), base, "Cursor")?);
+    }
+    if args.global {
+        report.warnings.push(
+            "Cursor has no file for global rules: paste templates/cursor/cortexmd.mdc (body) into Cursor Settings → Rules → User Rules, or run `cortexmd init --client cursor` (without -g) inside a repo".into(),
+        );
+    } else {
+        let cwd = std::env::current_dir().context("current dir")?;
+        let path = cwd.join(".cursor").join("rules").join("cortexmd.mdc");
+        let host = crate::wakeup::machine_id();
+        let rule = if host.is_empty() { CURSOR_RULE.to_string() } else { CURSOR_RULE.replace("<hostname>", &host) };
+        if write_if_changed(&path, &rule, args.verbose)? {
+            report.done.push(format!("wrote project rule {}", path.display()));
+        } else {
+            report.done.push(format!("{} already up to date", path.display()));
+        }
+    }
+    report.warnings.push(
+        "Cursor hooks are not installed automatically (output format differs): see templates/cursor/hooks.json + adapt-output.mjs".into(),
+    );
+    if !args.no_mcp && base.is_none() {
+        report.manual = Some(no_creds_step("cortexmd init --client cursor"));
+    }
+    prereq_warnings(&mut report, false);
+    print_summary("Cursor", &report, "restart Cursor; Settings → MCP should show cortexmd");
+    Ok(())
+}
+
+fn install_gemini(args: &InitArgs, base: Option<&str>) -> Result<()> {
+    let home = clients::home_dir()?;
+    let gemini = home.join(".gemini");
+    let mut report = clients::Report::default();
+    if args.no_mcp {
+        report.done.push("MCP registration skipped (--no-mcp)".into());
+    } else {
+        merge_report(&mut report, clients::register_json_stdio(&gemini.join("settings.json"), base, "Gemini CLI")?);
+    }
+    let block = clients::instruction_block("Gemini CLI", "gemini", &crate::wakeup::machine_id());
+    match clients::install_instruction_block(&gemini.join("GEMINI.md"), &block)? {
+        Some(line) => report.done.push(line),
+        None => report.done.push(format!("{} already has the cortexmd block", gemini.join("GEMINI.md").display())),
+    }
+    report.warnings.push(
+        "Gemini CLI hooks are not installed automatically: see the snippet in docs/integrations.md (Gemini CLI section)".into(),
+    );
+    if !args.no_mcp && base.is_none() {
+        report.manual = Some(no_creds_step("cortexmd init --client gemini"));
+    }
+    prereq_warnings(&mut report, false);
+    print_summary("Gemini CLI", &report, "restart Gemini CLI; `/mcp` should list cortexmd");
+    Ok(())
+}
+
+/// Instructions + hook scripts + settings.json. Returns false when the
+/// settings.json patch was declined/skipped (manual instructions printed).
 fn install(
     claude_dir: &Path,
     hook_only: bool,
     mode: PatchMode,
     global: bool,
     verbose: u8,
-) -> Result<()> {
+) -> Result<bool> {
     fs::create_dir_all(claude_dir)
         .with_context(|| format!("create {}", claude_dir.display()))?;
     // One timestamp per run: every backup this install leaves shares it.
@@ -465,7 +716,8 @@ fn install(
 
     let hooks = resolve_all_hooks(claude_dir);
     let settings_path = claude_dir.join(SETTINGS_JSON);
-    match patch_settings_json(&settings_path, &hooks, mode, verbose)? {
+    let result = patch_settings_json(&settings_path, &hooks, mode, verbose)?;
+    match result {
         PatchResult::Patched => {
             println!("  patched {}:", settings_path.display());
             for spec in &hooks {
@@ -490,11 +742,7 @@ fn install(
             print_manual_hook_instructions(&settings_path, &hooks);
         }
     }
-
-    let scope = if global { "global" } else { "local project" };
-    println!("\ncortexmd init complete ({}).", scope);
-    println!("  Restart Claude Code to pick up the hooks. Test with: cortexmd status");
-    Ok(())
+    Ok(matches!(result, PatchResult::Patched | PatchResult::AlreadyPresent))
 }
 
 // ── show / uninstall ──────────────────────────────────────────────────────
@@ -624,7 +872,7 @@ fn cmd_uninstall(claude_dir: &Path, global: bool, hook_only: bool, verbose: u8) 
 
 fn resolve_claude_dir(global: bool) -> Result<PathBuf> {
     if global {
-        let home = dirs::home_dir().context("could not determine HOME")?;
+        let home = clients::home_dir()?;
         Ok(home.join(".claude"))
     } else {
         let cwd = std::env::current_dir().context("could not determine current dir")?;
@@ -675,7 +923,7 @@ fn backup_rename(file: &Path, ts: &str) -> Result<PathBuf> {
 }
 
 /// `YYYYMMDD-HHMMSS` (UTC) without pulling in a date crate.
-fn timestamp_tag() -> String {
+pub fn timestamp_tag() -> String {
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -1468,6 +1716,27 @@ mod tests {
         // The empty `Read|Grep|Glob` shell was dropped.
         let pretool_entries = root["hooks"]["PreToolUse"].as_array().unwrap();
         assert!(pretool_entries.iter().all(|e| e["matcher"] != "Read|Grep|Glob"));
+    }
+
+    #[test]
+    fn codex_hooks_json_is_wired_once_with_codex_diary_name() {
+        let s = Scratch::new("codexhooks");
+        let codex = s.0.join(".codex");
+        install_hook_scripts(&codex, 0).unwrap();
+        let hooks = codex_hooks(&codex);
+        assert_eq!(hooks.len(), 6);
+        assert!(hooks.iter().filter(|h| h.command.contains(".mjs")).all(|h| h.command.starts_with("CORTEXMD_AGENT_CLIENT=Codex node ")));
+        assert!(hooks.iter().all(|h| h.event != "PreCompact"), "Codex has no PreCompact");
+        let path = codex.join("hooks.json");
+        fs::write(&path, r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"echo mine"}]}]}}"#).unwrap();
+        assert_eq!(patch_settings_json(&path, &hooks, PatchMode::Auto, 0).unwrap(), PatchResult::Patched);
+        assert_eq!(patch_settings_json(&path, &hooks, PatchMode::Auto, 0).unwrap(), PatchResult::AlreadyPresent);
+        let root = read_settings_root(&path).unwrap();
+        assert_eq!(occurrences(&root, "echo mine").len(), 1);
+        for h in &hooks {
+            assert_eq!(occurrences(&root, &h.command).len(), 1, "{}", h.command);
+        }
+        assert!(codex.join(HOOK_SCRIPT_SUBDIR).join("wakeup_directive_hook.mjs").exists());
     }
 
     #[test]

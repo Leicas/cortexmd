@@ -19,7 +19,7 @@
  * client module writes is preserved (49 total); ids may live in a different
  * ancestor container but the client's `getElementById` writes are indifferent
  * to ancestry, so no binding moves. Action buttons keep their
- * `onclick="cortex.*"` bridge verbatim. `assets/tabs/intelligence.js` is NOT
+ * `data-cx-click="cortex.*"` bridge verbatim. `assets/tabs/intelligence.js` is NOT
  * touched.
  */
 import { kpi, sectionHead } from '../components.js';
@@ -56,7 +56,7 @@ export function renderIntelligenceTab(): string {
     <div class="col-3 card card--center">
       <div class="section-title" style="margin-bottom:.25rem">Vault Health Score</div>
       <div class="chart-wrap" style="height:150px" role="img" aria-labelledby="healthScoreValue healthGradeValue">
-        <svg id="healthGauge" viewBox="0 0 600 140" preserveAspectRatio="xMidYMid meet" aria-hidden="true"></svg>
+        <svg id="healthGauge" viewBox="0 0 600 140" preserveAspectRatio="xMidYMid meet" role="img" aria-label="Chart (no data yet)" data-auto-label></svg>
       </div>
       <div style="display:flex;align-items:baseline;justify-content:center;gap:.5rem;margin-top:-.25rem">
         <span id="healthScoreValue" class="card-sub" style="margin-top:0">—</span>
@@ -78,10 +78,10 @@ export function renderIntelligenceTab(): string {
     <div class="col-8 card">
       ${sectionHead('Dream Insights', `
         <span id="dreamStatus" class="card-sub" style="margin-top:0">No dream run yet</span>
-        <button class="btn btn-primary" id="btnDreamRun" onclick="cortex.runDreamCycle(false)">Run Dream</button>
-        <button class="btn" id="btnDreamLlm" onclick="cortex.runDreamCycle(true)">LLM Dream</button>`)}
+        <button class="btn btn-primary" id="btnDreamRun" data-cx-click="cortex.runDreamCycle(false)">Run Dream</button>
+        <button class="btn" id="btnDreamLlm" data-cx-click="cortex.runDreamCycle(true)">LLM Dream</button>`)}
       <div id="dreamNarrative" class="card card--quiet" style="white-space:pre-wrap;line-height:1.6;min-height:60px;margin-top:.5rem"><span class="empty-msg">Run a dream cycle to analyze your vault and discover themes, orphans, and connection opportunities.</span></div>
-      <div id="dreamActivity" class="grid" style="grid-template-columns:repeat(3,1fr);margin-top:.75rem;margin-bottom:0"></div>
+      <div id="dreamActivity" class="grid fit-grid" style="--cols:3;margin-top:.75rem;margin-bottom:0"></div>
     </div>
     <div class="col-4 card">
       <div class="section-head">
@@ -138,8 +138,8 @@ export function renderIntelligenceTab(): string {
   const structure = `
   <div class="grid">
     <div class="col-8 card">
-      ${sectionHead('Entity Intelligence', `<button class="btn btn-primary" id="btnEntityRebuild" onclick="cortex.rebuildEntities()">Rebuild entities</button>`)}
-      <div class="grid" style="grid-template-columns:repeat(3,1fr);margin-bottom:.75rem">
+      ${sectionHead('Entity Intelligence', `<button class="btn btn-primary" id="btnEntityRebuild" data-cx-click="cortex.rebuildEntities()">Rebuild entities</button>`)}
+      <div class="grid fit-grid" style="--cols:3;margin-bottom:.75rem">
         <div>
           <div class="card-label">Total Entities</div>
           <div class="card-value card-value--xl" id="eiTotal">0</div>
@@ -175,8 +175,8 @@ export function renderIntelligenceTab(): string {
       </div>
     </div>
     <div class="col-4 card">
-      ${sectionHead('Knowledge Graph', `<button class="btn btn-primary" id="btnKgBootstrap" onclick="cortex.postAction('/dashboard/api/kg/bootstrap',{})">Bootstrap KG</button>`)}
-      <div class="grid" style="grid-template-columns:repeat(2,1fr);margin-bottom:.75rem">
+      ${sectionHead('Knowledge Graph', `<button class="btn btn-primary" id="btnKgBootstrap" data-cx-click="cortex.postAction('/dashboard/api/kg/bootstrap',{})">Bootstrap KG</button>`)}
+      <div class="grid fit-grid" style="--cols:2;margin-bottom:.75rem">
         <div>
           <div class="card-label">Entities</div>
           <div class="card-value" id="kgEntities">0</div>
@@ -205,7 +205,7 @@ export function renderIntelligenceTab(): string {
       <div class="col-7 card">
         <div class="section-title">Dream History</div>
         <div class="chart-wrap">
-          <svg id="chartDreamHealth" viewBox="0 0 600 140" preserveAspectRatio="none" aria-hidden="true"></svg>
+          <svg id="chartDreamHealth" viewBox="0 0 600 140" preserveAspectRatio="none" role="img" aria-label="Chart (no data yet)" data-auto-label></svg>
         </div>
         <div class="chart-legend">
           <span><i style="background:var(--ok)"></i>Health Score</span>

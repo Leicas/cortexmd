@@ -129,6 +129,27 @@ export function projectSlug(cwd) {
   if (override) return slugify(override);
   if (typeof cwd !== 'string' || !cwd.trim()) return '';
 
+  // cwd → slug never changes for an existing checkout: cache it so the
+  // per-prompt hook does not spawn `git` (~30–80 ms on Windows) every time.
+  const cache = readState(SLUG_CACHE_PATH);
+  const hit = cache.slugs && cache.slugs[cwd];
+  if (hit && typeof hit.slug === 'string' && Date.now() - (hit.at ?? 0) < SLUG_CACHE_TTL_MS) {
+    return hit.slug;
+  }
+  const slug = projectSlugUncached(cwd);
+  const slugs = { ...(cache.slugs ?? {}) };
+  slugs[cwd] = { slug, at: Date.now() };
+  const keys = Object.keys(slugs);
+  for (const k of keys.slice(0, Math.max(0, keys.length - SLUG_CACHE_MAX))) delete slugs[k];
+  writeState(SLUG_CACHE_PATH, { slugs });
+  return slug;
+}
+
+const SLUG_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+const SLUG_CACHE_MAX = 200;
+const SLUG_CACHE_PATH = join(stateRoot(), 'project-slug-cache.json');
+
+function projectSlugUncached(cwd) {
   let root = null;
   try {
     const r = spawnSync('git', ['rev-parse', '--show-toplevel', '--git-common-dir'], {
@@ -296,6 +317,45 @@ export function passthrough() {
   process.exit(0);
 }
 
+// ── hook latency ring (read by `cortexmd status`) ─────────────────────────
+//
+// One JSON line per hook process, written on exit:
+//   {t, hook, ms, cli_ms, cli_calls}
+// `ms` = whole process lifetime (Node boot + git + `cortexmd` spawns + HTTPS),
+// `cli_ms` = time blocked on `cortexmd` subprocesses. Trimmed to the last
+// LATENCY_KEEP lines once the file passes LATENCY_MAX_BYTES. Best-effort; a
+// failure here never affects the hook. CORTEXMD_HOOK_LATENCY=0 disables it.
+
+export const LATENCY_LOG = join(stateRoot(), 'hook-latency.jsonl');
+const LATENCY_MAX_BYTES = 256 * 1024;
+const LATENCY_KEEP = 1000;
+const latency = { cliMs: 0, cliCalls: 0 };
+
+function recordLatency() {
+  try {
+    const hook = basename(process.argv[1] ?? 'unknown').replace(/\.m?js$/, '');
+    const line = JSON.stringify({
+      t: new Date().toISOString(),
+      hook,
+      ms: Math.round(process.uptime() * 1000),
+      cli_ms: latency.cliMs,
+      cli_calls: latency.cliCalls,
+    }) + '\n';
+    mkdirSync(dirname(LATENCY_LOG), { recursive: true });
+    try {
+      if (statSync(LATENCY_LOG).size > LATENCY_MAX_BYTES) {
+        const lines = readFileSync(LATENCY_LOG, 'utf8').split('\n').filter(Boolean);
+        writeFileSync(LATENCY_LOG, lines.slice(-LATENCY_KEEP).join('\n') + '\n');
+      }
+    } catch { /* first write */ }
+    appendFileSync(LATENCY_LOG, line);
+  } catch { /* best-effort */ }
+}
+
+if ((process.env.CORTEXMD_HOOK_LATENCY ?? '').trim() !== '0' && /_hook\.m?js$/.test(process.argv[1] ?? '')) {
+  process.on('exit', recordLatency);
+}
+
 export async function readStdin() {
   let buf = '';
   try {
@@ -334,6 +394,7 @@ function withServerArg(args) {
  */
 function runCortexmd(args, opts = {}) {
   const { bin, pre } = cortexmdCommand();
+  const t0 = Date.now();
   const result = spawnSync(bin, [...pre, ...withServerArg(args)], {
     timeout: opts.timeout ?? TIMEOUT_MS,
     encoding: 'utf8',
@@ -341,6 +402,8 @@ function runCortexmd(args, opts = {}) {
     windowsHide: true,
     ...opts,
   });
+  latency.cliMs += Date.now() - t0;
+  latency.cliCalls += 1;
   if (result.error) {
     if (result.error.code === 'ENOENT') {
       // Binary not on PATH — return null instead of logging on every hook fire.
@@ -506,6 +569,34 @@ export async function storeMemory({ content, category = 'observation', title, ta
   try { return JSON.parse(r.stdout); }
   catch (err) {
     logError('storeMemory:parse', err);
+    return null;
+  }
+}
+
+/**
+ * Session-start recap via `cortexmd wakeup --format json` (REST `/api/wakeup`
+ * when the server has it, else MCP `memory_wakeup`). Returns the recap text,
+ * or null — see lastCortexmdFailure() for why (binary missing, older CLI
+ * without the subcommand, server unreachable). The CLI gets a deadline a bit
+ * under the spawn cap so it can close its MCP session before being killed.
+ */
+export async function wakeup({ agentName, preset = 'standard', project = '', machine = '' }) {
+  const args = ['wakeup', '--format', 'json', '--preset', preset, '--timeout-ms', String(Math.max(500, TIMEOUT_MS - 400))];
+  if (agentName) args.push('--agent-name', agentName);
+  if (project) args.push('--project', project);
+  if (machine) args.push('--machine', machine);
+  const r = runCortexmd(args);
+  if (r.missing || r.status !== 0) {
+    noteFailure('wakeup', r);
+    if (!r.missing) logError('wakeup:cortexmd', new Error(`status=${r.status} stderr=${(r.stderr || '').slice(0, 200)}`));
+    return null;
+  }
+  lastFailure = null;
+  try {
+    const v = JSON.parse(r.stdout);
+    return v && typeof v.text === 'string' && v.text.trim() ? v.text : null;
+  } catch (err) {
+    logError('wakeup:parse', err);
     return null;
   }
 }

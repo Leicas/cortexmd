@@ -37,7 +37,7 @@ export function renderRateLimitsTab(): string {
     <div class="col-12 card">
       ${sectionHead(
         'Tracked IPs',
-        `<button type="button" class="btn btn-danger btn--sm" onclick="cortex.postAction('/dashboard/api/rate-limit/reset-all',{})">Reset All</button>`,
+        `<button type="button" class="btn btn-danger btn--sm" data-cx-click="cortex.postAction('/dashboard/api/rate-limit/reset-all',{})">Reset All</button>`,
       )}
       <div class="sowhat" id="rlSoWhat"></div>
       <div class="table-wrap">

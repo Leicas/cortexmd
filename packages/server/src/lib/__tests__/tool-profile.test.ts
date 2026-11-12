@@ -10,8 +10,9 @@ import {
   DEFAULT_TOOL_PROFILE,
 } from '../tool-profile.js';
 
-// Core retains the I-6 set and adds the explicit bounded worker entry point:
-// TINY (6) + NAV_EXTRAS (9) + CORE_EXTRAS (17) + CLI/hook dependencies (7) = 39.
+// Core retains the I-6 set, the explicit bounded worker entry point and the
+// tool_invoke dispatcher: TINY (6) + NAV_EXTRAS (9) + CORE_EXTRAS (17) +
+// CLI/hook dependencies (7) + tool_invoke = 40.
 const CORE_I6 = [
   // tiny
   'notes_search', 'memory_recall', 'memory_store', 'code_symbol_search', 'code_file_outline', 'tool_search',
@@ -27,6 +28,18 @@ const CORE_I6 = [
   // CLI / hook dependencies
   'kg_query', 'diary_write', 'diary_read',
   'code_index_repo', 'code_ingest_repo', 'code_index_requests_poll', 'code_savings_push',
+  // dispatcher for whatever the profile hides
+  'tool_invoke',
+].sort();
+
+// Default profile: the tools the shipped hooks + instruction templates name.
+const STANDARD = [
+  'memory_wakeup', 'memory_recall', 'memory_store',
+  'notes_search', 'notes_get', 'notes_upsert',
+  'agent_diary_append', 'agent_diary_read',
+  'code_repo_list', 'code_file_outline', 'code_symbol_search', 'code_symbol_get',
+  'code_symbol_callers', 'code_symbol_callees', 'code_change_impact', 'code_call_chain',
+  'tool_search', 'tool_invoke',
 ].sort();
 
 const HIDDEN_SAMPLE = ['tags_merge', 'kg_add', 'graph_orphans', 'notes_delete', 'entity_detect', 'vault_status'];
@@ -48,12 +61,12 @@ async function connect(server: McpServer): Promise<Client> {
 }
 
 describe('parseToolProfile', () => {
-  it('defaults to full (every tool advertised) unless a profile is explicitly chosen', () => {
-    expect(DEFAULT_TOOL_PROFILE).toBe('full');
+  it('defaults to standard (lean surface) unless a profile is explicitly chosen', () => {
+    expect(DEFAULT_TOOL_PROFILE).toBe('standard');
     expect(parseToolProfile('full')).toBe('full');
-    expect(parseToolProfile('')).toBe('full');
-    expect(parseToolProfile(undefined)).toBe('full');
-    expect(parseToolProfile('bogus')).toBe('full');
+    expect(parseToolProfile('')).toBe('standard');
+    expect(parseToolProfile(undefined)).toBe('standard');
+    expect(parseToolProfile('bogus')).toBe('standard');
   });
 
   it('honours an explicit profile', () => {
@@ -62,13 +75,26 @@ describe('parseToolProfile', () => {
     expect(parseToolProfile('tiny')).toBe('tiny');
     expect(parseToolProfile('lean')).toBe('lean');
     expect(parseToolProfile('nav')).toBe('nav');
+    expect(parseToolProfile('standard')).toBe('standard');
+    expect(parseToolProfile('ChatGPT')).toBe('chatgpt');
   });
 });
 
 describe('profile membership', () => {
-  it('core is exactly the I-6 set plus bounded worker execution (39 tools)', () => {
+  it('core is exactly the I-6 set plus bounded worker execution and tool_invoke (40 tools)', () => {
     expect(profileToolNames('core')).toEqual(CORE_I6);
-    expect(profileMembership('core')!.size).toBe(39);
+    expect(profileMembership('core')!.size).toBe(40);
+  });
+
+  it('standard is the hook/template surface; chatgpt adds search + fetch', () => {
+    expect(profileToolNames('standard')).toEqual(STANDARD);
+    expect(profileToolNames('chatgpt')).toEqual([...STANDARD, 'fetch', 'search'].sort());
+  });
+
+  it('every reduced profile advertises tool_invoke so hidden tools stay reachable', () => {
+    for (const p of ['tiny', 'nav', 'standard', 'chatgpt', 'core', 'lean'] as const) {
+      expect(profileMembership(p)!.has('tool_invoke')).toBe(true);
+    }
   });
 
   it('profiles nest: tiny ⊂ nav ⊂ core ⊂ lean; full is unbounded', () => {
@@ -79,8 +105,8 @@ describe('profile membership', () => {
     for (const n of tiny) expect(nav.has(n)).toBe(true);
     for (const n of nav) expect(core.has(n)).toBe(true);
     for (const n of core) expect(lean.has(n)).toBe(true);
-    expect(tiny.size).toBe(6);
-    expect(nav.size).toBe(15);
+    expect(tiny.size).toBe(7);
+    expect(nav.size).toBe(16);
     expect(tiny.has('worker_run')).toBe(false);
     expect(nav.has('worker_run')).toBe(true);
     expect(lean.size).toBeGreaterThan(core.size);
@@ -96,7 +122,7 @@ describe('applyToolProfile (lazy loading: hidden but callable)', () => {
 
     const result = applyToolProfile(server, 'core');
     expect(result.profile).toBe('core');
-    expect(result.kept).toBe(39);
+    expect(result.kept).toBe(40);
     expect(result.hidden).toBe(HIDDEN_SAMPLE.length);
     expect(result.disabled).toBe(0);
 

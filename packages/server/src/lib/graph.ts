@@ -5,6 +5,7 @@ import { extractWikilinks, extractWikilinksWithLines } from './markdown.js';
 import { classifyPath } from './collections.js';
 import { isKgInitialized, kgQueryEntity } from './knowledge-graph.js';
 import { buildLinkLookup, resolveWikilink } from './link-resolver.js';
+import { docLinks, getIndexState, waitForIndexReady } from './index-state.js';
 
 // ── Types ────────────────────────────────────────────────────────────────
 
@@ -53,13 +54,20 @@ let cachedReverseGraph: Map<string, string[]> | null = null;
 let cachedAllFiles: Set<string> | null = null;
 
 /**
- * Scan all vault .md files, extract wikilinks, and build an adjacency map.
- * Keys are vault-relative paths; values are arrays of resolved link target paths.
+ * Raw wikilink targets for every vault .md file. Files are still LISTED (cheap
+ * glob, same node set as before), but their text is no longer re-read when the
+ * search index already holds it: rebuildIndex records each note's raw targets
+ * in `docLinks` (from the full text, frontmatter included) while the file is in
+ * memory. Only files the index doesn't cover (written but not yet indexed,
+ * allowlist-excluded source files) are read. Before any index build (scripts,
+ * unit tests) every file is read, as before.
  */
-export async function buildLinkGraph(): Promise<Map<string, string[]>> {
-  const graph = new Map<string, string[]>();
-
-  // Collect all files across vaults so we can resolve wikilink targets
+async function collectRawLinks(): Promise<{ paths: string[]; links: Map<string, string[]> }> {
+  if (getIndexState() === 'indexing') {
+    // Boot build in progress: wait for it rather than duplicating the I/O.
+    await waitForIndexReady(10 * 60_000);
+  }
+  const useIndex = getIndexState() === 'ready';
   const allFiles: string[] = [];
   for (const vault of [config.brainVault, ...listSourceVaultPaths()]) {
     try {
@@ -69,24 +77,39 @@ export async function buildLinkGraph(): Promise<Map<string, string[]>> {
       continue;
     }
   }
-
-  const lookup = buildLinkLookup(allFiles);
-
+  const links = new Map<string, string[]>();
   for (const filePath of allFiles) {
+    const known = useIndex ? docLinks.get(filePath) : undefined;
+    if (known) {
+      links.set(filePath, known);
+      continue;
+    }
     try {
       const { content } = await readNote(filePath);
-      const links = extractWikilinks(content);
-
-      const resolved = links
-        .map((target) => resolveWikilink(target, lookup, filePath))
-        .filter((t): t is string => t !== undefined);
-
-      graph.set(filePath, resolved);
+      links.set(filePath, extractWikilinks(content));
     } catch {
       // Skip unreadable files
     }
   }
+  return { paths: allFiles, links };
+}
 
+/**
+ * Build an adjacency map of every note's resolved wikilink targets.
+ * Keys are vault-relative paths; values are arrays of resolved link target paths.
+ */
+export async function buildLinkGraph(): Promise<Map<string, string[]>> {
+  const graph = new Map<string, string[]>();
+  const { paths, links } = await collectRawLinks();
+  const lookup = buildLinkLookup(paths);
+  for (const [filePath, targets] of links) {
+    graph.set(
+      filePath,
+      targets
+        .map((target) => resolveWikilink(target, lookup, filePath))
+        .filter((t): t is string => t !== undefined),
+    );
+  }
   return graph;
 }
 
@@ -95,33 +118,15 @@ export async function buildLinkGraph(): Promise<Map<string, string[]>> {
  * Called at startup and for force-rebuild scenarios.
  */
 export async function buildAndCacheGraph(): Promise<void> {
-  // Collect all files across vaults
-  const allFiles: string[] = [];
-  for (const vault of [config.brainVault, ...listSourceVaultPaths()]) {
-    try {
-      const files = await listFiles(vault);
-      allFiles.push(...files);
-    } catch {
-      continue;
-    }
-  }
-
-  const lookup = buildLinkLookup(allFiles);
+  const { paths, links } = await collectRawLinks();
+  const lookup = buildLinkLookup(paths);
   const graph = new Map<string, Set<string>>();
 
-  for (const filePath of allFiles) {
-    try {
-      const { content } = await readNote(filePath);
-      const links = extractWikilinks(content);
-
-      const resolved = links
-        .map((target) => resolveWikilink(target, lookup, filePath))
-        .filter((t): t is string => t !== undefined);
-
-      graph.set(filePath, new Set(resolved));
-    } catch {
-      // Skip unreadable files
-    }
+  for (const [filePath, targets] of links) {
+    const resolved = targets
+      .map((target) => resolveWikilink(target, lookup, filePath))
+      .filter((t): t is string => t !== undefined);
+    graph.set(filePath, new Set(resolved));
   }
 
   cachedGraph = graph;

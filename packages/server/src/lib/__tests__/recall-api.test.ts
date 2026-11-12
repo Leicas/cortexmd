@@ -108,6 +108,26 @@ describe('recallForHook', () => {
     expect(paths).toEqual(expect.arrayContaining([A, C]));
   });
 
+  it('applies the memory-kind scope and reports the time part of the query', async () => {
+    expect(() => validateRecallBody({ query: 'q', memoryKinds: ['bogus'] })).toThrow(expect.objectContaining({ status: 400 }));
+    const none = await recallForHook({ query: QUERY, kinds: 'memory', memoryKinds: ['episodic'] });
+    expect(none.memories.map((m) => m.path)).not.toContain(A);
+    const plain = await recallForHook({ query: QUERY, kinds: 'memory' });
+    expect(plain.time).toBeUndefined();
+
+    const now = new Date(`${today}T12:00:00Z`);
+    const dated = await recallForHook({ query: `${QUERY} today`, kinds: 'memory' }, now);
+    expect(dated.query).toBe(`${QUERY} today`);
+    expect(dated.time).toMatchObject({ dateFrom: today, dateTo: today, phrases: ['today'] });
+    expect(dated.memories.map((m) => m.path)).toContain(A);
+    // A period with nothing in it falls back once and says so.
+    const old = await recallForHook({ query: `${QUERY} in 2019`, kinds: 'memory' }, now);
+    expect(old.memories.length).toBeGreaterThan(0);
+    expect(old.time).toMatchObject({ outsidePeriod: true });
+    // timeAware:false leaves the query alone.
+    expect((await recallForHook({ query: `${QUERY} today`, kinds: 'memory', timeAware: false }, now)).time).toBeUndefined();
+  });
+
   it('kinds=notes returns no memories and kinds=memory returns no notes', async () => {
     expect((await recallForHook({ query: QUERY, kinds: 'notes' })).memories).toEqual([]);
     expect((await recallForHook({ query: QUERY, kinds: 'memory' })).notes).toEqual([]);

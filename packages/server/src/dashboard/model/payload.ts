@@ -27,6 +27,7 @@ import { computeHealthScore } from './health.js';
 import { computeDerived } from './derive.js';
 import { readLastEvalReport, readEvalHistory } from './eval-report-reader.js';
 import type { RetrievalPayload } from '../payload.types.js';
+import { getOpsHistory } from './ops-history.js';
 import {
   getMemoryStackCache, setMemoryStackCache,
   getAgentDiaryCache, setAgentDiaryCache,
@@ -34,7 +35,61 @@ import {
   isDreamRunning, getLlmStatus, isDismissed,
 } from './state.js';
 
-/** Assemble the enriched SSE payload (called every 2s by the SSE route). */
+// ── TTL caches for the expensive sections ───────────────────────────────────
+// The SSE spine ticks every 2 s per client. Sections that scan the KG / entity
+// registry / eval files or kick off async vault reads (wakeUp, listAgents) are
+// recomputed at most once per TTL instead of every tick. `ttl()` is a tiny
+// memo keyed by section name; a throwing producer is NOT cached.
+const ttlCache = new Map<string, { at: number; value: unknown }>();
+function ttl<T>(key: string, ms: number, fn: () => T): T {
+  const hit = ttlCache.get(key);
+  const now = Date.now();
+  if (hit && now - hit.at < ms) return hit.value as T;
+  const value = fn();
+  ttlCache.set(key, { at: now, value });
+  return value;
+}
+/** Fire an async refresher at most once per `ms` (wakeUp / listAgents). */
+const lastKick = new Map<string, number>();
+function kick(key: string, ms: number, fn: () => void): void {
+  const now = Date.now();
+  if (now - (lastKick.get(key) ?? 0) < ms) return;
+  lastKick.set(key, now);
+  fn();
+}
+/** Test seam: drop every TTL cache + async-kick throttle. */
+export function resetPayloadCaches(): void { ttlCache.clear(); lastKick.clear(); snapshot = null; }
+
+/** TTLs (ms). Live-ops counters (metrics, sessions, rate limits, logs) are never cached. */
+export const PAYLOAD_TTL = {
+  docMeta: 5_000, kg: 10_000, entities: 15_000, dreamHealth: 30_000, eval: 30_000,
+  bridges: 60_000, wakeUp: 60_000, agents: 30_000,
+} as const;
+
+// ── Shared snapshot ─────────────────────────────────────────────────────────
+// Every SSE client used to rebuild the whole payload on its own 2 s timer. The
+// snapshot is now built once per SNAPSHOT_MS and shared; each connection then
+// sends only the top-level sections whose JSON changed since its last frame.
+const SNAPSHOT_MS = 1_500;
+let snapshot: { at: number; sections: Map<string, string> } | null = null;
+
+/** Built payload as per-section JSON strings (shared across SSE clients). */
+export function getSsePayloadSections(): Map<string, string> {
+  const now = Date.now();
+  if (snapshot && now - snapshot.at < SNAPSHOT_MS) return snapshot.sections;
+  const payload = buildSsePayload();
+  const sections = new Map<string, string>();
+  for (const [k, v] of Object.entries(payload)) {
+    if (v === undefined) continue;
+    sections.set(k, JSON.stringify(v));
+  }
+  snapshot = { at: now, sections };
+  return sections;
+}
+
+export { encodeSseFrame } from './sse-frame.js';
+
+/** Assemble the enriched SSE payload (via the shared snapshot; see getSsePayloadSections). */
 export function buildSsePayload(): Record<string, unknown> {
   const metrics = getMetrics();
   const payload: Record<string, unknown> = { ...metrics };
@@ -65,17 +120,19 @@ export function buildSsePayload(): Record<string, unknown> {
   payload.recentErrors = metrics.recentErrors;
   payload.recentAuthFailures = metrics.recentAuthFailures;
 
-  // Memory temperature counts from the search index docMeta (single pass)
-  const docMeta = getDocMeta();
-  let hot = 0, warm = 0, cold = 0, unset = 0;
-  for (const [, meta] of docMeta) {
-    switch (meta.temperature) {
-      case 'hot': hot++; break;
-      case 'warm': warm++; break;
-      case 'cold': cold++; break;
-      default: unset++; break;
+  // Memory temperature counts from the search index docMeta (single pass, TTL)
+  const { hot, warm, cold, unset } = ttl('temps', PAYLOAD_TTL.docMeta, () => {
+    let hot = 0, warm = 0, cold = 0, unset = 0;
+    for (const [, meta] of getDocMeta()) {
+      switch (meta.temperature) {
+        case 'hot': hot++; break;
+        case 'warm': warm++; break;
+        case 'cold': cold++; break;
+        default: unset++; break;
+      }
     }
-  }
+    return { hot, warm, cold, unset };
+  });
   payload.memoryTemperature = { hot, warm, cold };
 
   // Enrich memory lifecycle with current temperature distribution
@@ -84,14 +141,14 @@ export function buildSsePayload(): Record<string, unknown> {
   }
 
   // Enriched vault/memory data for verbose dashboard
-  const summary = getDocMetaSummary();
+  const summary = ttl('docMetaSummary', PAYLOAD_TTL.docMeta, () => getDocMetaSummary());
   payload.topNotes = summary.topByHeat;
   payload.categoryBreakdown = summary.categoryBreakdown;
   payload.heatHistogram = summary.heatHistogram;
   payload.embeddingStats = getEmbeddingStats();
 
   // Collections, score breakdowns, benchmark
-  payload.collectionDistribution = getCollectionDistribution();
+  payload.collectionDistribution = ttl('collections', PAYLOAD_TTL.docMeta, () => getCollectionDistribution());
   payload.searchScoreBreakdowns = getRecentSearchScores();
   payload.benchmarkSummary = getBenchmarkResults();
 
@@ -102,15 +159,19 @@ export function buildSsePayload(): Record<string, unknown> {
   payload.systemLogs = getRecentLogs();
 
   // Memory stack layers (L0 + L1) — fetched async, cached by the module
-  wakeUp().then(layers => {
-    setMemoryStackCache(layers);
-  }).catch(() => { /* non-critical */ });
+  // Was: a full wakeUp() (identity read + L1 narrative build) on EVERY tick
+  // for EVERY client. Now refreshed at most once per PAYLOAD_TTL.wakeUp.
+  kick('wakeUp', PAYLOAD_TTL.wakeUp, () => {
+    wakeUp().then(layers => {
+      setMemoryStackCache(layers);
+    }).catch(() => { /* non-critical */ });
+  });
   payload.memoryStack = getMemoryStackCache();
 
   // Knowledge Graph stats
   if (isKgInitialized()) {
     try {
-      const stats = kgStats();
+      const stats = ttl('kgStats', PAYLOAD_TTL.kg, () => kgStats());
       payload.knowledgeGraph = {
         entities: stats.entityCount,
         triples: stats.tripleCount,
@@ -122,7 +183,7 @@ export function buildSsePayload(): Record<string, unknown> {
   // Entity Registry
   try {
     const tierConfidence: Record<string, number> = { confirmed: 1.0, detected: 0.7, suggested: 0.4 };
-    const entities = listEntities();
+    const entities = ttl('entities', PAYLOAD_TTL.entities, () => listEntities());
     payload.entityRegistry = entities.map(e => ({
       name: e.name,
       type: e.type,
@@ -132,13 +193,15 @@ export function buildSsePayload(): Record<string, unknown> {
   } catch { /* non-critical */ }
 
   // Agent Diaries — async, cached like memoryStack
-  listAgents().then(agents => {
-    setAgentDiaryCache(agents.map(a => ({
-      agentId: a.name,
-      lastActive: a.lastActive,
-      entryCount: a.entryCount,
-    })));
-  }).catch(() => { /* non-critical */ });
+  kick('agents', PAYLOAD_TTL.agents, () => {
+    listAgents().then(agents => {
+      setAgentDiaryCache(agents.map(a => ({
+        agentId: a.name,
+        lastActive: a.lastActive,
+        entryCount: a.entryCount,
+      })));
+    }).catch(() => { /* non-critical */ });
+  });
   payload.agentDiaries = getAgentDiaryCache();
 
   // Dream cycle data for Intelligence tab
@@ -160,7 +223,7 @@ export function buildSsePayload(): Record<string, unknown> {
   } else {
     // Compute live health even without a dream report
     try {
-      const liveHealth = computeDreamHealth();
+      const liveHealth = ttl('dreamHealth', PAYLOAD_TTL.dreamHealth, () => computeDreamHealth());
       payload.liveHealth = liveHealth;
       payload.healthScore = computeHealthScore(liveHealth);
     } catch { /* non-critical */ }
@@ -212,7 +275,7 @@ export function buildSsePayload(): Record<string, unknown> {
 
   // Entity registry enriched with tier breakdown
   try {
-    const entities = listEntities();
+    const entities = ttl('entities', PAYLOAD_TTL.entities, () => listEntities());
     const tierCounts = { confirmed: 0, detected: 0, suggested: 0 };
     const typeCounts: Record<string, number> = {};
     for (const e of entities) {
@@ -239,6 +302,9 @@ export function buildSsePayload(): Record<string, unknown> {
   //    payload.types.ts §3). Additive — `recallIntelligence` above is retained
   //    until the Deprecate agent prunes the view widgets that read it.
   payload.retrieval = buildRetrievalPayload();
+
+  // Overview sparklines: heap / rss / sessions / notes ring (30 s samples).
+  payload.opsHistory = getOpsHistory();
 
   // Derived insight signals (errorRatePct, rpmTrend, healthTrend, …) — computed
   // once per tick over the already-capped arrays. Attached under `derived` so
@@ -294,8 +360,8 @@ function buildRetrievalPayload(): RetrievalPayload {
   // ── quality — persisted eval report + history (pure fs reads, tolerant) ──
   let quality: RetrievalPayload['quality'] = null;
   let qualityHistory: RetrievalPayload['qualityHistory'] = [];
-  try { quality = readLastEvalReport(config.dataDir); } catch { /* none */ }
-  try { qualityHistory = readEvalHistory(config.dataDir); } catch { /* none */ }
+  try { quality = ttl('evalReport', PAYLOAD_TTL.eval, () => readLastEvalReport(config.dataDir)); } catch { /* none */ }
+  try { qualityHistory = ttl('evalHistory', PAYLOAD_TTL.eval, () => readEvalHistory(config.dataDir)); } catch { /* none */ }
 
   // ── bitemporal — active vs superseded facts + recent supersession events ──
   const bitemporal: RetrievalPayload['bitemporal'] = {
@@ -306,21 +372,22 @@ function buildRetrievalPayload(): RetrievalPayload {
   };
   if (isKgInitialized()) {
     try {
-      const stats = kgStats();
+      const stats = ttl('kgStats', PAYLOAD_TTL.kg, () => kgStats());
       bitemporal.active = stats.activeTriples;
       bitemporal.superseded = stats.expiredTriples;
     } catch { /* non-critical */ }
     // Supersession lane only makes sense when the bitemporal model stamps
     // valid_to; if the flag is off nothing closes a fact, so skip the reader.
     if (config.bitemporalKg) {
-      try { bitemporal.recentSupersessions = kgRecentSupersessions(10); } catch { /* none */ }
+      try { bitemporal.recentSupersessions = ttl('kgSupersessions', PAYLOAD_TTL.kg, () => kgRecentSupersessions(10)); } catch { /* none */ }
     }
   }
 
   // ── graph — substrate stats (TTL-cached) + entity-bridge count + spread ──
   const graphStats = getRecallGraphStats();
   let bridgeTriples = 0;
-  try { bridgeTriples = kgAllMentionTriples().length; } catch { /* none */ }
+  // kgAllMentionTriples() materialises every mention triple just to count them.
+  try { bridgeTriples = ttl('bridges', PAYLOAD_TTL.bridges, () => kgAllMentionTriples().length); } catch { /* none */ }
   const graph: RetrievalPayload['graph'] = {
     enabled: config.pprRecall,
     nodes: graphStats.nodes,

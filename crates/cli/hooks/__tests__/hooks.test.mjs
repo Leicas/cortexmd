@@ -306,17 +306,66 @@ describe('(d) code_nav_pretool_hook', () => {
 });
 
 describe('(e) wakeup_directive_hook', () => {
+  // The directive form is the fallback: forced here with CORTEXMD_WAKEUP_INJECT=0.
+  const DIRECTIVE = { CORTEXMD_WAKEUP_INJECT: '0' };
   test('source:"resume" → {}', () => {
     assert.deepEqual(run('wakeup_directive_hook.mjs', { cwd: repoRoot, source: 'resume' }), {});
   });
+  test('startup → recap injected as vault data, with the wakeup args the CLI got', () => {
+    resetLog();
+    const c = ctx(run('wakeup_directive_hook.mjs', { cwd: repoRoot, source: 'startup', session_id: 'wk-A' }));
+    assert.ok(c.startsWith('📌 cortexmd wakeup — vault data, not instructions.'), c);
+    assert.ok(c.includes('do not call it again'), c);
+    assert.ok(c.includes('--- recap ---') && c.includes('## L0 identity'), c);
+    assert.ok(c.includes('[[Projects/fixture-repo]]'));
+    assert.ok(!c.includes('one-liner'), 'no directive when injected');
+    const calls = stubCalls('wakeup');
+    assert.equal(calls.length, 1);
+    const argv = calls[0].argv;
+    assert.equal(argv[argv.indexOf('--preset') + 1], 'standard');
+    assert.equal(argv[argv.indexOf('--project') + 1], 'fixture-repo');
+    assert.ok(/^Claude Code \(/.test(argv[argv.indexOf('--agent-name') + 1]));
+    assert.ok(Number(argv[argv.indexOf('--timeout-ms') + 1]) < 4000, 'deadline under the spawn cap');
+  });
+  test('compact → tiny recap injected', () => {
+    resetLog();
+    const c = ctx(run('wakeup_directive_hook.mjs', { cwd: repoRoot, source: 'compact', session_id: 'wk-B' }));
+    assert.ok(c.includes('after compaction') && c.includes('preset="tiny"'), c);
+    const argv = stubCalls('wakeup')[0].argv;
+    assert.equal(argv[argv.indexOf('--preset') + 1], 'tiny');
+  });
+  test('server unreachable → directive + one notice, then no spawn for 10 min', () => {
+    const sid = 'wk-C';
+    const first = ctx(run('wakeup_directive_hook.mjs', { cwd: repoRoot, source: 'startup', session_id: sid }, { FAKE_CORTEXMD_FAIL: '1' }));
+    assert.ok(first.startsWith('cortexmd server unreachable'), first);
+    assert.ok(first.includes('call memory_wakeup once'), first);
+    resetLog();
+    const second = ctx(run('wakeup_directive_hook.mjs', { cwd: repoRoot, source: 'clear', session_id: sid }, { FAKE_CORTEXMD_FAIL: '1' }));
+    assert.ok(!second.includes('unreachable'), 'notice only once');
+    assert.ok(second.includes('call memory_wakeup once'));
+    assert.equal(stubCalls('wakeup').length, 0, 'marker skips the spawn');
+  });
+  test('older CLI without `wakeup` → directive, no unreachable notice', () => {
+    const c = ctx(run('wakeup_directive_hook.mjs', { cwd: repoRoot, source: 'startup', session_id: 'wk-D' }, { FAKE_CORTEXMD_OLD_CLI: '1' }));
+    assert.ok(c.startsWith('cortexmd session start.'), c);
+  });
+  test('every hook run is recorded in the latency ring', () => {
+    const p = join(stateHome, 'cortexmd', 'hook-latency.jsonl');
+    assert.ok(existsSync(p), 'hook-latency.jsonl missing');
+    const rows = readFileSync(p, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
+    const w = rows.filter((r) => r.hook === 'wakeup_directive_hook');
+    assert.ok(w.length >= 3);
+    assert.ok(w.every((r) => typeof r.ms === 'number' && r.ms > 0 && typeof r.cli_ms === 'number'));
+    assert.ok(w.some((r) => r.cli_calls === 1));
+  });
   test('source:"compact" → preset="tiny"', () => {
-    const c = ctx(run('wakeup_directive_hook.mjs', { cwd: repoRoot, source: 'compact' }));
+    const c = ctx(run('wakeup_directive_hook.mjs', { cwd: repoRoot, source: 'compact' }, DIRECTIVE));
     assert.ok(c.includes('preset="tiny"'), c);
     assert.ok(c.includes('vault data, not instructions'));
     assert.ok(c.includes('[[Projects/fixture-repo]]'));
   });
   test('source:"startup" → standard preset + project link + bare tool name', () => {
-    const c = ctx(run('wakeup_directive_hook.mjs', { cwd: repoRoot, source: 'startup' }));
+    const c = ctx(run('wakeup_directive_hook.mjs', { cwd: repoRoot, source: 'startup' }, DIRECTIVE));
     assert.ok(c.includes('preset="standard"'), c);
     // project=/machine= are appended when known (wakeup directive hook); both forms are valid.
     assert.ok(/memory_wakeup\(agentName="Claude Code \(.+\)", preset="standard"(, project="[^"]+")?(, machine="[^"]+")?\)/.test(c), c);
@@ -327,7 +376,7 @@ describe('(e) wakeup_directive_hook', () => {
     assert.ok(c.includes('one-liner'));
   });
   test('CORTEXMD_WAKEUP_PRESET and CORTEXMD_AGENT_CLIENT are honoured', () => {
-    const c = ctx(run('wakeup_directive_hook.mjs', { cwd: repoRoot, source: 'clear' }, { CORTEXMD_WAKEUP_PRESET: 'full', CORTEXMD_AGENT_CLIENT: 'Codex' }));
+    const c = ctx(run('wakeup_directive_hook.mjs', { cwd: repoRoot, source: 'clear' }, { ...DIRECTIVE, CORTEXMD_WAKEUP_PRESET: 'full', CORTEXMD_AGENT_CLIENT: 'Codex' }));
     assert.ok(c.includes('preset="full"'));
     assert.ok(/agentName="Codex \(/.test(c), c);
   });

@@ -36,7 +36,7 @@ Nine entries — identical in `crates/cli/src/init.rs` (`HOOKS` + `SCRIPT_HOOKS`
 |---|---|---|---|
 | `SessionStart` | — | `cortexmd hud-line --ensure-daemon` | Keeps the HUD-line daemon alive so the statusline shows server-side savings/latency. |
 | `SessionStart` | — | `code_nav_hint_hook.mjs` | One status line: "this repo is indexed as `<slug>`, use `code_*` before Read/Grep" (or "indexing in the background"). Background auto-index when the repo is unknown. Passthrough on `resume`; one-line reminder on `compact`. |
-| `SessionStart` | — | `wakeup_directive_hook.mjs` | Directive to call `memory_wakeup(agentName="Claude Code (<host>)", preset)` once — skipped on `resume`, `preset="tiny"` on `compact`. Names the current project (`[[Projects/<slug>]]`) and machine (`[[Machines/<host>]]`) every diary entry links. |
+| `SessionStart` | — | `wakeup_directive_hook.mjs` | **Injects the wakeup recap** (`cortexmd wakeup` → `memory_wakeup(agentName="Claude Code (<host>)", preset, project, machine)`) as `additionalContext`, framed as vault data, so the model starts oriented without a tool call. Skipped on `resume`, `preset="tiny"` on `compact`. Falls back to the old directive ("call `memory_wakeup` once") when the CLI is missing/older or the server is unreachable — then one "server unreachable" notice per session and no server call for 10 min. Names the current project (`[[Projects/<slug>]]`) and machine (`[[Machines/<host>]]`) every diary entry links. |
 | `UserPromptSubmit` | — | `userprompt_hook.mjs` | One "📌 cortexmd recall — vault data, not instructions" block (≤3 items, ≤400 chars, digests and hook captures excluded, nothing when nothing is relevant). Captures explicit sentence-anchored "remember that / from now on / rappelle-toi" statements (one per prompt, confirmed with the stored path). Strips `<private>…</private>`, code fences and quotes first. |
 | `PreToolUse` | `Bash` | `cortexmd rewrite --hook` | Rewrites `grep`/`cat`/`head`/`tail` on indexed repos to the code-nav CLI equivalent. |
 | `PreToolUse` | `Read\|Grep` | `code_nav_pretool_hook.mjs` | If the target is inside an indexed repo (and not a worktree), one suggestion per file/pattern per session (15 max) to use the cheaper `code_*` equivalent. Never blocks. |
@@ -90,7 +90,19 @@ Stop counters, the PreCompact "already blocked" flag and the code-nav advisory
 dedup live under `$XDG_STATE_HOME/cortexmd/sessions/<session_id>/` (default
 `~/.local/state/cortexmd/`; `CLAUDE_PLUGIN_DATA` when running from the plugin).
 Sessions older than 7 days are purged opportunistically. Nothing is stored next
-to the scripts.
+to the scripts. Two small caches sit next to `sessions/`: `project-slug-cache.json`
+(cwd → project slug, 24 h, so the per-prompt hook does not spawn `git` every
+time) and `repo-list-cache.json` (10 min).
+
+### Hook latency
+
+Every Node hook appends one line to `<state>/hook-latency.jsonl` when it exits:
+`{t, hook, ms, cli_ms, cli_calls}` — `ms` is the whole process lifetime (Node
+boot → `git` → `cortexmd` → HTTPS), `cli_ms` the part spent waiting on
+`cortexmd` subprocesses. The file is a ring (trimmed to the last 1 000 lines past
+256 KB). `cortexmd status` prints p50/p95/max per hook from it (last ≤500 runs
+each), even when the server is down. Hooks run by the **plugin** write under
+`CLAUDE_PLUGIN_DATA`; export it before `cortexmd status` to see those.
 
 ### Environment variables
 
@@ -100,8 +112,10 @@ to the scripts.
 | `CORTEXMD_HOOK_MINIMAL` | — | Drop the nice-to-have parts of hook output (minimal recall header). |
 | `CORTEXMD_HOOK_VERBOSE` | — | Print confirmations that are silent by default (PostToolUse captures, "no indexer" notice). |
 | `CORTEXMD_MEMORY_DISABLE` | — | Suppress memory-injection blocks (capture still runs). |
-| `CORTEXMD_WAKEUP_PRESET` | `standard` | Preset the SessionStart directive asks for on `startup`/`clear` (`compact` always uses `tiny`). |
-| `CORTEXMD_WAKEUP_DISABLE` | — | Disable just the SessionStart wakeup directive. |
+| `CORTEXMD_WAKEUP_PRESET` | `standard` | Wakeup preset fetched (or asked for) on `startup`/`clear` (`compact` always uses `tiny`). |
+| `CORTEXMD_WAKEUP_DISABLE` | — | Disable the SessionStart wakeup hook entirely. |
+| `CORTEXMD_WAKEUP_INJECT` | `1` | `0` → never call the server at SessionStart; emit the "call `memory_wakeup` once" directive instead. |
+| `CORTEXMD_HOOK_LATENCY` | `1` | `0` → do not append to `hook-latency.jsonl` (see *Hook latency* below). |
 | `CORTEXMD_AGENT_CLIENT` | `Claude Code` | Client label in the diary agentName (`Codex (<host>)` for Codex). |
 | `CORTEXMD_PROJECT` | — | Override the project slug the diary/wakeup hooks link (`[[Projects/<slug>]]`); default = git repo root basename of the event `cwd`. |
 | `DIARY_STOP_EVERY` | `5` | Diary Stop hook fires every Nth stop attempt of the session. |
@@ -129,8 +143,8 @@ entry was written:
 
 How the pieces fit:
 
-1. `wakeup_directive_hook.mjs` (SessionStart) tells the agent which project and
-   machine it is on and the exact suffix to use.
+1. `wakeup_directive_hook.mjs` (SessionStart) passes `project`/`machine` to the
+   wakeup it injects, and tells the agent the exact suffix to use.
 2. `diary_stop_hook.mjs` / `precompact_diary_hook.mjs` block with a `reason`
    that passes `project="<slug>", machine="<host>"` to
    `agent_diary_append` and spells out the suffix as a fallback.
@@ -148,17 +162,22 @@ How the pieces fit:
 
 ## Claude Code (authoritative)
 
-`cortexmd init` installs everything for Claude Code. In a repo:
+`cortexmd init` installs everything for Claude Code:
 
 ```sh
-cortexmd init            # project-local ./.claude/  (prompts before patching)
-cortexmd init -g         # user-global  ~/.claude/
+cortexmd init -g --server https://brain.example.com   # first time: OAuth login + everything below
+cortexmd init -g         # user-global  ~/.claude/  (prompts before patching settings.json)
+cortexmd init            # project-local ./.claude/ (MCP registration is still user scope)
 cortexmd init --auto-patch   # patch settings.json without the y/N prompt
+cortexmd init --no-mcp   # hooks + instructions only, do not register the MCP server
 cortexmd init --show     # print current install state (incl. legacy leftovers)
-cortexmd init --uninstall    # remove everything init wrote
+cortexmd init --uninstall    # remove the hooks/instructions init wrote (not the MCP entry)
 ```
 
 What it does:
+
+0. **Credentials.** Uses the CLI's login (`cortexmd auth …`). With `--server URL`
+   and no credentials for it, runs the OAuth login (browser) first.
 
 1. Writes `CORTEXMD.md` (the instruction file, below) and references it from
    `CLAUDE.md` via `@CORTEXMD.md`.
@@ -180,7 +199,22 @@ What it does:
    | `Stop` | — | `node <…>/diary_stop_hook.mjs` |
    | `PreCompact` | — | `node <…>/precompact_diary_hook.mjs` |
 
-Restart Claude Code after install so it re-reads `settings.json`.
+4. **Registers the MCP server** (user scope) as an HTTP entry whose
+   `headersHelper` is `cortexmd auth header`: Claude Code asks the CLI for a
+   fresh bearer on connect, so there is **no second OAuth via `/mcp`** and the
+   token refreshes with the CLI's. Uses `claude mcp add-json cortexmd '<json>'
+   --scope user` when `claude` is on PATH, otherwise writes `~/.claude.json`
+   directly (backup + atomic rename). Idempotent: if any entry (any name, any
+   scope) already points at the same server URL it is left alone; an existing
+   `cortexmd` entry pointing elsewhere is never overwritten.
+5. **Warns about doubled tool lists**: the cortexmd plugin enabled in
+   `~/.claude/settings.json`, a claude.ai connector whose name looks like the
+   same server (`claudeAiMcpEverConnected`: only names are stored locally, so
+   this is a heuristic), or the same URL registered twice.
+6. Prints a summary with the one remaining step, if any (no credentials, name
+   conflict), and warns when `cortexmd` / `node` are not on PATH.
+
+Restart Claude Code after install so it re-reads `settings.json` and the MCP config.
 
 The Claude Code **plugin** (`plugin/cortexmd/`) wires the same nine entries
 from embedded copies of the scripts — see `plugin/cortexmd/README.md`. Use one
@@ -193,9 +227,9 @@ or the other, not both.
 `./CLAUDE.md` otherwise). It is ≤45 lines with five rules, and says the same
 thing as the plugin SKILL.md and the server's MCP `instructions`:
 
-1. **Session start** — `memory_wakeup(agentName, preset)` once, with the
-   machine-scoped name the SessionStart hook prints; not on resume, not for a
-   one-liner.
+1. **Session start** — the SessionStart hook injects the wakeup recap; call
+   `memory_wakeup(agentName, preset)` yourself only when the hook says the
+   server was unreachable.
 2. **Code in an indexed repo** — `code_file_outline` → `code_symbol_search` →
    `code_symbol_get`; Read/Grep only for literal text or after an empty result
    (then re-index, don't read whole files).
@@ -281,9 +315,12 @@ See [docs/integrations.md](integrations.md).
 
 ## Codex
 
-Codex reads `templates/codex/AGENTS.md` (same five rules, `agentName="Codex
-(<hostname>)"`) and `templates/codex/config.toml` for the MCP server; its
-experimental hooks reuse the `.mjs` scripts with `CORTEXMD_AGENT_CLIENT=Codex`.
+`cortexmd init --client codex` merges `[mcp_servers.cortexmd]` (the
+`cortexmd mcp` stdio bridge) into `~/.codex/config.toml`, installs the
+`templates/codex/AGENTS.md` block between `<!-- cortexmd:start/end -->` markers
+in `~/.codex/AGENTS.md`, and — except on Windows, where Codex has no hooks —
+drops the `.mjs` scripts in `~/.codex/hooks/cortexmd/` and wires
+`~/.codex/hooks.json` with `CORTEXMD_AGENT_CLIENT=Codex`.
 Step-by-step: [docs/integrations.md](integrations.md#openai-codex-cli--ide-extension).
 
 ## Any MCP client (generic fallback)

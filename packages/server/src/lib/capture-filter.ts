@@ -9,6 +9,12 @@
  */
 import { config } from '../config.js';
 import { logger } from './logger.js';
+import { classifyEcho, isMachineSource, type EchoKind } from './vault-hygiene/patterns.js';
+
+/** True when `source` is a machine capture pipeline (n8n, email, hooks). */
+export function isMachineCaptureSource(source: string | undefined): boolean {
+  return isMachineSource(source, config.machineCaptureSourcePatterns);
+}
 
 export const DEFAULT_NOISE_PATTERNS: readonly RegExp[] = [
   // "<label>: <raw command>" stubs
@@ -42,11 +48,36 @@ function extraPatterns(): RegExp[] {
   return patterns;
 }
 
-/** The pattern that marks `title` as capture noise, or undefined to keep it. */
-export function matchCaptureNoise(title: string): RegExp | undefined {
+/**
+ * Stand-in "patterns" reported for the rule-based echo classes (see
+ * vault-hygiene/patterns.ts classifyEcho) so callers keep getting a RegExp.
+ */
+const ECHO_MARKERS: Record<EchoKind, RegExp> = {
+  'shell-command': /echo:shell-command/,
+  'tool-result': /echo:tool-result/,
+  'git-commit-echo': /echo:git-commit-echo/,
+  'prompt-fragment': /echo:prompt-fragment/,
+};
+
+/**
+ * The pattern that marks a capture as noise, or undefined to keep it.
+ *
+ * `title`-only callers (memory_store) get the title rules: legacy stubs,
+ * automated emails, bare shell commands, tool-result fragments and
+ * `git commit:` titles. Passing `extra` (body/source/tags — the hook path)
+ * also enables the body rules: multi-line commit echoes and UserPromptSubmit
+ * prompt fragments.
+ */
+export function matchCaptureNoise(
+  title: string,
+  extra?: { content?: string; source?: string; tags?: readonly string[] },
+): RegExp | undefined {
   if (!config.captureNoiseFilter) return undefined;
   const t = title.trim();
-  return [...DEFAULT_NOISE_PATTERNS, ...extraPatterns()].find((re) => re.test(t));
+  const legacy = [...DEFAULT_NOISE_PATTERNS, ...extraPatterns()].find((re) => re.test(t));
+  if (legacy) return legacy;
+  const kind = classifyEcho({ title: t, content: extra?.content, source: extra?.source, tags: extra?.tags });
+  return kind ? ECHO_MARKERS[kind] : undefined;
 }
 
 /**

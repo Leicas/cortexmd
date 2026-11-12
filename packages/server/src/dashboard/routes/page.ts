@@ -20,6 +20,8 @@ import { fileURLToPath } from 'node:url';
 import nodePath from 'node:path';
 import { renderPage } from '../views/layout.js';
 import { logger } from '../../lib/logger.js';
+import { config } from '../../config.js';
+import { csrfTokenFor } from '../security.js';
 
 interface Asset { body: Buffer; contentType: string; }
 
@@ -85,7 +87,11 @@ export function registerPageRoutes(router: Router): void {
   });
 
   // Dashboard page.
-  router.get('/dashboard', (_req: Request, res: Response) => {
-    res.type('html').send(renderPage());
+  router.get('/dashboard', (req: Request, res: Response) => {
+    res.setHeader('Cache-Control', 'no-store'); // page embeds the per-session CSRF token
+    res.type('html').send(renderPage({
+      csrfToken: csrfTokenFor(req),
+      obsidianVault: process.env.OBSIDIAN_VAULT_NAME || nodePath.basename(config.brainVault),
+    }));
   });
 }

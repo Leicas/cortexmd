@@ -251,10 +251,10 @@ the archives).
 
 1. Stop the server: `docker compose stop cortexmd` (so nothing writes mid-restore).
 2. Extract into an empty directory and check it:
-   `mkdir /srv/brain-restore && tar -xzf brain-20261111T033000Z.tar.gz -C /srv/brain-restore`
-   (or `node dist/backup-cli.js restore <archive> /srv/brain-restore`).
-3. Swap it in: move the current vault aside (`mv /srv/brain /srv/brain.broken`)
-   and the restored copy into place (`mv /srv/brain-restore /srv/brain`). Keep
+   `mkdir /opt/brain-restore && tar -xzf brain-20261111T033000Z.tar.gz -C /opt/brain-restore`
+   (or `node dist/backup-cli.js restore <archive> /opt/brain-restore`).
+3. Swap it in: move the current vault aside (`mv /opt/brain /opt/brain.broken`)
+   and the restored copy into place (`mv /opt/brain-restore /opt/brain`). Keep
    ownership consistent with the container user (`chown -R`).
 4. Start the server. The boot index build picks up the restored files; the
    embedding index re-embeds only notes whose text differs from what it had.

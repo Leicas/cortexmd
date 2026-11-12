@@ -86,9 +86,9 @@ function renderResult(ctx, d) {
     + '<div><b>Copy the secret now</b> — it is shown only once and cannot be retrieved later.</div>'
     + '<div style="display:grid;grid-template-columns:7rem 1fr;gap:.4rem;align-items:baseline">'
     + '<div class="card-label" style="margin:0">Client ID</div>'
-    + '<span class="mono" title="Click to copy" style="cursor:pointer;word-break:break-all" onclick="cortex.copyLogLine(this)">' + esc(d.client_id) + '</span>'
+    + '<span class="mono" title="Click to copy" style="cursor:pointer;word-break:break-all" data-cx-click="cortex.copyLogLine(this)">' + esc(d.client_id) + '</span>'
     + '<div class="card-label" style="margin:0">Client Secret</div>'
-    + '<span class="mono" title="Click to copy" style="cursor:pointer;word-break:break-all" onclick="cortex.copyLogLine(this)">' + esc(d.client_secret) + '</span>'
+    + '<span class="mono" title="Click to copy" style="cursor:pointer;word-break:break-all" data-cx-click="cortex.copyLogLine(this)">' + esc(d.client_secret) + '</span>'
     + '</div></div>';
 }
 
@@ -119,7 +119,7 @@ function renderClients(ctx, clients) {
       + '<td><span class="mono" title="' + esc(c.client_id) + '" style="word-break:break-all">' + esc(c.client_id) + '</span></td>'
       + '<td>' + uris + '</td>'
       + '<td><span class="mono" style="color:var(--text-dim)">' + esc(fmt.fmtDate(c.registeredAt)) + '</span></td>'
-      + '<td><button type="button" class="btn btn-danger btn--sm" onclick="cortex.oauthDelete(\'' + esc(c.client_id) + '\',\'' + esc(nameForJs) + '\')">Revoke</button></td>'
+      + '<td><button type="button" class="btn btn-danger btn--sm" data-cx-click="cortex.oauthDelete(\'' + esc(c.client_id) + '\',\'' + esc(nameForJs) + '\')">Revoke</button></td>'
       + '</tr>';
   }).join('');
 }

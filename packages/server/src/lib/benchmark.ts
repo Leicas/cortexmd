@@ -237,6 +237,17 @@ export interface QualityBenchmarkResult {
   p95LatencyMs: number;
   totalLatencyMs: number;
   byCategory: QualityCategoryResult[];
+  /**
+   * Which path was measured (additive field). 'memory_recall' (default) runs
+   * each query through the real memory_recall tool path (limit 10, priors,
+   * MMR; touch:false so the benchmark never bumps access counters);
+   * 'hybrid_search' is the legacy raw hybridSearch(limit 20) over all notes.
+   */
+  mode?: 'memory_recall' | 'hybrid_search';
+  /** MRR over the returned list (additive field). */
+  mrr?: number;
+  /** Fraction of queries whose first result is relevant (additive field). */
+  top1Accuracy?: number;
 }
 
 /**
@@ -280,11 +291,16 @@ function computeRecall(retrieved: string[], relevant: Set<string>, k: number): n
  * Each line: {"query": "...", "expected_paths": ["..."], "category?": "..."}
  *
  * Streams the file line by line to avoid accumulating all in memory.
- * Computes: Recall@5, Recall@10, NDCG@5, NDCG@10, zero-recall rate, avg/p95 latency.
+ * Computes: Recall@5, Recall@10, NDCG@5, NDCG@10, MRR, top-1, zero-recall
+ * rate, avg/p95 latency. By default each query goes through the REAL
+ * memory_recall path (shared runner core in eval/recall-core.ts), so the
+ * numbers match what agents see; expected paths are matched case-, `.md`- and
+ * slash-insensitively. Pass mode 'hybrid_search' for the legacy raw search.
  */
 export async function runQualityBenchmark(
   datasetPath: string,
   maxQueries?: number,
+  mode: 'memory_recall' | 'hybrid_search' = 'memory_recall',
 ): Promise<QualityBenchmarkResult> {
   // Stream JSONL line by line
   const entries: QualityQueryEntry[] = [];
@@ -321,8 +337,19 @@ export async function runQualityBenchmark(
       p95LatencyMs: 0,
       totalLatencyMs: 0,
       byCategory: [],
+      mode,
     };
   }
+
+  // Shared runner core: the real memory_recall path (touch:false) or raw search.
+  const core = await import('../eval/recall-core.js');
+  const { getDocMeta } = await import('./search.js');
+  const runner = mode === 'memory_recall'
+    ? await core.makeRecallRunner({ limit: 10 })
+    : async (q: string) => ({ paths: (await hybridSearch(q, { limit: 20 })).map((r) => r.path) });
+  const resolveGold = core.makeGoldResolver(getDocMeta());
+  let sumRR = 0;
+  let sumTop1 = 0;
 
   // Per-query metrics accumulators
   const latencies: number[] = [];
@@ -339,18 +366,23 @@ export async function runQualityBenchmark(
   >();
 
   for (const entry of entries) {
-    const relevant = new Set(entry.expected_paths);
+    // Resolve labels to indexed paths; unresolvable labels stay in the set as
+    // guaranteed misses (same denominator as before normalisation).
+    const resolved = resolveGold(entry.expected_paths);
+    const relevant = new Set([...resolved.gold, ...resolved.missing]);
 
     const start = Date.now();
     let retrieved: string[];
     try {
-      const results = await hybridSearch(entry.query, { limit: 20 });
-      retrieved = results.map((r) => r.path);
+      retrieved = (await runner(entry.query)).paths;
     } catch {
       retrieved = [];
     }
     const latency = Date.now() - start;
     latencies.push(latency);
+    const firstHit = retrieved.findIndex((p) => relevant.has(p));
+    sumRR += firstHit >= 0 ? 1 / (firstHit + 1) : 0;
+    sumTop1 += firstHit === 0 ? 1 : 0;
 
     const r5 = computeRecall(retrieved, relevant, 5);
     const r10 = computeRecall(retrieved, relevant, 10);
@@ -412,6 +444,9 @@ export async function runQualityBenchmark(
     p95LatencyMs: p95Latency,
     totalLatencyMs: totalLatency,
     byCategory,
+    mode,
+    mrr: Math.round((sumRR / n) * 10000) / 10000,
+    top1Accuracy: Math.round((sumTop1 / n) * 10000) / 10000,
   };
 }
 

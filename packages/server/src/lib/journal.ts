@@ -1,6 +1,7 @@
 import { readNote, writeNote, listFiles } from './vault.js';
 import { logger } from './logger.js';
 import { linkFromIndex } from './index-notes.js';
+import { ensureEntityStubs } from './vault-hygiene/entity-stubs.js';
 
 /**
  * Build a formatted timestamp string for journal entries.
@@ -48,8 +49,8 @@ function diaryPath(agentName: string, date: Date = new Date()): string {
 // Diary wiki-links: every diary entry links the PROJECT and the MACHINE it was
 // written from, so Obsidian's graph ties agent activity to `Projects/<slug>`
 // (the same notes the dream reconciles cold memories into — see
-// project-reconcile.ts) and to `Machines/<id>` (one note per host; created
-// on demand by Obsidian when the link is first followed).
+// project-reconcile.ts) and to `Machines/<id>` (one note per host). Both get
+// a create-only MOC stub on the first diary write that links them.
 //
 // Rendered as an entry suffix: ` · [[Projects/<slug>]] @ [[Machines/<id>]]`.
 // ---------------------------------------------------------------------------
@@ -89,6 +90,13 @@ export function machineFromAgentName(agentName: string): string {
   return m ? sanitizeLinkSegment(m[1]) : '';
 }
 
+/** The `Projects/<slug>` and `Machines/<id>` names a diary entry links ('' = none). */
+export function diaryLinkTargets(agentName: string, opts: DiaryLinkOptions = {}): { project: string; machine: string } {
+  const project = opts.project ? projectSlug(sanitizeLinkSegment(opts.project)) : '';
+  const machine = sanitizeLinkSegment(opts.machine ?? '') || machineFromAgentName(agentName);
+  return { project, machine };
+}
+
 /**
  * Render the wiki-link suffix for a diary entry, e.g.
  * ` · [[Projects/cortexmd]] @ [[Machines/Ao]]`. Links already present in
@@ -101,8 +109,7 @@ export function renderDiaryLinks(
   agentName: string,
   opts: DiaryLinkOptions = {},
 ): string {
-  const project = opts.project ? projectSlug(sanitizeLinkSegment(opts.project)) : '';
-  const machine = sanitizeLinkSegment(opts.machine ?? '') || machineFromAgentName(agentName);
+  const { project, machine } = diaryLinkTargets(agentName, opts);
 
   const links: string[] = [];
   if (project) {
@@ -173,6 +180,15 @@ export async function appendJournalEntry(
         filePath,
         [{ path: 'Ops/Agent Diaries/Agent Diaries.md', title: 'Agent Diaries' }],
       );
+    }
+
+    // The linked Projects/<slug> + Machines/<id> notes get a create-only MOC
+    // stub so the suffix never dangles (vault-hygiene/entity-stubs.ts).
+    try {
+      const { project, machine } = diaryLinkTargets(safeName, links);
+      await ensureEntityStubs({ project: project || undefined, machine: machine || undefined }, today);
+    } catch {
+      // Best-effort: the diary line is already written.
     }
 
     const lineNumber = newContent.trimEnd().split('\n').length;

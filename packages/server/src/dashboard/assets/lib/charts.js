@@ -28,12 +28,54 @@ function statusColor(v01, good, warn) {
   return 'var(--err)';
 }
 
+/** Compact number for chart text alternatives. */
+function fmtNum(v) {
+  if (v == null || isNaN(v)) return '—';
+  var a = Math.abs(v);
+  if (a >= 1000) return Math.round(v).toLocaleString();
+  if (a >= 10) return String(Math.round(v * 10) / 10);
+  return String(Math.round(v * 100) / 100);
+}
+
+/**
+ * Give a chart a text alternative instead of hiding it from assistive tech:
+ * role="img" + an aria-label summarising points / min / max / latest. The
+ * name comes from `data-label`, else the nearest `.card-label` /
+ * `.section-title`. An author-written aria-label (without data-auto-label) is
+ * kept as-is.
+ */
+export function describeChart(svg, values) {
+  if (!svg) return;
+  svg.removeAttribute('aria-hidden');
+  svg.setAttribute('role', 'img');
+  if (svg.hasAttribute('aria-label') && !svg.hasAttribute('data-auto-label')) return;
+  var name = svg.getAttribute('data-label');
+  if (!name) {
+    // Walk up to the nearest container that has a heading-ish label.
+    var lab = null;
+    for (var p = svg.parentElement; p && !lab && p !== document.body; p = p.parentElement) {
+      lab = p.querySelector(':scope > .card-label, :scope > .section-title, :scope > .section-head .section-title, :scope > .card-label-row');
+    }
+    name = lab ? lab.textContent.replace(/\s+/g, ' ').trim() : 'Chart';
+  }
+  var vals = (values || []).filter(function (v) { return typeof v === 'number' && !isNaN(v); });
+  var text = vals.length === 0 ? name + ': no data'
+    : name + ': ' + vals.length + ' points, min ' + fmtNum(Math.min.apply(null, vals)) +
+      ', max ' + fmtNum(Math.max.apply(null, vals)) + ', latest ' + fmtNum(vals[vals.length - 1]);
+  svg.setAttribute('aria-label', text);
+  svg.setAttribute('data-auto-label', '');
+}
+
 /** 3a. Draw a luminous area sparkline into an <svg> by id. `points` = [{y}]. */
 export function drawChart(svgId, points, color) {
   var svg = document.getElementById(svgId);
-  if (!svg || !points || points.length < 2) { if (svg) svg.innerHTML = ''; return; }
+  if (!svg || !points || points.length < 2) {
+    if (svg) { svg.innerHTML = ''; describeChart(svg, points ? points.map(function (p) { return p.y; }) : []); }
+    return;
+  }
   var w = W, h = H, pad = 4;
   var ys = points.map(function (p) { return p.y; });
+  describeChart(svg, ys);
   var max = Math.max.apply(null, [1].concat(ys));
   var step = w / (points.length - 1);
   var xy = points.map(function (p, i) { return [i * step, h - pad - (p.y / max) * (h - 2 * pad)]; });
@@ -45,7 +87,7 @@ export function drawChart(svgId, points, color) {
     '<defs><linearGradient id="' + gid + '" x1="0" y1="0" x2="0" y2="1">' +
     '<stop offset="0" stop-color="' + color + '" stop-opacity=".28"/>' +
     '<stop offset="1" stop-color="' + color + '" stop-opacity="0"/></linearGradient></defs>' +
-    '<line x1="0" y1="' + (h * 0.5) + '" x2="' + w + '" y2="' + (h * 0.5) + '" stroke="rgba(255,255,255,.05)"/>' +
+    '<line x1="0" y1="' + (h * 0.5) + '" x2="' + w + '" y2="' + (h * 0.5) + '" style="stroke:var(--line-faint)"/>' +
     '<polygon points="' + area + '" fill="url(#' + gid + ')"/>' +
     '<polyline points="' + line + '" fill="none" stroke="' + color + '" stroke-width="2" ' +
     'vector-effect="non-scaling-stroke" stroke-linecap="round" stroke-linejoin="round"/>' +
@@ -55,8 +97,9 @@ export function drawChart(svgId, points, color) {
 /** 3b. Vertical mini-histogram. `values` = number[]. opts: {median:boolean}. */
 export function drawBars(svgId, values, color, opts) {
   var svg = document.getElementById(svgId);
-  if (!svg || !values || !values.length) { if (svg) svg.innerHTML = ''; return; }
+  if (!svg || !values || !values.length) { if (svg) { svg.innerHTML = ''; describeChart(svg, []); } return; }
   opts = opts || {};
+  describeChart(svg, values);
   var w = W, h = H, pad = 4;
   var max = Math.max.apply(null, [1].concat(values));
   var n = values.length;
@@ -91,6 +134,13 @@ export function drawGauge(svgId, value01, opts) {
   if (!svg) return;
   opts = opts || {};
   var v = Math.max(0, Math.min(1, value01 || 0));
+  svg.removeAttribute('aria-hidden');
+  svg.setAttribute('role', 'img');
+  if (!svg.hasAttribute('aria-label') || svg.hasAttribute('data-auto-label')) {
+    svg.setAttribute('aria-label', (svg.getAttribute('data-label') || 'Gauge') + ': ' +
+      (opts.label != null ? String(opts.label) : Math.round(v * 100) + '%') + (opts.sub ? ' ' + opts.sub : ''));
+    svg.setAttribute('data-auto-label', '');
+  }
   var cx = W / 2, cy = H * 0.92, R = 58;
   var start = 135, sweep = 270;                  // 270° arc, bottom gap
   var col = opts.color || statusColor(v, opts.good, opts.warn);
@@ -121,8 +171,9 @@ export function drawGauge(svgId, value01, opts) {
 /** 3d. Overlaid sparklines. `series` = [{points:[{y}], color}]. opts: {normalize}. */
 export function drawMulti(svgId, series, opts) {
   var svg = document.getElementById(svgId);
-  if (!svg || !series || !series.length) { if (svg) svg.innerHTML = ''; return; }
+  if (!svg || !series || !series.length) { if (svg) { svg.innerHTML = ''; describeChart(svg, []); } return; }
   opts = opts || {};
+  describeChart(svg, (series[0].points || []).map(function (p) { return p.y; }));
   var w = W, h = H, pad = 6;
   var globalMax = 1;
   if (!opts.normalize) {
@@ -131,7 +182,7 @@ export function drawMulti(svgId, series, opts) {
     });
   }
   var grid = '<line x1="0" y1="' + (h * 0.5) + '" x2="' + w + '" y2="' + (h * 0.5) +
-    '" stroke="rgba(255,255,255,.05)"/>';
+    '" style="stroke:var(--line-faint)"/>';
   var paths = series.map(function (s) {
     var pts = s.points || [];
     if (pts.length < 2) return '';

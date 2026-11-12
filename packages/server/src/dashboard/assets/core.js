@@ -38,24 +38,99 @@ export function toast(msg, type) {
   setTimeout(function () { el.remove(); }, 3000);
 }
 
+// ── Auth + CSRF plumbing ────────────────────────────────────────────────────
+
+function metaContent(name) {
+  var m = document.querySelector('meta[name="' + name + '"]');
+  return m ? m.getAttribute('content') || '' : '';
+}
+var CSRF_TOKEN = metaContent('csrf-token');
+var OBSIDIAN_VAULT = metaContent('obsidian-vault');
+
+/** Session expired / not logged in → go to the login form (once). */
+var redirecting = false;
+export function redirectToLogin() {
+  if (redirecting) return;
+  redirecting = true;
+  toast('Session expired — redirecting to sign in…', 'error');
+  setTimeout(function () { window.location.assign('/login'); }, 600);
+}
+
+// Every same-origin state-changing fetch carries the CSRF token (security.ts).
+// Patched once here so all tab modules (old and new) are covered without
+// touching each call site. A 401 on any same-origin call means the session
+// expired → redirect to /login.
+(function patchFetch() {
+  var orig = window.fetch.bind(window);
+  window.fetch = function (input, init) {
+    init = init || {};
+    var method = String(init.method || (input && input.method) || 'GET').toUpperCase();
+    var url = typeof input === 'string' ? input : (input && input.url) || '';
+    var sameOrigin = url.charAt(0) === '/' || url.indexOf(window.location.origin) === 0;
+    if (sameOrigin && method !== 'GET' && method !== 'HEAD' && CSRF_TOKEN) {
+      var h = new Headers(init.headers || (typeof input !== 'string' && input && input.headers) || {});
+      if (!h.has('X-CSRF-Token')) h.set('X-CSRF-Token', CSRF_TOKEN);
+      init = Object.assign({}, init, { headers: h });
+    }
+    return orig(input, init).then(function (r) {
+      if (r.status === 401 && sameOrigin) redirectToLogin();
+      return r;
+    });
+  };
+})();
+
 /** POST JSON + toast on {ok}/{error} (matches legacy `window.postAction`). */
 export function postAction(url, body) {
-  fetch(url, {
+  return fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
   })
-    .then(function (r) { return r.json(); })
+    .then(function (r) { return r.json().catch(function () { return { error: 'HTTP ' + r.status }; }); })
     .then(function (d) {
       if (d.ok) toast('Action completed', 'success');
       else toast(d.error || 'Unknown error', 'error');
+      return d;
     })
     .catch(function (e) { toast('Request failed: ' + e.message, 'error'); });
 }
 
-/** GET + parse JSON. */
+/**
+ * Fetch + parse JSON. 401 → redirect to /login (and reject). Non-2xx with a
+ * JSON `{error}` body rejects with that message so callers can show it.
+ */
 export function fetchJson(url, opts) {
-  return fetch(url, opts).then(function (r) { return r.json(); });
+  return fetch(url, opts).then(function (r) {
+    if (r.status === 401) { redirectToLogin(); throw new Error('Not signed in'); }
+    return r.json().catch(function () { return {}; }).then(function (d) {
+      if (!r.ok) throw new Error((d && d.error) || ('HTTP ' + r.status));
+      return d;
+    });
+  });
+}
+
+/** POST JSON via fetchJson (CSRF header added by the fetch patch). */
+export function postJson(url, body) {
+  return fetchJson(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body || {}),
+  });
+}
+
+/** `obsidian://open` URL for a vault-relative note path ('' when unknown vault). */
+export function obsidianUrl(path) {
+  if (!OBSIDIAN_VAULT || !path) return '';
+  return 'obsidian://open?vault=' + encodeURIComponent(OBSIDIAN_VAULT) +
+    '&file=' + encodeURIComponent(String(path).replace(/\.md$/, ''));
+}
+
+/** Small "Open in Obsidian" anchor for a note path (empty string when unavailable). */
+export function obsidianLink(path, label) {
+  var u = obsidianUrl(path);
+  if (!u) return '';
+  return '<a class="obs-link" href="' + escAttr(u) + '" title="Open ' + escAttr(path) + ' in Obsidian">' +
+    esc(label || 'Open in Obsidian') + '<span class="sr-only"> (' + esc(path) + ')</span></a>';
 }
 
 /** Copy a log line to clipboard (matches legacy `window.copyLogLine`). */
@@ -99,7 +174,10 @@ export const ctx = {
   /** Latest GET /health JSON (null until the first poll succeeds). */
   get health() { return health; },
   $, esc, escAttr, on, fmt, charts,
-  toast, postAction, fetchJson, copyLogLine, setLive, switchTab,
+  toast, postAction, fetchJson, postJson, copyLogLine, setLive, switchTab,
+  obsidianUrl, obsidianLink, setRoute,
+  /** Sub-route of the active tab from the URL hash (`#tab/<rest>` → rest). */
+  get route() { return currentRest; },
 };
 
 // ── window.cortex action namespace ──────────────────────────────────────────
@@ -110,13 +188,98 @@ window.cortex = window.cortex || {};
 window.cortex.postAction = postAction;
 window.cortex.copyLogLine = copyLogLine;
 window.cortex.toast = toast;
-window.cortex.switchTab = switchTab;   // KPI deep-links / status pills call this
+window.cortex.switchTab = function (id) { switchTab(id); };   // KPI deep-links / status pills call this
 
-// ── Tab switching ───────────────────────────────────────────────────────────
+// ── CSP-safe action delegation ──────────────────────────────────────────────
+// Inline `onclick` handlers are blocked by the CSP (script-src 'self'), so
+// markup declares `data-cx-click="cortex.fn('a', true, this)"` and this single
+// delegated listener parses the call (string / number / boolean / null / {} /
+// `this` literals only — never eval) and invokes `window.cortex[fn]`.
 
-function switchTab(id) {
+export function parseCxCall(src) {
+  var m = /^\s*(?:window\.)?cortex\.([A-Za-z_$][\w$]*)\s*\(([\s\S]*)\)\s*;?\s*$/.exec(src || '');
+  if (!m) return null;
+  var args = [], s = m[2], i = 0;
+  function skip() { while (i < s.length && /[\s,]/.test(s[i])) i++; }
+  skip();
+  while (i < s.length) {
+    var c = s[i];
+    if (c === "'" || c === '"') {
+      var q = c, out = ''; i++;
+      while (i < s.length && s[i] !== q) {
+        if (s[i] === '\\' && i + 1 < s.length) { out += s[i + 1]; i += 2; } else { out += s[i++]; }
+      }
+      i++; args.push(out);
+    } else if (s.slice(i, i + 4) === 'this') { args.push({ $this: true }); i += 4; }
+    else if (s.slice(i, i + 4) === 'true') { args.push(true); i += 4; }
+    else if (s.slice(i, i + 5) === 'false') { args.push(false); i += 5; }
+    else if (s.slice(i, i + 4) === 'null') { args.push(null); i += 4; }
+    else if (c === '{') {
+      var depth = 0, j = i;
+      for (; j < s.length; j++) { if (s[j] === '{') depth++; else if (s[j] === '}' && --depth === 0) break; }
+      var lit = s.slice(i, j + 1); i = j + 1;
+      try { args.push(JSON.parse(lit)); } catch (_e) { args.push({}); }
+    } else {
+      var n = /^-?\d+(\.\d+)?/.exec(s.slice(i));
+      if (!n) return null;
+      args.push(Number(n[0])); i += n[0].length;
+    }
+    skip();
+  }
+  return { fn: m[1], args: args };
+}
+
+function wireDelegation() {
+  document.addEventListener('click', function (ev) {
+    var el = ev.target && ev.target.closest ? ev.target.closest('[data-cx-click]') : null;
+    if (!el) return;
+    var call = parseCxCall(el.getAttribute('data-cx-click'));
+    if (!call || typeof window.cortex[call.fn] !== 'function') return;
+    ev.preventDefault();
+    var args = call.args.map(function (a) { return a && a.$this ? el : a; });
+    window.cortex[call.fn].apply(null, args);
+  });
+}
+
+// ── Tab switching + hash routing ────────────────────────────────────────────
+// URL shape: `#<tab>` or `#<tab>/<rest>` (rest is tab-defined, e.g.
+// `#memories/Memories/fact/x.md`, `#lab/eval`). Tabs that care implement
+// `route(el, ctx, rest)`; switchTab keeps the hash in sync.
+
+var currentRest = '';
+var suppressHash = false;
+
+function parseHash() {
+  var raw = (window.location.hash || '').replace(/^#\/?/, '');
+  var h;
+  try { h = decodeURIComponent(raw); } catch (_e) { h = raw; }
+  var slash = h.indexOf('/');
+  return slash < 0 ? { tab: h, rest: '' } : { tab: h.slice(0, slash), rest: h.slice(slash + 1) };
+}
+
+function writeHash(tab, rest, replace) {
+  var next = '#' + tab + (rest ? '/' + rest.split('/').map(encodeURIComponent).join('/') : '');
+  if (window.location.hash === next) return;
+  suppressHash = true;
+  if (replace) history.replaceState(null, '', next);
+  else history.pushState(null, '', next);
+  setTimeout(function () { suppressHash = false; }, 0);
+}
+
+/** Update the sub-route of the active tab (pushes a history entry unless `replace`). */
+export function setRoute(rest, replace) {
+  currentRest = rest || '';
+  writeHash(activeTab, currentRest, replace);
+}
+
+function switchTab(id, opts) {
   if (!tabs.has(id) && !$('tab-' + id)) return;
+  opts = opts || {};
+  var changed = id !== activeTab;
   activeTab = id;
+  if (opts.rest !== undefined) currentRest = opts.rest;
+  else if (changed) currentRest = '';
+  if (!opts.fromHash) writeHash(id, currentRest, !!opts.replace);
   document.querySelectorAll('.tab-btn').forEach(function (b) {
     var on = b.getAttribute('data-tab') === id;
     b.classList.toggle('active', on);
@@ -124,6 +287,8 @@ function switchTab(id) {
     b.setAttribute('tabindex', on ? '0' : '-1');
     if (on) b.setAttribute('aria-current', 'page');
     else b.removeAttribute('aria-current');
+    // Keep the active tab visible in the horizontally scrolling bar (phones).
+    if (on && b.scrollIntoView) b.scrollIntoView({ block: 'nearest', inline: 'nearest' });
   });
   document.querySelectorAll('.tab-panel').forEach(function (p) {
     p.classList.toggle('active', p.id === 'tab-' + id);
@@ -131,7 +296,15 @@ function switchTab(id) {
   var mod = tabs.get(id);
   var el = $('tab-' + id);
   if (mod && el && !inited.has(id)) { if (mod.init) mod.init(el, ctx); inited.add(id); }
+  if (mod && el && mod.route) mod.route(el, ctx, currentRest);
   if (mod && el && mod.refresh) mod.refresh(el, ctx);
+}
+
+function onHashChange() {
+  if (suppressHash) return;
+  var r = parseHash();
+  if (!r.tab || (!tabs.has(r.tab) && !$('tab-' + r.tab))) return;
+  switchTab(r.tab, { rest: r.rest, fromHash: true });
 }
 
 function wireTabBar() {
@@ -195,7 +368,17 @@ function connectSse() {
   es = new EventSource('/dashboard/events');
   es.onmessage = function (ev) {
     try {
-      data = JSON.parse(ev.data);
+      var msg = JSON.parse(ev.data);
+      // Delta frames (sse.ts) carry only changed top-level sections; merge them
+      // into the last full payload and drop the keys listed in `_removed`.
+      if (msg && msg._delta) {
+        var next = Object.assign({}, data);
+        Object.keys(msg).forEach(function (k) { if (k !== '_delta' && k !== '_removed') next[k] = msg[k]; });
+        (msg._removed || []).forEach(function (k) { delete next[k]; });
+        data = next;
+      } else {
+        data = msg;
+      }
       lastUpdateTs = Date.now();
       document.body.removeAttribute('data-sse');
       var up = $('uptime');
@@ -253,10 +436,18 @@ function pollHealth() {
 /** Boot the dashboard: wire tab bar, start clock, connect SSE, poll /health, activate default tab. */
 export function boot() {
   wireTabBar();
+  wireDelegation();
+  window.addEventListener('hashchange', onHashChange);
+  window.addEventListener('popstate', onHashChange);
+  var initial = parseHash();
+  if (initial.tab && (tabs.has(initial.tab) || $('tab-' + initial.tab))) {
+    activeTab = initial.tab;
+    currentRest = initial.rest;
+  }
   startClock();
   on($('refreshBtn'), 'click', reconnect);
   connectSse();
   pollHealth();
   setInterval(pollHealth, HEALTH_POLL_MS);
-  switchTab(activeTab);
+  switchTab(activeTab, { rest: currentRest, replace: true });
 }

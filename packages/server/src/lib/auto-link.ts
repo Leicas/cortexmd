@@ -9,7 +9,8 @@
  *      `[[path]]` backlinks (the similarity signal was previously computed on
  *      every store and thrown away).
  *   3. seedEntityKg      — inline `mentions_*` + `co_mentioned` KG triples so the
- *      temporal graph grows on every write, not just on manual bootstrap.
+ *      temporal graph grows on every write, not just on manual bootstrap —
+ *      only from deliberate decision/fact/insight/preference/plan notes.
  *
  * Everything here is conservative + reversible and never throws: auto links are
  * clearly marked at the call sites (`## Related (auto)` / `## Entities (auto)`
@@ -24,6 +25,7 @@ import type { SimilarNote } from './similar-notes.js';
 import { getDocMeta } from './search.js';
 import { buildLinkLookup, resolveWikilink, type LinkLookup } from './link-resolver.js';
 import { replaceWikilinks } from './markdown.js';
+import { isDigestNote, isEmailNote, isLowValueLinkTarget, isMachineSource } from './vault-hygiene/patterns.js';
 
 type EntityType = 'person' | 'project' | 'organization';
 
@@ -127,13 +129,69 @@ export function repairWikilinks(body: string): string {
  * Turn the (already-computed) ranked similar notes into strippable `[[path]]`
  * backlinks, gated by a higher score floor than the advisory surface and capped.
  * Returns [] when the feature is disabled or nothing clears the floor.
+ *
+ * Never links TO low-value notes — weekly/series digests, email captures, hook
+ * echoes and low-importance machine auto-captures: a real note pointing at a
+ * marketing digest inflated the digest's centrality in recall and the graph.
  */
 export function selectAutoRelated(similar: SimilarNote[]): string[] {
   if (!config.autoLink || !config.autoLinkRelatedNotes) return [];
+  const max = Math.max(0, Math.min(AUTO_RELATED_HARD_CAP, config.autoLinkRelatedMax));
+  let dm: ReadonlyMap<string, { tags?: string[]; type?: string; title?: string; importance?: string; content?: string }> | undefined;
+  try { dm = getDocMeta(); } catch { dm = undefined; }
   return similar
     .filter((n) => n.score >= config.autoLinkRelatedMinScore)
-    .slice(0, config.autoLinkRelatedMax)
+    .filter((n) => !isLowValueTarget(n.path, n.title, dm?.get(n.path)))
+    .slice(0, max)
     .map((n) => `[[${n.path}]]`);
+}
+
+/** Absolute ceiling on `## Related (auto)` links per note, whatever the config says. */
+export const AUTO_RELATED_HARD_CAP = 5;
+
+function isLowValueTarget(
+  path: string,
+  title: string,
+  meta: { tags?: string[]; type?: string; title?: string; importance?: string; content?: string } | undefined,
+): boolean {
+  return isLowValueLinkTarget({
+    path,
+    title: meta?.title ?? title,
+    type: meta?.type,
+    tags: meta?.tags ?? [],
+    importance: meta?.importance,
+    // Index content carries no frontmatter; the body is enough for the echo rules.
+    content: meta?.content?.slice(0, 500),
+  });
+}
+
+/**
+ * Whether a note may seed `mentions_*` / `co_mentioned` KG triples. Email
+ * captures, digests and machine auto-captures never do (they produced 98% of
+ * the graph as sender/subject co-mention noise); deliberate notes whose
+ * category is in config.autoSeedKgCategories (decision/fact/insight/
+ * preference/plan by default) do, as do curated uncategorised notes outside
+ * Memories/. Category comes from `meta`, the index, or the
+ * `Memories/<category>/` path segment.
+ */
+export function maySeedKg(
+  notePath: string,
+  meta?: { category?: string; tags?: readonly string[]; source?: string; type?: string },
+): boolean {
+  let indexed: { category?: string; tags?: string[]; type?: string; title?: string } | undefined;
+  try { indexed = getDocMeta().get(notePath); } catch { indexed = undefined; }
+  const tags = [...(meta?.tags ?? []), ...(indexed?.tags ?? [])].map(String);
+  const note = { path: notePath, type: meta?.type ?? indexed?.type, tags, source: meta?.source, title: indexed?.title };
+  if (isEmailNote(note) || isDigestNote(note)) return false;
+  if (tags.includes('auto-capture')) return false;
+  if (meta?.source && isMachineSource(meta.source, config.machineCaptureSourcePatterns)) return false;
+  const category = meta?.category
+    ?? indexed?.category
+    ?? /^Memories\/([^/]+)\//.exec(notePath)?.[1];
+  // A curated non-memory note (project page, CRM entity, how-to — written via
+  // notes_upsert, no category) is deliberate content: it keeps seeding.
+  if (!category) return !/^Memories\//i.test(notePath);
+  return (config.autoSeedKgCategories ?? []).includes(category);
 }
 
 // Cap pairwise co-occurrence so a note naming many entities doesn't emit an
@@ -145,14 +203,17 @@ const CO_OCCURRENCE_ENTITY_CAP = 8;
  *   subject = note title, predicate = mentions_{person,org,project}, object = entity
  * plus pairwise `co_mentioned` edges between entities that appear together.
  * kgAddTriple is an md5 upsert (idempotent). Config-gated; never throws.
+ * Only decision/fact/insight/preference/plan notes seed (see maySeedKg).
  */
 export function seedEntityKg(
   noteTitle: string,
   entities: DetectedEntity[],
   notePath: string,
+  meta?: { category?: string; tags?: readonly string[]; source?: string; type?: string },
 ): void {
   if (!config.autoLink || !config.autoSeedKg || !config.kgEnabled) return;
   if (entities.length === 0 || !isKgInitialized()) return;
+  if (!maySeedKg(notePath, meta)) return;
   const source = `autolink:store:${notePath}`;
   try {
     for (const e of entities) {

@@ -163,6 +163,75 @@ export function buildRecallGraph(input: BuildRecallGraphInput): RecallGraph {
   return { adj, degree, noteNodes };
 }
 
+/**
+ * Transition matrix in CSR form over integer node ids: node `i`'s out-edges
+ * are `targets[offsets[i] .. offsets[i+1])` with probabilities `probs[...]`
+ * (each row sums to 1; a dangling node has an empty row).
+ */
+interface Transitions {
+  ids: string[];
+  indexOf: Map<string, number>;
+  isNote: Uint8Array;
+  offsets: Int32Array;
+  targets: Int32Array;
+  probs: Float64Array;
+}
+
+// Transitions depend only on the (immutable) graph and the specificity flag, so
+// they are memoised per graph object: a caller that reuses a graph across
+// queries (lib/search.ts caches it per index version) pays the O(E)
+// normalisation once instead of on every query.
+const transitionCache = new WeakMap<RecallGraph, { spec?: Transitions; plain?: Transitions }>();
+
+/**
+ * Row-normalised, specificity-weighted transition matrix. With `useSpec` the
+ * weight of edge (u→v) is `w(u,v) · log(1 + N / (1 + deg(v)))` (graph-IDF).
+ */
+function transitionsFor(graph: RecallGraph, useSpec: boolean): Transitions {
+  let slot = transitionCache.get(graph);
+  if (!slot) { slot = {}; transitionCache.set(graph, slot); }
+  const cached = useSpec ? slot.spec : slot.plain;
+  if (cached) return cached;
+
+  const { adj, degree, noteNodes } = graph;
+  const N = adj.size;
+  const ids = [...adj.keys()];
+  const indexOf = new Map<string, number>();
+  ids.forEach((id, i) => indexOf.set(id, i));
+  const isNote = new Uint8Array(N);
+  const spec = new Float64Array(N);
+  let edgeCount = 0;
+  ids.forEach((id, i) => {
+    if (noteNodes.has(id)) isNote[i] = 1;
+    spec[i] = useSpec ? Math.log(1 + N / (1 + (degree.get(id) ?? 0))) : 1;
+    edgeCount += adj.get(id)!.size;
+  });
+
+  const offsets = new Int32Array(N + 1);
+  const targets = new Int32Array(edgeCount);
+  const probs = new Float64Array(edgeCount);
+  let k = 0;
+  ids.forEach((id, i) => {
+    offsets[i] = k;
+    const start = k;
+    let total = 0;
+    for (const [v, w] of adj.get(id)!) {
+      const j = indexOf.get(v);
+      if (j === undefined) continue;
+      const tw = w * spec[j];
+      if (tw > 0) { targets[k] = j; probs[k] = tw; total += tw; k++; }
+    }
+    // Dangling nodes (no positive out-transitions) contribute no push mass;
+    // their rank leaks to restart via the alpha·p term, which is correct.
+    for (let e = start; e < k; e++) probs[e] /= total;
+  });
+  offsets[N] = k;
+
+  const trans: Transitions = { ids, indexOf, isNote, offsets, targets, probs };
+  if (useSpec) slot.spec = trans; else slot.plain = trans;
+  return trans;
+}
+
 export interface RunPPROptions {
   alpha?: number;           // restart probability (default 0.15)
   maxIters?: number;        // default 30
@@ -177,13 +246,16 @@ export interface RunPPROptions {
  * `seeds` are node ids (note paths and/or `entity:` ids) that form the
  * personalization vector `p` (uniform over seeds). Returns note-path nodes
  * only, best-first, as `{ path, score }` — the same shape `searchSemantic`
- * returns, so it drops straight into the RRF fusion loop.
+ * returns, so it drops straight into the fusion loop.
  *
  * With `nodeSpecificity: true` (default) the transition weight of edge (u→v) is
  * `w(u,v) · spec(v)` where `spec(v) = log(1 + N / (1 + deg(v)))` — a graph-IDF
  * that down-weights hub destinations so a person mentioned in 200 notes does
  * not dominate the walk. Setting it false is the ablation the acceptance check
  * uses to prove the term is load-bearing.
+ *
+ * The iteration runs over typed arrays (CSR transitions cached per graph), so a
+ * query costs O(iterations × edges) with no per-iteration allocation.
  */
 export function runPPR(
   graph: RecallGraph,
@@ -195,76 +267,50 @@ export function runPPR(
   const tol = opts.tol ?? DEFAULT_TOL;
   const useSpec = opts.nodeSpecificity ?? true;
 
-  const { adj, degree, noteNodes } = graph;
-  const N = adj.size;
+  const N = graph.adj.size;
 
   // No seeds (or seeds not in graph) => empty result; fusion is unaffected.
-  const seedSet = seeds.filter((s) => adj.has(s));
+  const seedSet = [...new Set(seeds.filter((s) => graph.adj.has(s)))];
   if (N === 0 || seedSet.length === 0) return [];
 
-  // Node specificity (graph-IDF). Precompute per destination node.
-  const spec = (node: string): number => {
-    if (!useSpec) return 1;
-    const deg = degree.get(node) ?? 0;
-    return Math.log(1 + N / (1 + deg));
-  };
-
-  // Build the column-normalized specificity-weighted transition matrix as
-  // per-source out-edge lists: for source u, transitions to v with normalized
-  // probability. We store it as source -> Array<[v, prob]>.
-  const trans = new Map<string, Array<[string, number]>>();
-  for (const [u, nbrs] of adj) {
-    let total = 0;
-    const weighted: Array<[string, number]> = [];
-    for (const [v, w] of nbrs) {
-      const tw = w * spec(v);
-      if (tw > 0) { weighted.push([v, tw]); total += tw; }
-    }
-    if (total > 0) {
-      for (const pair of weighted) pair[1] /= total;
-      trans.set(u, weighted);
-    }
-    // Dangling nodes (no positive out-transitions) contribute no push mass;
-    // their rank leaks to restart via the alpha·p term, which is correct.
-  }
+  const { ids, indexOf, isNote, offsets, targets, probs } = transitionsFor(graph, useSpec);
 
   // Personalization vector: uniform over seeds.
-  const p = new Map<string, number>();
+  const p = new Float64Array(N);
   const seedMass = 1 / seedSet.length;
-  for (const s of seedSet) p.set(s, seedMass);
+  for (const s of seedSet) p[indexOf.get(s)!] = seedMass;
 
   // Rank vector, initialized to p.
-  let r = new Map<string, number>(p);
+  let r = Float64Array.from(p);
+  let next = new Float64Array(N);
 
   for (let iter = 0; iter < maxIters; iter++) {
-    const next = new Map<string, number>();
     // restart term: alpha * p
-    for (const [node, pv] of p) next.set(node, alpha * pv);
-    // push term: (1 - alpha) * Mᵀ · r  — push each node's mass along its out-edges
-    for (const [u, ru] of r) {
+    for (let i = 0; i < N; i++) next[i] = alpha * p[i];
+    // push term: (1 - alpha) * Mᵀ · r — push each node's mass along its out-edges
+    for (let u = 0; u < N; u++) {
+      const ru = r[u];
       if (ru === 0) continue;
-      const outs = trans.get(u);
-      if (!outs) continue; // dangling: mass drops (recaptured by restart next iter)
       const contrib = (1 - alpha) * ru;
-      for (const [v, prob] of outs) {
-        next.set(v, (next.get(v) ?? 0) + contrib * prob);
+      for (let e = offsets[u], end = offsets[u + 1]; e < end; e++) {
+        next[targets[e]] += contrib * probs[e];
       }
     }
 
     // L1 convergence check
     let l1 = 0;
-    const keys = new Set<string>([...r.keys(), ...next.keys()]);
-    for (const k of keys) l1 += Math.abs((next.get(k) ?? 0) - (r.get(k) ?? 0));
+    for (let i = 0; i < N; i++) l1 += Math.abs(next[i] - r[i]);
+    const tmp = r;
     r = next;
+    next = tmp;
     if (l1 < tol) break;
   }
 
   // Keep note-path nodes only (entity nodes are routers, never results).
   const out: Array<{ path: string; score: number }> = [];
-  for (const [node, score] of r) {
-    if (score <= 0) continue;
-    if (!noteNodes.has(node)) continue;
-    out.push({ path: node, score });
+  for (let i = 0; i < N; i++) {
+    if (r[i] <= 0 || !isNote[i]) continue;
+    out.push({ path: ids[i], score: r[i] });
   }
   out.sort((a, b) => b.score - a.score || (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
 

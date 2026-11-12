@@ -99,37 +99,61 @@ cortexmd/
 
 The project is **polyglot**: two toolchains (TS + Rust) glued by CI, kept honest by `contract/`.
 
-## Quick start (local-stdio)
+## Quick start
 
-This is the recommended path for individual use: zero config, no auth, no
-network, no Docker, no sync.
+Two ways to run it. Pick **A** for one machine and one client with nothing else to set up;
+pick **B** to get the hooks (wakeup recap injected at session start, recall on every prompt,
+diary on stop), several clients/machines on one brain, and the `cortexmd` CLI features.
 
-```sh
-# 1. build the server (Node 22)
-cd packages/server && npm ci && npm run build
+### A. Local stdio — no HTTP, no auth (4 steps)
 
-# 2. run it over stdio, reading one of your vaults read-only.
-#    BRAIN_VAULT defaults to a per-user data dir if omitted
-#    (~/.local/share/cortexmd/brain, %LOCALAPPDATA%\cortexmd\brain on Windows).
-BRAIN_VAULT=~/.local/share/cortexmd/brain \
-SOURCE_VAULTS=/path/to/your/vault \
-node dist/index.js --stdio
-```
+Prerequisites: Node 22, an MCP client that runs stdio servers.
 
-Register it with your MCP client (Claude Code / Cursor / Codex) as an **stdio**
-server pointing at that command. Tools appear under `mcp__cortexmd__*`.
+1. Build the server: `cd packages/server && npm ci && npm run build`
+2. Pick the vault paths. `BRAIN_VAULT` (written by cortexmd) defaults to a per-user data
+   dir (`~/.local/share/cortexmd/brain`, `%LOCALAPPDATA%\cortexmd\brain` on Windows);
+   `SOURCE_VAULTS` are read-only.
+3. Register the server with your client as a stdio command, e.g. Claude Code:
+   ```sh
+   claude mcp add --scope user cortexmd \
+     -e BRAIN_VAULT=~/.local/share/cortexmd/brain -e SOURCE_VAULTS=/path/to/your/vault \
+     -- node /abs/path/to/cortexmd/packages/server/dist/index.js --stdio
+   ```
+   (Codex: `command = "node"`, `args = [".../dist/index.js", "--stdio"]` under
+   `[mcp_servers.cortexmd]`; Cursor / Gemini CLI: the same in `mcpServers`.)
+4. Restart the client. Tools appear under `mcp__cortexmd__*`.
 
-Then index a repo for code-nav with the Rust CLI:
+No hooks in this mode: the agent follows the protocol from the server's MCP
+`instructions`. The `cortexmd` CLI (hooks, `init`, `status`, repo indexing from the shell)
+talks to an HTTP server, so it needs mode B; index repos from the agent with the
+`code_index_repo` tool instead. Walkthrough: [`docs/deploy-local.md`](./docs/deploy-local.md).
 
-```sh
-cd crates/cli && cargo build --release
-./target/release/cortexmd /path/to/some/repo      # index a repo
-./target/release/cortexmd scan /path/to/dev-root  # walk + index every git repo
-./target/release/cortexmd --help
-```
+### B. HTTP server + `cortexmd init` (per machine: 2 steps once the server runs)
 
-Full walkthrough — install, source-vault `name=path:globs` syntax, optional
-features — in [`docs/deploy-local.md`](./docs/deploy-local.md).
+Prerequisites: a cortexmd HTTP server ([Advanced: self-hosted HTTP](#advanced-self-hosted-http),
+[`docs/deploy-http.md`](./docs/deploy-http.md)); Rust (to build the CLI); Node ≥ 18 on `PATH`
+for the hook scripts.
+
+1. Install the CLI: `cargo install --path crates/cli` (puts `cortexmd` on `PATH`).
+2. Run `init` for your client — it logs the CLI in when needed (OAuth in the browser),
+   installs instructions + hooks, registers the MCP server reusing that login, and prints
+   what it did plus the one step left, if any:
+
+   | Client | Command | Then |
+   |---|---|---|
+   | Claude Code | `cortexmd init -g --server https://your-server` | restart Claude Code |
+   | Codex | `cortexmd init --client codex --server https://your-server` | restart Codex (hooks skipped on Windows) |
+   | Cursor | `cortexmd init --client cursor --server https://your-server` (inside the repo) | restart Cursor |
+   | Gemini CLI | `cortexmd init --client gemini --server https://your-server` | restart Gemini CLI |
+
+   `--server` is only needed the first time on a machine. Claude Code gets an HTTP entry
+   whose `headersHelper` is `cortexmd auth header` (no second login via `/mcp`); the other
+   clients get the stdio bridge `cortexmd mcp`. Re-running is safe: nothing is duplicated,
+   and an existing registration of the same server under another name is kept.
+
+Check the install with `cortexmd status` (server, repos, savings, local hook latency p50/p95).
+Index code for code-nav: `cortexmd /path/to/repo` or `cortexmd scan /path/to/dev-root`.
+Per-client details and limits: [`docs/integrations.md`](./docs/integrations.md).
 
 ### Optional features
 

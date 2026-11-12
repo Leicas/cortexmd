@@ -21,6 +21,50 @@ The same text lives in `CORTEXMD.md` (written by `cortexmd init`), the plugin's
 `SKILL.md`, the MCP `instructions` field the server sends at `initialize`, and
 `templates/codex/AGENTS.md`. Hook-level details: [`hooks.md`](./hooks.md).
 
+## Quick start per client
+
+**Prerequisites (every client):** a running cortexmd server you can reach
+(`http://localhost:3000` locally — [`deploy-local.md`](./deploy-local.md) — or an HTTPS
+deployment with OAuth/`API_KEY` — [`deploy-http.md`](./deploy-http.md)); the `cortexmd`
+binary on `PATH` (`cargo install --path crates/cli`); Node ≥ 18 on `PATH` for the hook
+scripts (Claude Code, and Codex on macOS/Linux).
+
+**Claude Code** — 2 steps:
+
+1. `cortexmd init -g --server https://your-server` — logs the CLI in (OAuth in the browser,
+   skipped when already logged in), writes `CORTEXMD.md` + hooks, and registers the MCP
+   server at user scope with `headersHelper: "cortexmd auth header"`, so Claude Code reuses
+   the CLI token (no `/mcp` login). One y/N prompt before patching `settings.json`
+   (`--auto-patch` skips it); the summary names the remaining step, if any.
+2. Restart Claude Code. Check with `cortexmd status`.
+
+**Codex** — 2 steps:
+
+1. `cortexmd init --client codex --server https://your-server` (`--server` only needed
+   the first time) — merges `[mcp_servers.cortexmd]` (stdio bridge `cortexmd mcp`, lean
+   `enabled_tools`) into `~/.codex/config.toml`, writes the AGENTS.md block, and on
+   macOS/Linux installs the hooks (`~/.codex/hooks.json`, `[features] hooks = true`). On
+   Windows hooks are skipped (Codex has none there).
+2. Restart Codex.
+
+**Cursor** — 2 steps (+ optional hooks):
+
+1. In each repo: `cortexmd init --client cursor [--server URL]` — registers the stdio bridge
+   in `~/.cursor/mcp.json` and writes `.cursor/rules/cortexmd.mdc`.
+2. Restart Cursor. Hooks are manual: `templates/cursor/hooks.json` + `adapt-output.mjs`.
+
+**Gemini CLI** — 2 steps (+ optional hooks snippet in the Gemini section):
+
+1. `cortexmd init --client gemini [--server URL]` — registers the stdio bridge in
+   `~/.gemini/settings.json` and the instruction block in `~/.gemini/GEMINI.md`.
+2. Restart Gemini CLI.
+
+**No HTTP server at all (single machine):** register the server itself as a stdio MCP
+server — `node packages/server/dist/index.js --stdio` (see
+[`deploy-local.md`](./deploy-local.md)). No auth, no network; the hooks and the `cortexmd`
+commands that call the REST API (`recall`, `wakeup`, `status`, indexing) need the HTTP
+server.
+
 ## Shared conventions
 
 | Convention | Value | Why |
@@ -28,20 +72,29 @@ The same text lives in `CORTEXMD.md` (written by `cortexmd init`), the plugin's
 | `agentName` | `"<client> (<hostname>)"` — `Claude Code (Ao)`, `Codex (Ao)`, `Cursor (Ao)`; `"ChatGPT"` / `"Claude.ai"` where there is no machine | Diaries are per machine (`Ops/Agent Diaries/<agentName>/YYYY-MM-DD.md`); the same name must be used for `memory_wakeup` and `agent_diary_append`. |
 | `CORTEXMD_AGENT_CLIENT` | env var read by the hook scripts (`_mcp_rest.mjs` → `diaryAgentName()`), default `Claude Code` | Lets Codex/Cursor reuse the Claude Code hook scripts unchanged with their own diary name. |
 | `source` | `hook:Stop`, `hook:PreCompact`, `codex`, `cursor`, `chatgpt`, `claude.ai` | Rendered as `_via <source>_` in the diary line. |
-| Server URL | `http://localhost:3000` (stdio build: `cortexmd mcp`) | HTTP deployments need `PUBLIC_URL` + OAuth or `API_KEY` — [`deploy-http.md`](./deploy-http.md). |
+| Server URL | `http://localhost:3000`; stdio clients use the bridge `cortexmd mcp` (forwards to `<server>/mcp` with the CLI token); local no-HTTP: `node dist/index.js --stdio` | HTTP deployments need `PUBLIC_URL` + OAuth or `API_KEY` — [`deploy-http.md`](./deploy-http.md). |
 | Hook scripts | `crates/cli/hooks/*.mjs` (Node ≥ 18, built-ins only); installed to `~/.claude/hooks/cortexmd/` by `cortexmd init -g`, shipped as `plugin/cortexmd/scripts/hooks/` by the plugin | Any client with a command-hook mechanism can run them; they read Claude Code's event JSON and emit `{}` on any error. |
 
 ---
 
 ## Claude Code — via `cortexmd init`
 
-- **Install**: `cortexmd init -g` (user-global) or `cortexmd init` (project). Writes
-  `CORTEXMD.md`, references it from `CLAUDE.md` (`@CORTEXMD.md`), drops the hook scripts
-  and patches `settings.json` with the nine canonical entries. Legacy
-  `OBSIDIAN-MCP.md` / `@OBSIDIAN-MCP.md` references are removed with a `.bak` copy.
-- **Where**: `~/.claude/` or `<repo>/.claude/`. `cortexmd init --show` prints the state.
-- **Diary name**: `Claude Code (<hostname>)` (automatic).
+- **Install**: `cortexmd init -g [--server URL]` (user-global) or `cortexmd init`
+  (project). Writes `CORTEXMD.md`, references it from `CLAUDE.md` (`@CORTEXMD.md`), drops
+  the hook scripts, patches `settings.json` with the nine canonical entries, and registers
+  the MCP server (user scope, `claude mcp add-json`, else `~/.claude.json`) with
+  `headersHelper: "cortexmd auth header"` — Claude Code reuses the CLI token, no second
+  OAuth. Skips registration when any entry already points at the same URL; warns when the
+  plugin or a claude.ai connector looks like the same server (tools listed twice).
+  `--no-mcp` skips registration. Legacy `OBSIDIAN-MCP.md` / `@OBSIDIAN-MCP.md` references
+  are removed with a `.bak` copy.
+- **Where**: `~/.claude/` or `<repo>/.claude/`; MCP entry in `~/.claude.json`.
+  `cortexmd init --show` prints the hook state.
+- **Diary name**: `Claude Code (<hostname>)` (automatic). The SessionStart hook injects the
+  `memory_wakeup` recap directly.
 - **Limits**: hooks need `cortexmd` and `node` on PATH. Do not combine with the plugin.
+  `headersHelper` needs a Claude Code build that supports it; if the server shows
+  "needs authentication", run `/mcp` → Authenticate once (Claude's own OAuth).
 - **Docs**: [`hooks.md`](./hooks.md); Claude Code hooks reference
   https://code.claude.com/docs/en/hooks (events, `additionalContext`, `decision: block`,
   `async`, exec form).
@@ -64,21 +117,30 @@ The same text lives in `CORTEXMD.md` (written by `cortexmd init`), the plugin's
 
 ## OpenAI Codex (CLI + IDE extension)
 
-- **Templates**: [`templates/codex/AGENTS.md`](../templates/codex/AGENTS.md) (the five
+- **Install**: `cortexmd init --client codex` (honours `CODEX_HOME`). Idempotent: an
+  existing `[mcp_servers.*]` table pointing at the same URL, or any `cortexmd mcp` entry,
+  is left alone; comments and other tables survive (format-preserving `toml_edit`); the
+  AGENTS.md block is replaced in place between `<!-- cortexmd:start/end -->` markers;
+  backups `*.bak-cortexmd-<ts>`.
+- **Templates** (what `init` writes; copy by hand if you prefer):
+  [`templates/codex/AGENTS.md`](../templates/codex/AGENTS.md) (the five
   rules, `agentName="Codex (<hostname>)"`, `cat/grep/sed` → `code_*`),
   [`templates/codex/config.toml`](../templates/codex/config.toml) (`[mcp_servers.cortexmd]`
-  with `startup_timeout_sec`, `tool_timeout_sec`, `required = false`, optional
-  `enabled_tools`; `[features] hooks = true`),
+  = `command = "cortexmd"`, `args = ["mcp"]`, `startup_timeout_sec`, `tool_timeout_sec`,
+  lean `enabled_tools`; HTTP `url` + `codex mcp login` and `node dist/index.js --stdio`
+  alternatives in comments; `[features] hooks = true`),
   [`templates/codex/hooks.json`](../templates/codex/hooks.json) (experimental hooks:
   SessionStart ×2, UserPromptSubmit with `additionalContextLimit: 2500`, PreToolUse/
   PostToolUse on `^Bash$`, Stop).
-- **Where**: append the AGENTS block to `~/.codex/AGENTS.md` or `<repo>/AGENTS.md`; merge
-  the TOML into `~/.codex/config.toml`; copy `hooks.json` to `~/.codex/hooks.json`.
+- **Where**: `~/.codex/AGENTS.md`, `~/.codex/config.toml`, `~/.codex/hooks.json` +
+  scripts in `~/.codex/hooks/cortexmd/` (`init` writes absolute paths; the template file
+  points at `~/.claude/hooks/cortexmd/`).
 - **Diary name**: `Codex (<hostname>)` — the hook commands set `CORTEXMD_AGENT_CLIENT=Codex`.
 - **Limits**: hooks are behind a feature flag, **not available on Windows**, and have no
   PreCompact; `notify` is a post-turn notification, not a hook. Verify the shell-tool
-  matcher name (`Bash` vs `shell`) on your build. `cortexmd init --client codex` is backlog
-  (B3): copy the files by hand for now.
+  matcher name (`Bash` vs `shell`) on your build; `init` writes `^Bash$` and omits the
+  template's `additionalContextLimit`. `enabled_tools` hides everything else from Codex —
+  reach it with `tool_search` + `tool_invoke`, or delete the key.
 - **Docs**: https://developers.openai.com/codex/config-reference ·
   https://developers.openai.com/codex/mcp · https://developers.openai.com/codex/agents-md ·
   https://developers.openai.com/codex/hooks (and `docs/hooks.md` / `docs/config.md` in
@@ -86,6 +148,10 @@ The same text lives in `CORTEXMD.md` (written by `cortexmd init`), the plugin's
 
 ## Cursor
 
+- **Install**: `cortexmd init --client cursor` inside a repo registers
+  `{"command":"cortexmd","args":["mcp"]}` in `~/.cursor/mcp.json` and writes
+  `.cursor/rules/cortexmd.mdc`; with `-g` only the MCP entry (Cursor's User Rules are not a
+  file — paste the rule body). Hooks stay manual (below).
 - **Templates**: [`templates/cursor/cortexmd.mdc`](../templates/cursor/cortexmd.mdc)
   (`alwaysApply: true` rule, `agentName="Cursor (<hostname>)"`),
   [`templates/cursor/hooks.json`](../templates/cursor/hooks.json) (`version: 1`;
@@ -95,7 +161,8 @@ The same text lives in `CORTEXMD.md` (written by `cortexmd init`), the plugin's
   `decision: block` → `followup_message`, maps `workspace_roots[0]` → `cwd`).
 - **Where**: `.cursor/rules/cortexmd.mdc` (project) or User Rules; `~/.cursor/hooks.json`
   or `<repo>/.cursor/hooks.json`; the wrapper in `~/.cursor/hooks/cortexmd/`; MCP server in
-  `.cursor/mcp.json` (`{"mcpServers":{"cortexmd":{"url":"http://localhost:3000/mcp"}}}`).
+  `~/.cursor/mcp.json` (stdio bridge as above, or `{"url":"http://localhost:3000/mcp"}` with
+  Cursor's own OAuth).
 - **Diary name**: `Cursor (<hostname>)` — set by the wrapper (`CORTEXMD_AGENT_CLIENT=Cursor`).
 - **Limits**: Cursor hooks cannot block the agent the way Claude Code's Stop does; the
   diary nudge is a `followup_message` every 5th stop. Only `sessionStart` is documented to
@@ -119,8 +186,10 @@ and **timeouts are in milliseconds**. The cortexmd scripts run unchanged:
   "command": "node \"$HOME/.claude/hooks/cortexmd/userprompt_hook.mjs\"", "timeout": 8000 } ] } ] } }
 ```
 
-Register the MCP server under `"mcpServers"` in the same file (`"cortexmd": { "httpUrl":
-"http://localhost:3000/mcp" }`). A `cortexmd init --client gemini` is backlog B3. Docs:
+`cortexmd init --client gemini` registers the MCP server under `"mcpServers"` in the same
+file as the stdio bridge (`"cortexmd": { "command": "cortexmd", "args": ["mcp"] }`; HTTP
+alternative `"httpUrl": "http://localhost:3000/mcp"`) and writes the instruction block to
+`~/.gemini/GEMINI.md`. The hooks above are not written automatically. Docs:
 https://geminicli.com/docs/hooks/ · https://geminicli.com/docs/tools/mcp-server/.
 
 ## ChatGPT
@@ -137,9 +206,19 @@ https://geminicli.com/docs/hooks/ · https://geminicli.com/docs/tools/mcp-server
 - **Where**: Custom GPT → Configure → Instructions / Actions; connector → Settings →
   Connectors (developer mode); API → your agent code.
 - **Diary name**: `"ChatGPT"` (connector) / none (Custom GPT: no diary route over REST).
-- **Limits**: standard ChatGPT connectors only use `search`/`fetch` tools (backlog B4);
-  developer mode is a beta that exposes the full tool list. GPT Actions need HTTPS and a
-  static `API_KEY`; the OAuth stack is for MCP clients.
+- **`search` / `fetch` (connectors, deep research)**: start the server with
+  `TOOL_PROFILE=chatgpt` (the default `standard` tools plus `search` and `fetch`), or set
+  `CHATGPT_SEARCH_FETCH=true` to add the pair to any profile. `search(query)` runs the same
+  ranking as `memory_recall` over memories and notes and returns
+  `{"results":[{"id","title","url"}]}`. The `id` is the vault path and the `url` is an
+  `obsidian://open?vault=…&file=…` link. `fetch(id)` returns
+  `{"id","title","text","url","metadata"}` with the note's full markdown. Both are
+  read-only. They are not registered under other profiles, so other clients do not see
+  two extra generic tool names.
+- **Limits**: standard ChatGPT connectors and deep research only call `search`/`fetch`.
+  Developer mode exposes every tool `tools/list` advertises. Under `standard`/`chatgpt`,
+  other tools are reachable through `tool_search` + `tool_invoke`. GPT Actions need HTTPS
+  and a static `API_KEY`; the OAuth stack is for MCP clients.
 - **Docs**: https://platform.openai.com/docs/mcp ·
   https://platform.openai.com/docs/guides/tools-connectors-mcp ·
   https://platform.openai.com/docs/actions/introduction ·
@@ -197,6 +276,6 @@ https://platform.claude.com/docs/en/agent-sdk/mcp.
 
 | Id | Item |
 |---|---|
-| B1 | `cortexmd wakeup --hook` + `/api/wakeup`: inject the diary recap directly at SessionStart instead of a directive. |
-| B3 | `cortexmd init --client codex\|cursor\|gemini\|agents-md` writing these templates in place. |
+| B1 | Server route `POST /api/wakeup` (`{agentName, preset, project, machine}` → `{text}`): `cortexmd wakeup` already tries it first and falls back to MCP `memory_wakeup` (3 round-trips) on 404. |
+| B3 | Hooks for `--client cursor\|gemini` (output adapters), `--client agents-md`, and `--show`/`--uninstall` for non-Claude clients. |
 | B4 | `search` / `fetch` tools for standard ChatGPT connectors and deep research. |

@@ -607,6 +607,17 @@ pub fn cmd_logout(yes: bool) -> Result<()> {
     Ok(())
 }
 
+/// `auth header` handler: `{"Authorization":"Bearer <token>"}` on stdout.
+/// Claude Code runs it as the MCP server's `headersHelper` (on connect), so
+/// the bearer is always the CLI's current token — OAuth refreshes included.
+pub fn cmd_header(server: Option<&str>, api_key: Option<&str>) -> Result<()> {
+    let creds = resolve_creds(server, api_key)?
+        .ok_or_else(|| anyhow!("{}", no_creds_message()))?;
+    let out = serde_json::json!({ "Authorization": format!("Bearer {}", creds.api_key) });
+    println!("{}", out);
+    Ok(())
+}
+
 /// `auth import-from-claude` handler.
 pub fn cmd_import_from_claude(name: Option<&str>, yes: bool) -> Result<()> {
     let disc = auto_discover_from_claude(name)?

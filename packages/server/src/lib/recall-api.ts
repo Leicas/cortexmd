@@ -12,13 +12,25 @@
  *   - `seen`     → paths already injected this session are dropped BEFORE
  *                  selection, so repeats never crowd out fresh context
  *   - `minImportance` → lets a hook skip `low` exhaust entirely
+ *   - `memoryKinds` / `includeEpisodic` → the memory-kind scope of the
+ *                  `memories` list (same rule as the tool's kinds /
+ *                  includeEpisodic: semantic + procedural first, episodic as
+ *                  the low-priority tier)
+ *   - time words in the query ("last week", "latest") → date filter /
+ *                  recency preference, exactly as in the tool; `time` in the
+ *                  response says what was applied. `timeAware: false` turns
+ *                  the parsing off for the call.
  *
  * The handler in index.ts only validates transport concerns, calls
  * recallForHook and `res.json`s the result; `markActivity()` stays there.
  */
 import { hybridSearch, getDocMeta } from './search.js';
 import { projectSlug } from './journal.js';
-import { rescoreRecall, touchRecalledMemories, IMPORTANCE_ORDER } from './memory.js';
+import {
+  rescoreRecall, touchRecalledMemories, searchRecallPool, planRecallTime, IMPORTANCE_ORDER,
+  type RecallTimeInfo, type RescoredResult,
+} from './memory.js';
+import { isMemoryKind, type MemoryKind } from './memory-kind.js';
 import { config } from '../config.js';
 
 export type RecallKinds = 'memory' | 'notes' | 'both';
@@ -36,6 +48,12 @@ export interface RecallBody {
   minImportance?: RecallImportance;
   /** Vault paths already shown this session — excluded from both lists. */
   seen?: string[];
+  /** Memory kinds for the `memories` list (strict). Default: semantic + procedural first, episodic low priority. */
+  memoryKinds?: MemoryKind[];
+  /** true: episodic memories at full weight. false: never. Ignored when memoryKinds is set. */
+  includeEpisodic?: boolean;
+  /** Parse time words in the query into a date filter / recency preference (default true). */
+  timeAware?: boolean;
 }
 
 export interface RecallMemoryHit {
@@ -59,6 +77,8 @@ export interface RecallResponse {
   query: string;
   memories: RecallMemoryHit[];
   notes: RecallNoteHit[];
+  /** What was understood of the query's temporal part (absent when nothing). */
+  time?: RecallTimeInfo;
 }
 
 export interface ApiValidationError {
@@ -88,7 +108,7 @@ function round4(n: number): number {
 }
 
 /** Validate a raw request body into a normalised RecallBody. Throws `{ status: 400, message }`. */
-export function validateRecallBody(raw: unknown): Required<Pick<RecallBody, 'query' | 'limit' | 'kinds' | 'excludeArchived' | 'seen'>> & Pick<RecallBody, 'project' | 'minImportance'> {
+export function validateRecallBody(raw: unknown): Required<Pick<RecallBody, 'query' | 'limit' | 'kinds' | 'excludeArchived' | 'seen' | 'timeAware'>> & Pick<RecallBody, 'project' | 'minImportance' | 'memoryKinds' | 'includeEpisodic'> {
   const body = (raw && typeof raw === 'object' ? raw : {}) as Record<string, unknown>;
   const query = typeof body.query === 'string' ? body.query.trim() : '';
   if (!query) throw bad('query required');
@@ -115,33 +135,77 @@ export function validateRecallBody(raw: unknown): Required<Pick<RecallBody, 'que
     ? body.seen.filter((p): p is string => typeof p === 'string' && p.length > 0).slice(0, 500)
     : [];
 
-  return { query, limit, kinds, excludeArchived, project, minImportance, seen };
+  let memoryKinds: MemoryKind[] | undefined;
+  if (body.memoryKinds !== undefined && body.memoryKinds !== null) {
+    if (!Array.isArray(body.memoryKinds) || !body.memoryKinds.every(isMemoryKind)) {
+      throw bad(`invalid memoryKinds: ${String(body.memoryKinds)}`);
+    }
+    memoryKinds = body.memoryKinds.length > 0 ? body.memoryKinds : undefined;
+  }
+  const includeEpisodic = typeof body.includeEpisodic === 'boolean' ? body.includeEpisodic : undefined;
+  const timeAware = typeof body.timeAware === 'boolean' ? body.timeAware : true;
+
+  return { query, limit, kinds, excludeArchived, project, minImportance, seen, memoryKinds, includeEpisodic, timeAware };
 }
 
-export async function recallForHook(body: RecallBody): Promise<RecallResponse> {
-  const { query, limit, kinds, excludeArchived, project, minImportance, seen } = validateRecallBody(body);
+export async function recallForHook(body: RecallBody, now: Date = new Date()): Promise<RecallResponse> {
+  const {
+    query: rawQuery, limit, kinds, excludeArchived, project, minImportance, seen, memoryKinds, includeEpisodic, timeAware,
+  } = validateRecallBody(body);
   const seenSet = new Set(seen);
   // Over-fetch enough that the seen-set and post-filters still leave `limit`.
   const overFetch = limit * 3 + seenSet.size;
+
+  // Same time-aware planning as memory_recall: parsed period → date filter,
+  // "latest" → recency preference, search on the topical part of the query.
+  const plan = timeAware
+    ? planRecallTime(rawQuery, {}, now)
+    : { query: rawQuery, preferRecent: false, parsedFilter: false } as ReturnType<typeof planRecallTime>;
+  const query = plan.query;
+  let time = plan.info;
 
   const memories: RecallMemoryHit[] = [];
   const notes: RecallNoteHit[] = [];
 
   if (kinds !== 'notes') {
     const relatedTo = project ? [`Projects/${projectSlug(project)}`] : undefined;
-    const hits = await hybridSearch(query, {
-      type: 'memory',
-      limit: overFetch,
-      excludeArchived,
-      // With temporal memory enabled, hook recall asks for what is true now.
-      asOf: config.bitemporalKg ? new Date().toISOString() : undefined,
-    });
-    const ranked = rescoreRecall(hits.filter((h) => !isHookExcluded(h.path)), {
-      limit,
-      minImportance,
-      relatedTo,
-      exclude: seenSet,
-    });
+    const retrieve = async (bounds: { dateFrom?: string; dateTo?: string; asOf?: string }): Promise<RescoredResult[]> => {
+      const pool = await searchRecallPool(query, {
+        type: 'memory',
+        limit: overFetch,
+        excludeArchived,
+        dateFrom: bounds.dateFrom,
+        dateTo: bounds.dateTo,
+        // rescoreRecall re-sorts the hits, so an LLM rerank here would be paid
+        // for (up to RERANKER_TIMEOUT_MS on every prompt) and then discarded.
+        rerank: false,
+        // With temporal memory enabled, hook recall asks for what is true now.
+        asOf: bounds.asOf ?? (config.bitemporalKg ? new Date().toISOString() : undefined),
+        filter: (p) => !isHookExcluded(p),
+      }, { kinds: memoryKinds, includeEpisodic });
+      return rescoreRecall(pool.results, {
+        limit,
+        minImportance,
+        relatedTo,
+        exclude: seenSet,
+        query,
+        // The hook's `notes` list covers non-memory notes separately.
+        scope: 'memory',
+        kinds: pool.kinds,
+        episodicOptIn: pool.episodicOptIn,
+        preferRecent: plan.preferRecent,
+      });
+    };
+    let ranked = await retrieve({ dateFrom: plan.dateFrom, dateTo: plan.dateTo, asOf: plan.asOf });
+    // Over-filtering guard (as in memory_recall): a parsed period that matches
+    // nothing is dropped once and the response is flagged.
+    if (plan.parsedFilter && ranked.length === 0) {
+      const unfiltered = await retrieve({});
+      if (unfiltered.length > 0) {
+        ranked = unfiltered;
+        time = time ? { ...time, outsidePeriod: true } : time;
+      }
+    }
     for (const r of ranked) {
       memories.push({
         path: r.path,
@@ -176,5 +240,5 @@ export async function recallForHook(body: RecallBody): Promise<RecallResponse> {
     }
   }
 
-  return { query, memories, notes };
+  return { query: rawQuery, memories, notes, ...(time ? { time } : {}) };
 }

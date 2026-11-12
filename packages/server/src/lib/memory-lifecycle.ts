@@ -376,16 +376,21 @@ export async function applyAutoConsolidation(group: {
     }
   }
 
+  // A machine-made digest is born cold: `type: digest`, low importance, no
+  // heat. It earns heat only through recall — previously it was stamped
+  // warm/6 and outranked the (often cold, high-importance) notes it folded.
+  // The sources' best numeric importance is kept for provenance only.
   const data: Record<string, any> = {
-    type: 'memory',
+    type: 'digest',
     title: group.suggestedTitle,
     category: 'insight',
     tags: [...allTags].sort(),
     consolidated_from: group.paths,
     auto_consolidated: true,
-    importance: typeof maxImportance === 'number' && maxImportance > 0 ? maxImportance : 1,
-    temperature: 'warm',
-    heat_score: 6,
+    importance: 'low',
+    ...(typeof maxImportance === 'number' && maxImportance > 0 ? { source_max_importance: maxImportance } : {}),
+    temperature: 'cold',
+    heat_score: 0,
     created: todayStr,
     last_updated: todayStr,
     last_accessed: todayStr,

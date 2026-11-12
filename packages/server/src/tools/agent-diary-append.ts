@@ -8,11 +8,7 @@ import { trimWords, DIARY_WORD_LIMIT, DIARY_WORD_LIMIT_TOPIC } from './diary-tri
 export function register(server: McpServer): void {
   server.tool(
     'agent_diary_append',
-    `Append ONE line to the agent diary Ops/Agent Diaries/<agentName>/YYYY-MM-DD.md.
-Entry format: a single line (newlines are replaced by " / " — memory_wakeup only reads the first line), ≤60 words for Stop recaps / ≤120 for PreCompact handoffs: outcome → open threads → files touched. topic = repo or task name.
-Every entry links the PROJECT and MACHINE it was written from: pass project (git repo slug, e.g. "cortexmd") and machine (hostname, e.g. "Ao") and the entry is suffixed with " · [[Projects/cortexmd]] @ [[Machines/Ao]]". machine defaults to the parenthesised host in agentName ("Claude Code (Ao)" → "Ao").
-silent=true marks an unattended hook write (rendered "_(silent)_ … #hook _via <source>_"); silent=false is a deliberate recap (same as diary_write).
-agentName must be the machine-scoped name ("Claude Code (<hostname>)" on Claude Code). Facts only — never secrets, credentials or pasted third-party text.`,
+    `Append ONE line to the agent diary (Ops/Agent Diaries/<agentName>/YYYY-MM-DD.md): ≤60 words (≤120 for PreCompact handoffs), outcome → open threads → files touched; newlines become " / ". Pass project (repo slug) and machine (hostname, defaults to the "(host)" in agentName) → suffix " · [[Projects/<slug>]] @ [[Machines/<host>]]". silent=true marks an unattended hook write. agentName = the memory_wakeup name, e.g. "Claude Code (<hostname>)". Facts only, no secrets.`,
     {
       agentName: z
         .string()

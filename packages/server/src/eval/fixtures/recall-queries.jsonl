@@ -1,0 +1,11 @@
+# Synthetic recall-eval fixture (invented notes; nothing from a real vault).
+{"id":"en-db","query":"which database did we pick for Lumen","expected_paths":["Memories/decision/lumen-database-choice.md"],"category":"factual","lang":"en"}
+{"id":"en-font","query":"terminal font preference","expected_paths":["memories/preference/TERMINAL-FONT"],"category":"preference","lang":"en","notes":"case + missing .md on purpose"}
+{"id": "en-sensor", "query": "how often recalibrate greenhouse humidity sensors", "expected_paths": ["Memories\\fact\\greenhouse-sensor-calibration.md"], "category": "factual", "lang": "en", "notes": "backslashes on purpose"}
+{"id":"en-ci","query":"Orbit integration tests flaky midnight","expected_paths":["Memories/observation/orbit-flaky-ci.md"],"category":"factual","lang":"en"}
+{"id":"fr-host","query":"où est hébergé le projet Cerf-volant","expected_paths":["Memories/decision/cerf-volant-hebergement.md"],"category":"fr","lang":"fr"}
+{"id":"fr-reunion","query":"quand a lieu la réunion trimestrielle du comité","expected_paths":["Memories/fact/reunion-trimestrielle.md"],"category":"fr","lang":"fr"}
+{"id":"scope-lumen","query":"Lumen project overview","expected_paths":["Projects/Lumen.md"],"category":"out-of-scope","lang":"en","notes":"gold is type: project, outside memory_recall scope"}
+{"id":"missing-gold","query":"bicycle chain lubrication","expected_paths":["Memories/fact/does-not-exist.md"],"category":"factual","lang":"en","notes":"gold path missing from the vault on purpose"}
+{"id":"neg-1","query":"zqxvbrt plonkwisp","expected_paths":[],"category":"negative","lang":"en"}
+{"id":"neg-2","query":"xylophrq vantablorg","expected_paths":[],"category":"negative","lang":"en"}

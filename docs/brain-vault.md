@@ -109,6 +109,68 @@ BRAIN_VAULT/
 Auto-stored memories embed `[[wiki-links]]` to detected entities, so they join
 the graph rather than orphaning.
 
+## Keeping the brain clean
+
+### At ingest
+
+- **Born cold.** A capture whose `source` matches a machine pipeline (n8n,
+  email, Claude Code / Codex hooks — `MACHINE_CAPTURE_SOURCES` overrides the
+  regex list) is stored `temperature: cold`, `importance: low`,
+  `heat_score: 0`; it only earns heat by being recalled. Deliberate stores keep
+  their warm/hot start. Machine-made digests are `type: digest`, low, cold.
+- **Echo filter.** Bare shell commands (`git status`, `label: cd x && y`),
+  tool-result fragments (`…</result>`, JSON dumps), `git commit:` echoes
+  (including multi-line heredoc bodies) and UserPromptSubmit prompt fragments
+  never become memories (`CAPTURE_NOISE_FILTER=false` disables).
+- **Recurring captures supersede.** A machine capture with the same
+  normalised title stem (dates, weekdays, numbers stripped) and `source` as a
+  note from the last `RECURRING_CAPTURE_WINDOW_DAYS` (7) days supersedes it:
+  the new note carries `supersedes`, the old one `valid_to` / `superseded_by`
+  and is archived — the same bitemporal fields the KG supersession pass uses.
+- **Auto-links.** `## Related (auto)` never points at digests, emails, hook
+  echoes or low-importance auto-captures; floor `AUTO_LINK_RELATED_MIN_SCORE`
+  0.03, at most `AUTO_LINK_RELATED_MAX` (2, hard cap 5) per note. KG
+  `mentions_*` / `co_mentioned` triples are seeded only from
+  `AUTO_SEED_KG_CATEGORIES` (decision, fact, insight, preference, plan) and
+  curated non-memory notes — never from email or machine captures.
+- **Entity hubs.** The first diary line that links `[[Projects/<slug>]]` /
+  `[[Machines/<host>]]` creates a stub note (`type: project|machine`,
+  `description`, Dataview block of diary days). Existing notes are never
+  overwritten.
+- **Reconcile guard.** The dream only folds cold notes into a project that is
+  registry-confirmed: a git repo slug some agent diary links, or a
+  `Projects/<slug>.md` with `type: project` that the dream did not itself
+  auto-create. People, filenames, email subjects and tag pairs never become
+  projects.
+
+### `vault-hygiene` (existing notes)
+
+```bash
+# Dry-run (the default): prints counts + samples, writes nothing.
+node packages/server/scripts/vault-hygiene.mjs all --vault "$BRAIN_VAULT" --json report.json
+# One command, scoped:
+node packages/server/scripts/vault-hygiene.mjs broken-links --vault "$BRAIN_VAULT" --prefix Memories/ --exclude "Ops/Agent Diaries/"
+# Apply ONLY with a backup dir outside the vault; every touched file is copied
+# there first with a manifest. Removed notes MOVE to Archive/vault-hygiene/.
+node packages/server/scripts/vault-hygiene.mjs all --vault "$BRAIN_VAULT" --apply --backup-dir /safe/place
+# Undo byte-for-byte:
+node packages/server/scripts/vault-hygiene.mjs restore --backup /safe/place/vault-hygiene-<stamp>
+```
+
+| Sub-command | What it plans |
+|---|---|
+| `hook-echoes` | archive auto-captures matching the echo filter above |
+| `junk-projects` | dream-made `Projects/` notes no diary vouches for → merge into the same-named entity note, or archive; curated notes are only reported |
+| `digests` | `Memories/consolidated/*` → `type: digest`, low, cold, heat 0; source `[[links]]` → `consolidated_from` |
+| `auto-related` | strip `## Related (auto)` / `auto_related` links to digests and emails |
+| `tags` | `msg:<id>` → `gmail_id`, Gmail labels (`2: FYI`, `INBOX`) → `email_label`, drop `source:*` tags duplicating `source`, `k: v` → `k:v`, numeric tags coerced to strings |
+| `reheat` | fix heat/temperature contradicting category + importance (0–100 fossils rescaled, machine/email/digest capped at 2, high-importance knowledge floored at warm 5) |
+| `broken-links` | unresolvable `[[links]]` → plain text (digests: into `consolidated_from`); creates missing diary-linked `Projects/` / `Machines/` stubs first. Embeds, attachments and code are never touched |
+
+`all` runs them in that order (archives first, `broken-links` last) and is
+idempotent: a second run plans nothing. The `vault_hygiene` MCP tool returns
+the same dry-run report; applying is CLI-only by design.
+
 ## Reading, editing, and syncing the brain yourself (advanced)
 
 "Sole writer" describes how the **server** routes writes — it never writes

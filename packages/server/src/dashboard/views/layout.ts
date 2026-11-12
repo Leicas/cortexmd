@@ -13,14 +13,21 @@ import { TABS, TAB_GROUP_LABELS, type TabGroup } from './tabs.js';
  * Asset cache-bust token. Bump on deploy (or wire to package version later).
  * Appended as `?v=` to the <link>/<script> URLs in renderPage().
  */
-export const ASSET_VERSION = '8';
+export const ASSET_VERSION = '9';
 
 /** Minimal HTML-escape for the (static) tab labels. */
 function esc(s: string): string {
-  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
-export function renderPage(): string {
+export interface RenderPageOpts {
+  /** Per-session CSRF token (security.ts) echoed by core.js in X-CSRF-Token. */
+  csrfToken?: string;
+  /** Obsidian vault name for `obsidian://open?vault=…` links on note references. */
+  obsidianVault?: string;
+}
+
+export function renderPage(opts: RenderPageOpts = {}): string {
   const v = ASSET_VERSION;
 
   // Group the tabs into clusters (render order in TABS keeps groups contiguous).
@@ -56,6 +63,9 @@ export function renderPage(): string {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<meta name="csrf-token" content="${esc(opts.csrfToken ?? '')}">
+<meta name="obsidian-vault" content="${esc(opts.obsidianVault ?? '')}">
 <title>cortexmd &mdash; Control Panel</title>
 <link rel="stylesheet" href="/dashboard/assets/app.css?v=${v}">
 </head>

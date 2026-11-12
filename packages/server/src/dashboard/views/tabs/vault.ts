@@ -64,7 +64,7 @@ export function renderVaultTab(): string {
   const zoneIndex = `
   <div class="grid">
     <div class="col-12 card">
-      ${sectionHead('Read-only Vaults', `<button class="btn" onclick="cortex.loadSourceVaults()">Refresh</button>`)}
+      ${sectionHead('Read-only Vaults', `<button class="btn" data-cx-click="cortex.loadSourceVaults()">Refresh</button>`)}
       <div class="card-sub" style="margin:0 0 .75rem">
         Additional source folders indexed read-only. Env-managed entries (SOURCE_VAULTS) are immutable; persisted entries can be removed here. Adding or removing a vault triggers a background reindex.
       </div>
@@ -102,7 +102,7 @@ export function renderVaultTab(): string {
           <textarea id="svGlobs" class="textarea mono" rows="2" placeholder="**/*.md, notes/**"></textarea>
         </div>
         <div style="display:flex;align-items:center;gap:.75rem;margin-top:.6rem">
-          <button class="btn btn-primary" id="svAddBtn" onclick="cortex.addSourceVault()">Add vault</button>
+          <button class="btn btn-primary" id="svAddBtn" data-cx-click="cortex.addSourceVault()">Add vault</button>
           <span id="svFeedback" class="card-sub" style="margin:0"></span>
         </div>
       </div>
@@ -111,7 +111,7 @@ export function renderVaultTab(): string {
 
   <div class="grid">
     <div class="col-6 card">
-      ${sectionHead('Vault Index', `<button class="btn btn-primary" onclick="cortex.postAction('/dashboard/api/index/rebuild',{})">Rebuild Now</button>`)}
+      ${sectionHead('Vault Index', `<button class="btn btn-primary" data-cx-click="cortex.postAction('/dashboard/api/index/rebuild',{})">Rebuild Now</button>`)}
       <div style="display:flex;align-items:baseline;gap:.5rem">
         <span class="card-value card-value--xl" id="vaultNotes">0</span>
         <span class="card-label" style="margin:0">indexed notes</span>
@@ -121,8 +121,8 @@ export function renderVaultTab(): string {
     </div>
     <div class="col-6 card">
       ${sectionHead('Vault Migration', `
-        <button class="btn" onclick="cortex.runMigrationAction(true)">Dry Run</button>
-        <button class="btn btn-primary" id="btnMigrateRun" onclick="cortex.runMigrationAction(false)">Migrate Now</button>`)}
+        <button class="btn" data-cx-click="cortex.runMigrationAction(true)">Dry Run</button>
+        <button class="btn btn-primary" id="btnMigrateRun" data-cx-click="cortex.runMigrationAction(false)">Migrate Now</button>`)}
       <div class="card-sub" style="margin:0 0 .5rem">Move memories to year/month subfolders, split journal into daily files, split diaries into per-day files, merge insight/insights.</div>
       <div id="migrationResult" style="font-size:var(--fs-sm);max-height:200px;overflow-y:auto"></div>
     </div>
@@ -188,7 +188,7 @@ export function renderVaultTab(): string {
       <div class="col-6 card">
         <div class="section-title">Temperature Over Time</div>
         <div class="chart-wrap" style="height:160px">
-          <svg id="chartTempHistory" viewBox="0 0 600 160" preserveAspectRatio="none" aria-hidden="true"></svg>
+          <svg id="chartTempHistory" viewBox="0 0 600 160" preserveAspectRatio="none" role="img" aria-label="Chart (no data yet)" data-auto-label></svg>
         </div>
         <div class="chart-legend">
           <span><i style="background:var(--err)"></i>Hot</span>
@@ -199,7 +199,7 @@ export function renderVaultTab(): string {
       <div class="col-6 card">
         <div class="section-title">Heat Score Distribution</div>
         <div class="chart-wrap chart-wrap--sm" style="height:120px">
-          <svg id="heatHistogram" viewBox="0 0 600 140" preserveAspectRatio="none" aria-hidden="true"></svg>
+          <svg id="heatHistogram" viewBox="0 0 600 140" preserveAspectRatio="none" role="img" aria-label="Chart (no data yet)" data-auto-label></svg>
         </div>
         <div style="display:flex;gap:8px;justify-content:space-between;margin-top:.4rem;font-size:var(--fs-xs);color:var(--text-dim);font-family:var(--mono)">
           <span style="flex:1;text-align:center">0–3</span>
@@ -294,9 +294,9 @@ export function renderVaultTab(): string {
     <div class="grid">
       <div class="col-12 card">
         ${sectionHead('Retrieval Quality Benchmark', `
-          <button class="btn btn-primary" onclick="cortex.postAction('/dashboard/api/benchmark/run',{})">Run Benchmark</button>
-          <button class="btn" id="btnSaveGroundTruth" onclick="cortex.postAction('/dashboard/api/benchmark/save-ground-truth',{})" style="display:none">Save as Ground Truth</button>`)}
-        <div style="display:grid;grid-template-columns:repeat(4,1fr) 1.4fr;gap:.75rem;align-items:start;margin-bottom:.75rem">
+          <button class="btn btn-primary" data-cx-click="cortex.postAction('/dashboard/api/benchmark/run',{})">Run Benchmark</button>
+          <button class="btn" id="btnSaveGroundTruth" data-cx-click="cortex.postAction('/dashboard/api/benchmark/save-ground-truth',{})" style="display:none">Save as Ground Truth</button>`)}
+        <div class="fit-grid fit-grid--bench" style="gap:.75rem;align-items:start;margin-bottom:.75rem">
           <div id="benchmarkGauges" style="display:contents"></div>
           <div>
             <div class="card-label">NDCG@10 / Query</div>
@@ -318,7 +318,7 @@ export function renderVaultTab(): string {
     <div class="grid">
       <div class="col-12 card card--quiet">
         ${sectionHead('Benchmark Summary', statusPill('snapshot', 'muted', { dot: false }))}
-        <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:.75rem">
+        <div class="fit-grid" style="--cols:4;gap:.75rem">
           <div><div class="card-label">Recall@5</div><div class="card-value card-value--xl mono" id="sqbRecall5">—</div></div>
           <div><div class="card-label">NDCG@10</div><div class="card-value card-value--xl mono" id="sqbNdcg10">—</div></div>
           <div><div class="card-label">Avg Latency</div><div class="card-value card-value--xl mono" id="sqbAvgLat">—</div></div>

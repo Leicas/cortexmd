@@ -1,6 +1,8 @@
 import { recordToolCall, recordToolCallDetailed } from './metrics.js';
 import { logger } from './logger.js';
 import { markActivity } from './activity.js';
+import { config } from '../config.js';
+import { getIndexState, waitForIndexReady, IndexNotReadyError } from './index-state.js';
 import { recordCodeNavSavings, BASELINE_TOKENS_BY_TOOL, extractRepoSlug } from './code-nav/savings.js';
 
 interface TextContent {
@@ -64,6 +66,9 @@ export function errorHint(err: Error & { code?: string; issues?: unknown }): str
   if (code === 'ENOENT' || /\bENOENT\b/.test(msg) || /note (?:not found|does not exist)/i.test(msg)) {
     return 'note path not found; use notes_search to get the exact vault path';
   }
+  if (code === 'INDEXING' || /still indexing the vault/i.test(msg)) {
+    return 'the server just started and is still building its search index; retry in a few seconds';
+  }
   if (/graph has not been built/i.test(msg)) {
     return 'call graph_stats after startup finishes (it builds the link graph on demand)';
   }
@@ -118,6 +123,12 @@ export function wrapToolHandler(
     const sessionId = (extra as any)?.sessionId as string | undefined;
     if (sessionId && sessionToolHook) sessionToolHook(sessionId, toolName);
     try {
+      // The HTTP server listens before the boot index build completes. Wait
+      // (bounded) for it rather than answering from an empty index; on timeout
+      // fail with an explicit, retryable "indexing" error.
+      if (getIndexState() === 'indexing' && !(await waitForIndexReady(config.indexReadyWaitMs))) {
+        throw new IndexNotReadyError();
+      }
       const result = await handler(args);
       const durationMs = Date.now() - start;
       // Tools can set _detail on the result for richer dashboard display

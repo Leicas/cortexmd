@@ -196,17 +196,30 @@ SOURCE_VAULTS="notes=git+https://git.example.com/me/notes.git#main:Public/**"
 
 ### Health endpoint
 
-`GET /health` needs no auth and is what the dashboard "Server" card and
-`cortexmd status` read:
+`GET /health` is the liveness probe. **Without credentials** it returns only
+`{ "status", "version", "commit" }` (always HTTP 200). `status` is `indexing`
+while the boot index build runs — the server now listens *before* the index is
+built, and tool calls made meanwhile wait up to `INDEX_READY_WAIT_MS` (default
+20 s) and then fail with a retryable "still indexing" error — `degraded` if the
+boot build failed (the periodic rescan retries it), else `ok`.
+
+**With a credential** (Bearer API key / OAuth JWT, the dashboard session cookie,
+or `Remote-User` when `PROXY_AUTH=true`) it returns the detail the dashboard
+"Server" card and `cortexmd status` read:
 
 ```json
 { "status": "ok", "version": "1.18.0", "commit": "abc1234", "uptime": 123456,
   "activeSessions": 3, "indexedNotes": 4200,
-  "heap": { "usedMb": 310, "totalMb": 420, "rssMb": 760, "limitMb": 1024 },
+  "index": { "state": "ready", "progress": { "done": 4200, "total": 4200 } },
+  "heap": { "usedMb": 310, "totalMb": 420, "rssMb": 760, "limitMb": 1024,
+            "externalMb": 20, "pct": 30.3, "warnPct": 80, "warn": false },
   "sessions": { "active": 3, "persisted": 12, "maxActive": 200, "timeoutMs": 1800000 },
   "lastIndexUpdate": { "at": "…", "updated": 2, "removed": 0, "ms": 140, "collisions": 0 },
   "restarts": { "lastExit": { "at": "…", "reason": "SIGTERM", "signal": "SIGTERM", "heapUsedMb": 300 } } }
 ```
+
+`heap.warn` turns true (and a `Heap usage high` warning is logged once) when the
+heap passes `HEAP_WARN_PCT` (default 80) % of the V8 heap limit.
 
 `restarts.lastExit` comes from `DATA_DIR/last-exit.json`, written on graceful
 shutdown and on `uncaughtException` / `unhandledRejection` (reason, message,
@@ -215,6 +228,39 @@ heap at exit), so an OOM-adjacent crash is diagnosable after the restart.
 See [`packages/server/.env.example`](../packages/server/.env.example) for the
 authoritative list. Deprecated `VAULT_RW` / `VAULT_RO_*` names are still honored
 for one release with a warning and map onto `BRAIN_VAULT` / `SOURCE_VAULTS`.
+
+### Backup and restore
+
+Note writes are atomic (temp file + fsync + rename in the same directory), so a
+crash never leaves a truncated note. For point-in-time copies, enable the
+scheduled brain backup:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `BACKUP_SCHEDULE` | `off` | `on` (daily 03:30 server time) or a `"M H * * *"` cron. |
+| `BACKUP_DIR` | `<DATA_DIR>/backups` | Where `brain-YYYYMMDDTHHMMSSZ.tar.gz` archives go. Put it on a different volume/disk than the vault if you can. |
+| `BACKUP_KEEP` | `7` | Newest archives kept; older ones are deleted after each backup. |
+
+Each archive holds every regular file of the brain vault (Obsidian config
+included; `.git/`, `node_modules/`, symlinks and in-flight temp files are
+skipped) with its bytes, permission bits and mtime. Ad hoc:
+`docker compose exec cortexmd node dist/backup-cli.js create` (`list` shows
+the archives).
+
+**Restore** (the archives are plain POSIX tar.gz — no cortexmd needed):
+
+1. Stop the server: `docker compose stop cortexmd` (so nothing writes mid-restore).
+2. Extract into an empty directory and check it:
+   `mkdir /opt/brain-restore && tar -xzf brain-20261111T033000Z.tar.gz -C /opt/brain-restore`
+   (or `node dist/backup-cli.js restore <archive> /opt/brain-restore`).
+3. Swap it in: move the current vault aside (`mv /opt/brain /opt/brain.broken`)
+   and the restored copy into place (`mv /opt/brain-restore /opt/brain`). Keep
+   ownership consistent with the container user (`chown -R`).
+4. Start the server. The boot index build picks up the restored files; the
+   embedding index re-embeds only notes whose text differs from what it had.
+5. Syncthing / Obsidian clients will see the restored state as new changes and
+   propagate it; pause sync on other devices first if they hold newer edits you
+   want to keep.
 
 ## 6. Connecting the CLI
 

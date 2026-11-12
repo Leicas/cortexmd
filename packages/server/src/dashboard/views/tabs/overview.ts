@@ -21,15 +21,15 @@ export function renderOverviewTab(): string {
   <div class="grid">
     <div class="col-12 card card--pad-sm" style="display:flex;gap:.5rem;flex-wrap:wrap;align-items:center">
       <span class="card-label" style="margin:0 .5rem 0 0">System Status</span>
-      <button type="button" class="pill pill--muted" id="stMcp" onclick="window.cortex.switchTab('logs')" aria-label="MCP / SSE status">
+      <button type="button" class="pill pill--muted" id="stMcp" data-cx-click="window.cortex.switchTab('logs')" aria-label="MCP / SSE status">
         <span class="dot" aria-hidden="true"></span>MCP / SSE</button>
-      <button type="button" class="pill pill--muted" id="stLlm" onclick="window.cortex.switchTab('intelligence')" aria-label="Local LLM status">
+      <button type="button" class="pill pill--muted" id="stLlm" data-cx-click="window.cortex.switchTab('intelligence')" aria-label="Local LLM status">
         <span class="dot" aria-hidden="true"></span>Local LLM</button>
-      <button type="button" class="pill pill--muted" id="stEmb" onclick="window.cortex.switchTab('vault')" aria-label="Embeddings status">
+      <button type="button" class="pill pill--muted" id="stEmb" data-cx-click="window.cortex.switchTab('vault')" aria-label="Embeddings status">
         <span class="dot" aria-hidden="true"></span>Embeddings</button>
-      <button type="button" class="pill pill--muted" id="stIndex" onclick="window.cortex.switchTab('vault')" aria-label="Search index status">
+      <button type="button" class="pill pill--muted" id="stIndex" data-cx-click="window.cortex.switchTab('vault')" aria-label="Search index status">
         <span class="dot" aria-hidden="true"></span>Search Index</button>
-      <button type="button" class="pill pill--muted" id="stVault" onclick="window.cortex.switchTab('intelligence')" aria-label="Vault health status">
+      <button type="button" class="pill pill--muted" id="stVault" data-cx-click="window.cortex.switchTab('intelligence')" aria-label="Vault health status">
         <span class="dot" aria-hidden="true"></span>Vault Health</button>
     </div>
   </div>`;
@@ -105,6 +105,15 @@ export function renderOverviewTab(): string {
         </div>
       </div>
       <div class="card-sub" id="srvLastExit" style="margin-top:.5rem;display:none"></div>
+      <div class="grid ops-sparks" style="margin:.75rem 0 0">
+        <div class="col-4"><div class="card-label">Heap MB <span class="card-label-aux mono" id="opsHeapTxt"></span></div>
+          <div class="chart-wrap chart-wrap--sm"><svg id="opsHeap" data-label="Heap used (MB)" viewBox="0 0 600 140" preserveAspectRatio="none"></svg></div></div>
+        <div class="col-4"><div class="card-label">Active sessions <span class="card-label-aux mono" id="opsSessTxt"></span></div>
+          <div class="chart-wrap chart-wrap--sm"><svg id="opsSess" data-label="Active sessions" viewBox="0 0 600 140" preserveAspectRatio="none"></svg></div></div>
+        <div class="col-4"><div class="card-label">Indexed notes <span class="card-label-aux mono" id="opsNotesTxt"></span></div>
+          <div class="chart-wrap chart-wrap--sm"><svg id="opsNotes" data-label="Indexed notes" viewBox="0 0 600 140" preserveAspectRatio="none"></svg></div></div>
+      </div>
+      <div class="card-sub" id="opsWindow" style="margin-top:.35rem"></div>
     </div>
   </div>`;
 
@@ -131,11 +140,11 @@ export function renderOverviewTab(): string {
   <div class="grid">
     <div class="col-6 card">
       <div class="section-title">Requests / min</div>
-      <div class="chart-wrap"><svg id="chartRpm" viewBox="0 0 600 140" preserveAspectRatio="none" aria-hidden="true"></svg></div>
+      <div class="chart-wrap"><svg id="chartRpm" viewBox="0 0 600 140" preserveAspectRatio="none" role="img" aria-label="Chart (no data yet)" data-auto-label></svg></div>
     </div>
     <div class="col-6 card">
       <div class="section-title">Avg Latency (ms)</div>
-      <div class="chart-wrap"><svg id="chartLatency" viewBox="0 0 600 140" preserveAspectRatio="none" aria-hidden="true"></svg></div>
+      <div class="chart-wrap"><svg id="chartLatency" viewBox="0 0 600 140" preserveAspectRatio="none" role="img" aria-label="Chart (no data yet)" data-auto-label></svg></div>
     </div>
   </div>
 

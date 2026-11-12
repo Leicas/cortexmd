@@ -75,7 +75,7 @@ export default {
               + '<span class="dot" aria-hidden="true"></span>' + esc(v.status || 'unknown') + '</span>';
             var action = v.source === 'env'
               ? '<span style="color:var(--text-dim);font-size:var(--fs-xs)">immutable</span>'
-              : '<button class="btn btn-danger btn--sm" onclick="cortex.removeSourceVault(\'' + escAttr(v.name) + '\')">Remove</button>';
+              : '<button class="btn btn-danger btn--sm" data-cx-click="cortex.removeSourceVault(\'' + escAttr(v.name) + '\')">Remove</button>';
             return '<tr>'
               + '<td>' + esc(v.name) + '</td>'
               + '<td class="mono" title="' + escAttr(v.path) + '" style="font-size:var(--fs-xs)">' + esc(v.path) + '</td>'

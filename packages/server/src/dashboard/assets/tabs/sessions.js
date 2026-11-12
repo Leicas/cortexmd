@@ -284,7 +284,7 @@ function renderTable(ctx, sessions, st) {
       + '<td class="num">' + fmt.fmt(s.requestCount) + '</td>'
       + '<td><div style="display:flex;flex-wrap:wrap;gap:.25rem;align-items:center">' + chips + '</div></td>'
       + '<td>' + topBar + '</td>'
-      + '<td><button type="button" class="btn btn-danger btn--sm" onclick="cortex.kill(\'' + esc(s.sessionId) + '\')">Kill</button></td>'
+      + '<td><button type="button" class="btn btn-danger btn--sm" data-cx-click="cortex.kill(\'' + esc(s.sessionId) + '\')">Kill</button></td>'
       + '</tr>';
   }).join('');
   void st;

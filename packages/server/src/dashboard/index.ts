@@ -3,3 +3,4 @@
  * consumers can `import { dashboardRouter } from './dashboard/index.js'`.
  */
 export { dashboardRouter } from './controller.js';
+export { dashboardSecurityMiddleware } from './security.js';

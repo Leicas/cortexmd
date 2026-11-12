@@ -203,6 +203,25 @@ async function resolveBearer(
 }
 
 /**
+ * Non-rejecting auth probe: true when the request carries ANY credential the
+ * dashboard accepts (session cookie, Bearer API key / OAuth JWT, or — with
+ * PROXY_AUTH=true — a forward-auth Remote-User header). Never sends a response
+ * and never counts as an auth failure; /health uses it to decide between the
+ * public liveness payload and the detailed one.
+ */
+export async function isRequestAuthenticated(req: Request): Promise<boolean> {
+  try {
+    const sessionToken = readCookie(req, SESSION_COOKIE_NAME);
+    if (sessionToken && (await verifyDashboardSession(sessionToken))) return true;
+    if (await resolveBearer(req)) return true;
+    if (config.proxyAuth && req.headers['remote-user']) return true;
+  } catch {
+    /* treat as unauthenticated */
+  }
+  return false;
+}
+
+/**
  * Dashboard / admin auth (Component A — the DEFAULT human auth path).
  *
  * Authorizes when ANY of the following hold:

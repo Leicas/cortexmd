@@ -46,7 +46,13 @@ yet). See [Configuring source vaults](#4-configuring-source-vaults) below for
 the full `name=path:globs` syntax.
 
 In stdio mode `API_KEY`, `PUBLIC_URL`, OAuth, and the reverse-proxy machinery
-are all irrelevant — there is no network surface to protect.
+are all irrelevant — there is no network surface to protect. `--stdio` starts
+no HTTP listener and no dashboard; stdout carries only MCP JSON-RPC frames and
+every log line goes to stderr (your client's MCP log). The lexical index is
+built before the first request is served; embeddings and the link graph build
+in the background, exactly as in HTTP mode. The process exits when the client
+closes stdin. Set `DATA_DIR` to a writable per-user directory (its built-in
+default, `/app/data`, is the Docker path).
 
 ## 3. Register with your MCP client
 
@@ -118,11 +124,16 @@ All off-by-default-friendly; none required for a working local install.
 | Env var | Default | Effect |
 |---------|---------|--------|
 | `ENABLE_EMBEDDINGS` | `true` | Semantic search (HNSW + transformers). Set `false` for a **lexical-only** fast path on low-resource machines — avoids the first-run model download and HNSW build. |
-| `EMBEDDING_MODEL` | (built-in) | Override the embedding model id. |
+| `EMBEDDING_MODEL` | `Xenova/all-MiniLM-L6-v2` | Embedding model id (transformers.js / ONNX, CPU). Known presets set dimension, pooling and prefixes automatically: `Xenova/multilingual-e5-small`, `Xenova/paraphrase-multilingual-MiniLM-L12-v2`, `onnx-community/embeddinggemma-300m-ONNX`, `onnx-community/Qwen3-Embedding-0.6B-ONNX`. Each model + dimension keeps its **own index file**, so a switch re-embeds the vault in the background (semantic search fills in as it goes) and switching back is instant. See [BENCHMARKS.md](BENCHMARKS.md#embedding-models-chunking-and-the-local-cross-encoder). |
+| `EMBEDDING_DIMENSION` / `EMBEDDING_POOLING` / `EMBEDDING_QUERY_PREFIX` / `EMBEDDING_DOC_PREFIX` / `EMBEDDING_DTYPE` | from the model preset (`384` / `mean` / none / none / `q8`) | Only needed for a model without a preset. Pooling: `mean`, `cls`, `last_token` or `sentence_embedding`. The dimension is also auto-detected from the model's first output. |
+| `EMBEDDING_CHUNKING` | `on` | Chunk-level vectors: notes longer than ~1,000 chars get one vector per ~200-token heading-aware section (plus the whole-note lead vector), so text deep in a long note is reachable semantically. `off` = one vector per note. Tunables: `EMBEDDING_CHUNK_CHARS` (800), `EMBEDDING_CHUNK_OVERLAP` (120), `EMBEDDING_MAX_CHUNKS` (24 per note), `EMBEDDING_CHUNK_ROLLUP` (`max`|`top2`). An existing index migrates incrementally in the background. |
 | `ENABLE_RERANKER` | `false` | Optional LLM reranker. No default host/model — opt-in only. |
+| `ENABLE_CROSS_ENCODER` | `false` | **Experimental, not wired into recall** (on the real-vault eval it added ~1.2 s p50 and lowered top-1; see BENCHMARKS.md). Local ONNX cross-encoder reranker module (`CROSS_ENCODER_MODEL`, default `Xenova/ms-marco-MiniLM-L-6-v2`; `CROSS_ENCODER_TOP_K` 30, `CROSS_ENCODER_TIMEOUT_MS` 800). Lazy-loaded on first use. |
 | `DREAM_SCHEDULE` | (empty) | Cron expression for memory "dream" consolidation. Empty disables it. |
 | `DATA_DIR` | per-user data dir | Where the SQLite cache + HNSW index live. |
 | `LOG_LEVEL` | `info` | `debug`, etc. |
+| `TOOL_PROFILE` | `standard` | Which tools `tools/list` advertises. `standard` = 18 tools (~5k tokens): wakeup/recall/store, notes get/search/upsert, diary append/read, step-by-step `code_*` nav, `tool_search` + `tool_invoke`. Every other tool stays callable through `tool_invoke(name, arguments)` (find it with `tool_search`). `full` advertises all ~87 tools (~22k tokens, the pre-1.21 default); `chatgpt` = `standard` + `search`/`fetch`; `tiny`/`nav`/`core`/`lean` still work. Legacy name: `OBSIDIAN_TOOL_PROFILE`. |
+| `CHATGPT_SEARCH_FETCH` | `false` | Also register the ChatGPT connector `search`/`fetch` pair under any profile. |
 
 See [`packages/server/.env.example`](../packages/server/.env.example) for the
 authoritative list.

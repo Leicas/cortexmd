@@ -62,3 +62,32 @@ describe('wakeUp with { project }', () => {
     expect(l1(await wakeUp())).toBe(plain);
   });
 });
+
+describe('wakeup selection helpers', () => {
+  it('flags archived notes, digests, email and machine captures as noise', async () => {
+    const { isWakeupNoise } = await import('../memory-stack.js');
+    expect(isWakeupNoise('Memories/fact/a.md', { type: 'memory' })).toBe(false);
+    expect(isWakeupNoise('Memories/fact/a.md', { type: 'memory', archived: true })).toBe(true);
+    expect(isWakeupNoise('Memories/consolidated/ops-2026-W10.md', { type: 'memory' })).toBe(true);
+    expect(isWakeupNoise('Notes/weekly.md', { type: 'digest' })).toBe(true);
+    expect(isWakeupNoise('Memories/observation/x.md', { type: 'memory', tags: ['consolidated-series'] })).toBe(true);
+    expect(isWakeupNoise('EmailLog/2026-01-01-x.md', { type: 'memory' })).toBe(true);
+    expect(isWakeupNoise('Memories/observation/x.md', { type: 'memory', source: 'n8n:mail-triage' })).toBe(true);
+    expect(isWakeupNoise('Memories/observation/x.md', { type: 'memory', source: 'hook:PostToolUse:Bash' })).toBe(true);
+    expect(isWakeupNoise('Memories/observation/x.md', { type: 'memory', tags: ['auto-capture'] })).toBe(true);
+    expect(isWakeupNoise('Indexes/All.md', { type: 'index' })).toBe(true);
+    // A human-written source is not a machine capture.
+    expect(isWakeupNoise('Memories/fact/a.md', { type: 'memory', source: 'meeting with the team' })).toBe(false);
+  });
+
+  it('ranks durable, important and project-linked notes above merely hot ones', async () => {
+    const { wakeupRank } = await import('../memory-stack.js');
+    const hotObservation = wakeupRank({ category: 'observation', heat_score: 12 });
+    expect(wakeupRank({ category: 'decision', heat_score: 8 })).toBeGreaterThan(hotObservation);
+    expect(wakeupRank({ category: 'observation', heat_score: 8, importance: 'critical' }))
+      .toBeGreaterThan(wakeupRank({ category: 'observation', heat_score: 8 }));
+    expect(wakeupRank({ category: 'observation', heat_score: 8 }, true)).toBeGreaterThan(hotObservation);
+    // A stale 0–100-scale heat fossil is clamped to the 0–16 scale.
+    expect(wakeupRank({ category: 'observation', heat_score: 80 })).toBe(wakeupRank({ category: 'observation', heat_score: 16 }));
+  });
+});

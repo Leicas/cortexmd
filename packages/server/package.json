@@ -11,6 +11,7 @@
     "test": "vitest run",
     "eval": "tsx src/eval/index.ts",
     "eval:realvault": "tsx src/eval/index.ts --real-vault .realvault-snapshot",
+    "eval:recall": "tsx src/eval/recall-eval.ts",
     "snapshot": "node scripts/snapshot-vault.mjs",
     "code:index": "node bin/code-index.mjs",
     "contract:check": "node scripts/contract-check.mjs"

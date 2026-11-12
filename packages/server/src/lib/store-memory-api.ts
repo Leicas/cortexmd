@@ -10,24 +10,34 @@
  *   - title dedup (Levenshtein on the slug, same category) and semantic dedup
  *     when embeddings are ready — the old route wrote blindly
  *   - incremental graph update so the note is not an orphan until next rebuild
- *   - `importance` honoured from the body (default `low`; auto-capture is
- *     exhaust until promoted), `temperature: 'warm'`, `heat_score: 6` kept
+ *   - born-cold ingest: a MACHINE source (n8n / email / hooks — see
+ *     config.machineCaptureSourcePatterns) is stored `temperature: cold`,
+ *     `importance: low` (unless the caller passed one), `heat_score: 0`;
+ *     any other (deliberate) source keeps `warm` / `heat_score: 6`
+ *   - recurring machine captures (same title stem + source within
+ *     config.recurringCaptureWindowDays) supersede the previous note
+ *     (`supersedes` on the new note; `valid_to` / `superseded_by` + archived
+ *     on the old one) instead of piling up a near-duplicate per day
  *
  * The handler in index.ts validates nothing but transport, calls
  * storeMemoryFromApi and `res.json`s the result; `markActivity()` stays there.
  */
 import { v4 as uuidv4 } from 'uuid';
-import { createNote } from './vault.js';
-import { stringifyFrontmatter } from './frontmatter.js';
-import { indexNote, searchNotes } from './search.js';
+import { createNote, readNote, writeNote } from './vault.js';
+import { stringifyFrontmatter, parseFrontmatter } from './frontmatter.js';
+import { indexNote, searchNotes, getDocMeta } from './search.js';
 import { updateGraphForNote } from './graph.js';
 import { isEmbeddingsReady, checkSemanticDuplicate } from './embeddings.js';
-import { matchCaptureNoise, isSlugTitle } from './capture-filter.js';
+import { matchCaptureNoise, isSlugTitle, isMachineCaptureSource } from './capture-filter.js';
+import { titleStem, isUsableStem } from './vault-hygiene/patterns.js';
+import { config } from '../config.js';
 import { linkFromIndex } from './index-notes.js';
 import { sanitizeContent } from './sanitize.js';
 import { repairWikilinks } from './auto-link.js';
 import { MEMORY_CATEGORIES } from './categorize.js';
 import { logger } from './logger.js';
+import { projectSlug } from './journal.js';
+import { memoryKindOf } from './memory-kind.js';
 
 export type StoreMemoryImportance = 'low' | 'medium' | 'high';
 
@@ -41,6 +51,45 @@ export interface StoreMemoryBody {
   importance?: StoreMemoryImportance;
   /** Skip title + semantic dedup (e.g. a caller that already deduped). */
   skipDedupe?: boolean;
+  /** Provenance for the dashboard Memories filters (all optional). */
+  agent?: string;
+  machine?: string;
+  project?: string;
+}
+
+export interface CaptureProvenance {
+  agent?: string;
+  machine?: string;
+  project?: string;
+  client?: string;
+}
+
+/** One-line, bounded frontmatter value; undefined for non-strings/blank. */
+function provenanceValue(v: unknown): string | undefined {
+  if (typeof v !== 'string') return undefined;
+  const s = v.replace(/[\r\n\t]+/g, ' ').trim().slice(0, 120);
+  return s || undefined;
+}
+
+/**
+ * Normalise optional provenance (`agent`, `machine`, `project`, `client`) into
+ * the frontmatter keys the dashboard Memories filters read
+ * (dashboard/model/memories.ts provenanceOf). `project` is stored as the
+ * Projects/<slug> slug. Absent / blank values produce no key, so callers that
+ * pass nothing write exactly the frontmatter they always did.
+ */
+export function provenanceFrontmatter(raw: Record<string, unknown>): CaptureProvenance {
+  const out: CaptureProvenance = {};
+  const agent = provenanceValue(raw.agent);
+  const machine = provenanceValue(raw.machine);
+  const projectRaw = provenanceValue(raw.project);
+  const project = projectRaw ? projectSlug(projectRaw) : undefined;
+  const client = provenanceValue(raw.client);
+  if (agent) out.agent = agent;
+  if (machine) out.machine = machine;
+  if (project) out.project = project;
+  if (client) out.client = client;
+  return out;
 }
 
 export interface StoreMemoryResult {
@@ -49,6 +98,8 @@ export interface StoreMemoryResult {
   category?: string;
   reason?: 'capture_noise' | 'duplicate' | 'semantic_duplicate';
   existingPath?: string;
+  /** Previous version of a recurring capture that this one superseded. */
+  supersededPath?: string;
   title?: string;
   pattern?: string;
 }
@@ -121,7 +172,10 @@ export function validateStoreMemoryBody(raw: unknown): {
   tags: string[];
   source: string;
   importance: StoreMemoryImportance;
+  /** True when the caller set `importance` (machine captures honour it). */
+  importanceExplicit: boolean;
   skipDedupe: boolean;
+  provenance: CaptureProvenance;
 } {
   const body = (raw && typeof raw === 'object' ? raw : {}) as Record<string, unknown>;
   const content = typeof body.content === 'string' ? body.content.trim() : '';
@@ -133,7 +187,8 @@ export function validateStoreMemoryBody(raw: unknown): {
   }
 
   let importance: StoreMemoryImportance = 'low';
-  if (body.importance !== undefined && body.importance !== null) {
+  const importanceExplicit = body.importance !== undefined && body.importance !== null;
+  if (importanceExplicit) {
     if (typeof body.importance !== 'string' || !IMPORTANCE_VALUES.has(body.importance as StoreMemoryImportance)) {
       throw bad(`invalid importance: ${String(body.importance)}`);
     }
@@ -147,7 +202,10 @@ export function validateStoreMemoryBody(raw: unknown): {
   const source = typeof body.source === 'string' && body.source.trim() ? body.source.trim() : 'hook';
   const skipDedupe = body.skipDedupe === true;
 
-  return { content, category, title, tags, source, importance, skipDedupe };
+  // `client` is server-derived (MCP session) — not accepted from the REST body.
+  const provenance = provenanceFrontmatter({ agent: body.agent, machine: body.machine, project: body.project });
+
+  return { content, category, title, tags, source, importance, importanceExplicit, skipDedupe, provenance };
 }
 
 export async function storeMemoryFromApi(body: StoreMemoryBody): Promise<StoreMemoryResult> {
@@ -161,11 +219,16 @@ export async function storeMemoryFromApi(body: StoreMemoryBody): Promise<StoreMe
   const rawTitle = v.title && !isSlugTitle(v.title) ? v.title : deriveTitle(content);
   const title = rawTitle.slice(0, 80) || 'Auto-captured';
 
-  // Shell-command stubs and automated emails never become memories.
-  const noise = matchCaptureNoise(title);
+  // Shell-command stubs, tool-result fragments, commit echoes, prompt
+  // fragments and automated emails never become memories.
+  const noise = matchCaptureNoise(title, { content, source: v.source, tags: v.tags });
   if (noise) {
     return { stored: false, reason: 'capture_noise', title, pattern: noise.source };
   }
+
+  // Machine exhaust (n8n, email, hooks) is born cold; deliberate API captures
+  // keep the historical warm/6 start.
+  const machine = isMachineCaptureSource(v.source);
 
   const now = new Date();
   const today = now.toISOString().slice(0, 10);
@@ -180,9 +243,28 @@ export async function storeMemoryFromApi(body: StoreMemoryBody): Promise<StoreMe
   const memoryId = uuidv4();
   const notePath = `${baseDir}/${category}/${subdir}${today}-${slug}${isEmailCapture ? '' : `-${memoryId.slice(0, 8)}`}.md`;
 
+  // Recurring machine captures (daily briefings, weekly summaries): same
+  // normalised title stem + same source within the window → the new capture
+  // SUPERSEDES the previous one instead of piling up a near-duplicate.
+  let supersedes: RecurringMatch | undefined;
+  if (!v.skipDedupe && machine) {
+    try {
+      supersedes = await findRecurringPredecessor({ baseDir, category, title, source: v.source, today: now });
+    } catch {
+      supersedes = undefined;
+    }
+    // The exact same title is the same memory, not a new version of a
+    // series: leave it to the title dedup below (historical contract).
+    if (supersedes && slugify(String(supersedes.data.title ?? '')) === slug) supersedes = undefined;
+    if (supersedes && supersedes.body.trim() === `# ${title}\n\n${content}`.trim()) {
+      // A retry of the identical capture is a duplicate, not a new version.
+      return { stored: false, reason: 'duplicate', existingPath: supersedes.path, title };
+    }
+  }
+
   // Title dedup: an existing note in the same collection/category whose slug
   // is within 2 edits of ours is the same memory.
-  if (!v.skipDedupe) {
+  if (!v.skipDedupe && !supersedes) {
     try {
       const dedupResults = searchNotes(`${title} ${content.slice(0, 50)}`, {
         scopePaths: [`${baseDir}/${category}/`],
@@ -199,7 +281,7 @@ export async function storeMemoryFromApi(body: StoreMemoryBody): Promise<StoreMe
   }
 
   // Semantic dedup via embeddings (only when the vector index is ready).
-  if (!v.skipDedupe && isEmbeddingsReady()) {
+  if (!v.skipDedupe && !supersedes && isEmbeddingsReady()) {
     try {
       const semantic = await checkSemanticDuplicate(content);
       if (semantic.isDuplicate && semantic.matchPath) {
@@ -210,22 +292,34 @@ export async function storeMemoryFromApi(body: StoreMemoryBody): Promise<StoreMe
     }
   }
 
-  const tags = Array.from(new Set([...v.tags, 'auto-capture', `source:${v.source}`]));
+  // `source` lives in its own frontmatter field — no duplicate `source:*` tag.
+  const tags = Array.from(new Set([...v.tags, 'auto-capture']));
   const frontmatter: Record<string, unknown> = {
     id: memoryId,
     type: 'memory',
     category,
     title,
-    importance: v.importance,
-    temperature: 'warm',
-    heat_score: 6,
-    access_count: 1,
+    // Machine captures start low/cold with no heat: they earn heat only by
+    // being recalled. An explicit importance from the caller is honoured.
+    importance: machine && !v.importanceExplicit ? 'low' : v.importance,
+    temperature: machine ? 'cold' : 'warm',
+    heat_score: machine ? 0 : 6,
+    access_count: machine ? 0 : 1,
     last_accessed: today,
     created: today,
     last_updated: today,
     tags,
     source: v.source,
+    ...v.provenance,
   };
+  if (supersedes) {
+    frontmatter.supersedes = supersedes.path;
+    frontmatter.valid_from = today;
+  }
+  // Episodic / semantic / procedural, so recall can scope without re-deriving.
+  frontmatter.memory_kind = memoryKindOf(frontmatter, notePath, {
+    machineSourcePatterns: config.machineCaptureSourcePatterns,
+  });
   const noteBody = `# ${title}\n\n${content}\n`;
   const noteContent = stringifyFrontmatter(frontmatter, noteBody);
 
@@ -242,6 +336,10 @@ export async function storeMemoryFromApi(body: StoreMemoryBody): Promise<StoreMe
 
   try { await indexNote(notePath); } catch { /* best-effort */ }
   try { updateGraphForNote(notePath, noteContent); } catch { /* graph may not be built yet */ }
+
+  if (supersedes) {
+    await closeSupersededCapture(supersedes, notePath, today);
+  }
 
   if (isEmailCapture) {
     // Email captures get no entity/related links; a per-month index keeps
@@ -260,5 +358,95 @@ export async function storeMemoryFromApi(body: StoreMemoryBody): Promise<StoreMe
     }
   }
 
-  return { stored: true, path: notePath, category, title };
+  return {
+    stored: true, path: notePath, category, title,
+    ...(supersedes ? { supersededPath: supersedes.path } : {}),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Recurring-capture supersession
+// ---------------------------------------------------------------------------
+
+export interface RecurringMatch {
+  path: string;
+  etag: string;
+  data: Record<string, any>;
+  body: string;
+}
+
+function dayOf(path: string, metaDate: string | undefined): string | undefined {
+  if (metaDate && /^\d{4}-\d{2}-\d{2}/.test(metaDate)) return metaDate.slice(0, 10);
+  return /(?:^|\/)(\d{4}-\d{2}-\d{2})-[^/]*$/.exec(path)?.[1];
+}
+
+/**
+ * The newest live note in `<baseDir>/<category>/` created within the window
+ * whose title has the same normalised stem and whose frontmatter `source`
+ * equals ours. Undefined when the stem is too generic, the window is 0, or
+ * nothing matches. Candidates are pre-filtered from the index; only stem hits
+ * are read from disk to confirm `source`.
+ */
+export async function findRecurringPredecessor(opts: {
+  baseDir: string;
+  category: string;
+  title: string;
+  source: string;
+  today: Date;
+}): Promise<RecurringMatch | undefined> {
+  const windowDays = config.recurringCaptureWindowDays;
+  if (!(windowDays > 0)) return undefined;
+  const stem = titleStem(opts.title);
+  if (!isUsableStem(stem)) return undefined;
+  const cutoff = new Date(opts.today.getTime() - windowDays * 86_400_000).toISOString().slice(0, 10);
+  const prefix = `${opts.baseDir}/${opts.category}/`;
+
+  const hits: Array<{ path: string; day: string }> = [];
+  for (const [p, meta] of getDocMeta()) {
+    if (!p.startsWith(prefix)) continue;
+    if (meta.archived === true || meta.valid_to || meta.superseded_by) continue;
+    const day = dayOf(p, meta.date);
+    if (!day || day < cutoff) continue;
+    if (titleStem(meta.title ?? '') !== stem) continue;
+    hits.push({ path: p, day });
+  }
+  hits.sort((a, b) => (a.day < b.day ? 1 : a.day > b.day ? -1 : 0));
+  for (const hit of hits) {
+    try {
+      const { content, etag } = await readNote(hit.path);
+      const { data, body } = parseFrontmatter(content);
+      if (String(data.source ?? '') !== opts.source) continue;
+      if (data.valid_to || data.superseded_by || data.archived === true) continue;
+      return { path: hit.path, etag, data: { ...data }, body };
+    } catch {
+      // Unreadable candidate — try the next one.
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Close the previous version of a recurring capture, bitemporal-style
+ * (`valid_to` / `superseded_by`, same fields bitemporal.ts stamps), and
+ * archive it so it drops out of active recall. Never deletes. Best-effort:
+ * an ETag conflict leaves the old note live (the new one is already written).
+ */
+async function closeSupersededCapture(prev: RecurringMatch, newPath: string, today: string): Promise<void> {
+  try {
+    const data = { ...prev.data };
+    if (!data.valid_to) data.valid_to = today;
+    data.superseded_by = newPath;
+    data.archived = true;
+    data.archived_at = today;
+    data.archive_reason = 'superseded by a newer recurring capture';
+    data.temperature = 'cold';
+    data.heat_score = 0;
+    await writeNote(prev.path, stringifyFrontmatter(data, prev.body), prev.etag);
+    try { await indexNote(prev.path); } catch { /* best-effort */ }
+  } catch (err) {
+    logger.warn('store-memory-api: could not close superseded capture', {
+      path: prev.path,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
 }

@@ -4,7 +4,10 @@
 
 pub mod auth;
 pub mod ask;
+pub mod bridge;
 pub mod cli;
+pub mod clients;
+pub mod hook_stats;
 pub mod contract;
 pub mod git;
 pub mod indexer;
@@ -19,6 +22,7 @@ pub mod parser;
 pub mod payload;
 pub mod rewrite;
 pub mod simhash;
+pub mod wakeup;
 pub mod walker;
 pub mod workspace;
 
@@ -64,6 +68,9 @@ fn dispatch(cli: Cli) -> Result<()> {
                 oauth::cmd_oauth_login(server.as_deref(), !no_browser)
             }
             AuthCommand::OauthStatus => oauth::cmd_oauth_status(),
+            AuthCommand::Header { server, api_key } => {
+                auth::cmd_header(server.as_deref(), api_key.as_deref())
+            }
             AuthCommand::OauthLogout { yes } => oauth::cmd_oauth_logout(yes),
         },
         Some(Command::Index(args)) => run_index(args),
@@ -87,6 +94,8 @@ fn dispatch(cli: Cli) -> Result<()> {
         Some(Command::Pull(args)) => inspect::cmd_pull(args),
         Some(Command::Contract(args)) => contract::cmd_contract(args.command),
         Some(Command::Init(args)) => init::cmd_init(args),
+        Some(Command::Wakeup(args)) => wakeup::cmd_wakeup(args),
+        Some(Command::Mcp(args)) => bridge::cmd_mcp(args),
         None => run_index(cli.index),
     }
 }

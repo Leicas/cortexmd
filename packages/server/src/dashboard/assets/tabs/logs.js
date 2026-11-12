@@ -196,7 +196,7 @@ function renderSystemLogs(ctx, d) {
     var metaStr = l.meta ? JSON.stringify(l.meta) : '';
     var ts = l.timestamp ? new Date(l.timestamp).toISOString() : '';
     var fullLine = ts + ' [' + (l.source || 'general') + '] ' + l.level.toUpperCase() + ' ' + l.message + (metaStr ? ' ' + metaStr : '');
-    return '<div class="log-entry" data-full="' + escAttr(fullLine) + '" onclick="cortex.copyLogLine(this)" style="cursor:pointer" title="Click to copy">'
+    return '<div class="log-entry" data-full="' + escAttr(fullLine) + '" data-cx-click="cortex.copyLogLine(this)" style="cursor:pointer" title="Click to copy">'
       + '<span class="log-ts">' + fmt.fmtTime(l.timestamp) + '</span>'
       + '<span class="log-level l-' + l.level + '">' + l.level + '</span>'
       + '<span class="log-src">' + esc(l.source || 'general') + '</span>'

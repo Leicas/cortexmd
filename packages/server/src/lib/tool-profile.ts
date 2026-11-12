@@ -3,19 +3,55 @@ import { logger } from './logger.js';
 
 /**
  * Tool profile membership. Every tool is ALWAYS registered and enabled; a
- * profile only decides which tools are advertised by `tools/list`. Hidden
- * tools stay callable (the agent discovers them with `tool_search`, which reads
- * the full registry snapshot taken in tool-meta.ts) — so a reduced profile is
- * a lazy-loading surface, not a permission boundary.
+ * profile only decides which tools are advertised by `tools/list`. It is a
+ * lazy-loading surface, not a permission boundary. A tool outside the profile:
+ *   - is discoverable with `tool_search` (reads the full registry snapshot
+ *     taken in tool-meta.ts, including each tool's inputSchema), and
+ *   - is invocable through the advertised `tool_invoke(name, arguments)`
+ *     dispatcher, which validates against the hidden tool's real zod schema.
+ *     That path works for clients (Claude Code, Codex, ChatGPT) that only call
+ *     tools they saw in `tools/list`. Raw MCP clients (the cortexmd CLI) can
+ *     still `tools/call` a hidden tool by name directly.
  *
  * Sizes:
- *   tiny  = 6 tools
- *   nav   = 14
- *   core  = 38 (opt-in via OBSIDIAN_TOOL_PROFILE; includes the 7 CLI/hook dependencies)
- *   lean  = core + 20
- *   full  = everything
+ *   tiny     = 6 tools
+ *   nav      = 15
+ *   standard = 18 (DEFAULT: what the shipped hooks/instruction templates use)
+ *   chatgpt  = standard + `search` + `fetch` (ChatGPT connector / deep research)
+ *   core     = 39 (includes the 7 CLI/hook dependencies)
+ *   lean     = core + 20
+ *   full     = everything (TOOL_PROFILE=full restores the pre-1.21 surface)
  */
-export type ToolProfile = 'tiny' | 'nav' | 'core' | 'lean' | 'full';
+export type ToolProfile = 'tiny' | 'nav' | 'standard' | 'chatgpt' | 'core' | 'lean' | 'full';
+
+/**
+ * Default profile. Covers the session protocol in server-instructions.ts and
+ * the templates/hooks (wakeup → recall/store → notes → diary, plus the
+ * step-by-step code_* navigation) and the two lazy-loading meta-tools.
+ */
+const STANDARD: ReadonlyArray<string> = [
+  'memory_wakeup',
+  'memory_recall',
+  'memory_store',
+  'notes_search',
+  'notes_get',
+  'notes_upsert',
+  'agent_diary_append',
+  'agent_diary_read',
+  'code_repo_list',
+  'code_file_outline',
+  'code_symbol_search',
+  'code_symbol_get',
+  'code_symbol_callers',
+  'code_symbol_callees',
+  'code_change_impact',
+  'code_call_chain',
+  'tool_search',
+  'tool_invoke',
+];
+
+/** ChatGPT connector pair (src/tools/search-fetch.ts). */
+const CHATGPT_EXTRAS: ReadonlyArray<string> = ['search', 'fetch'];
 
 const TINY: ReadonlyArray<string> = [
   'notes_search',
@@ -105,24 +141,27 @@ function compose(...lists: ReadonlyArray<ReadonlyArray<string>>): Set<string> {
   return out;
 }
 
+// Every reduced profile carries the dispatcher, so whatever it hides stays
+// reachable for clients that only call advertised tools.
 const PROFILE_SETS: Record<Exclude<ToolProfile, 'full'>, Set<string>> = {
-  tiny: compose(TINY),
-  nav: compose(TINY, NAV_EXTRAS),
-  core: compose(TINY, NAV_EXTRAS, CORE_EXTRAS),
-  lean: compose(TINY, NAV_EXTRAS, CORE_EXTRAS, LEAN_EXTRAS),
+  tiny: compose(TINY, ['tool_invoke']),
+  nav: compose(TINY, NAV_EXTRAS, ['tool_invoke']),
+  standard: compose(STANDARD),
+  chatgpt: compose(STANDARD, CHATGPT_EXTRAS),
+  core: compose(TINY, NAV_EXTRAS, CORE_EXTRAS, ['tool_invoke']),
+  lean: compose(TINY, NAV_EXTRAS, CORE_EXTRAS, LEAN_EXTRAS, ['tool_invoke']),
 };
 
-const VALID: ReadonlySet<string> = new Set(['tiny', 'nav', 'core', 'lean', 'full']);
+const VALID: ReadonlySet<string> = new Set(['tiny', 'nav', 'standard', 'chatgpt', 'core', 'lean', 'full']);
 
-export const DEFAULT_TOOL_PROFILE: ToolProfile = 'full';
+export const DEFAULT_TOOL_PROFILE: ToolProfile = 'standard';
 
 /**
- * Resolve the profile name. `full` is the default: every tool is advertised.
- * Reduced profiles (`tiny`/`nav`/`core`/`lean`) only trim what `tools/list`
- * advertises — hidden tools stay registered and callable for raw MCP clients
- * and `tool_search`, but note that Claude Code / ChatGPT / Codex only call
- * tools they saw in `tools/list`, so a reduced profile is an explicit opt-in
- * (`OBSIDIAN_TOOL_PROFILE=core`) for token-sensitive deployments.
+ * Resolve the profile name (TOOL_PROFILE, legacy OBSIDIAN_TOOL_PROFILE).
+ * Unset/unknown → `standard`. Reduced profiles only trim what `tools/list`
+ * advertises; hidden tools remain callable via `tool_invoke` (for clients that
+ * only call listed tools) and via direct `tools/call` (raw MCP clients).
+ * `full` advertises every tool, as before 1.21.
  */
 export function parseToolProfile(raw: string | undefined | null): ToolProfile {
   const v = (raw ?? '').toLowerCase().trim();
@@ -170,8 +209,14 @@ type RawHandler = (request: unknown, extra: unknown) => Promise<unknown>;
  * map is unreachable (SDK internals moved), we log and advertise everything —
  * never fail startup.
  */
-export function applyToolProfile(server: unknown, profile: ToolProfile): ToolProfileResult {
-  const allowed = profileMembership(profile);
+export function applyToolProfile(
+  server: unknown,
+  profile: ToolProfile,
+  /** Extra tool names to advertise on top of the profile (e.g. CHATGPT_SEARCH_FETCH). */
+  alsoAdvertise: ReadonlyArray<string> = [],
+): ToolProfileResult {
+  const base = profileMembership(profile);
+  const allowed = base && alsoAdvertise.length > 0 ? new Set([...base, ...alsoAdvertise]) : base;
   const mcp = server as {
     _registeredTools?: Record<string, { enabled: boolean }>;
     server?: {

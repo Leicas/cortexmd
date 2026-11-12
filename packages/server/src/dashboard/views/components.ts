@@ -83,7 +83,7 @@ export function kpi(o: KpiOpts): string {
   const linkCls = o.linkTab ? ' is-link' : '';
   const extra = o.className ? ` ${o.className}` : '';
   const attrs = o.linkTab
-    ? ` type="button" onclick="window.cortex.switchTab('${esc(o.linkTab)}')" aria-label="${esc(o.label)} — open ${esc(o.linkTab)} tab"`
+    ? ` type="button" data-cx-click="window.cortex.switchTab('${esc(o.linkTab)}')" aria-label="${esc(o.label)} — open ${esc(o.linkTab)} tab"`
     : '';
   const valueCls = o.mono ? 'card-value card-value--mono' : 'card-value';
   const pill = o.pillId ? `<span id="${esc(o.pillId)}"></span>` : '';
@@ -93,7 +93,7 @@ export function kpi(o: KpiOpts): string {
     ? `<div class="card-sub" id="${esc(o.subId)}">${o.sub ? esc(o.sub) : ''}</div>`
     : (o.sub ? `<div class="card-sub">${esc(o.sub)}</div>` : '');
   const spark = o.sparkId
-    ? `<svg class="kpi-spark" id="${esc(o.sparkId)}" viewBox="0 0 600 140" preserveAspectRatio="none" aria-hidden="true"></svg>`
+    ? `<svg class="kpi-spark" id="${esc(o.sparkId)}" viewBox="0 0 600 140" preserveAspectRatio="none" role="img" aria-label="Chart (no data yet)" data-auto-label></svg>`
     : '';
   return `<${tag} class="card card--kpi${linkCls}${extra}"${attrs}` +
     ` style="text-align:left;display:block;width:100%">` +
@@ -129,7 +129,7 @@ export function sparkRow(label: string, svgId: string, opts: { className?: strin
   const cls = opts.className ? ` ${opts.className}` : '';
   return `<div class="spark-row${cls}">` +
     `<div class="card-label">${esc(label)}</div>` +
-    `<div class="chart-wrap chart-wrap--sm"><svg id="${esc(svgId)}" viewBox="0 0 600 140" preserveAspectRatio="none" aria-hidden="true"></svg></div>` +
+    `<div class="chart-wrap chart-wrap--sm"><svg id="${esc(svgId)}" viewBox="0 0 600 140" preserveAspectRatio="none" role="img" aria-label="Chart (no data yet)" data-auto-label></svg></div>` +
     `</div>`;
 }
 

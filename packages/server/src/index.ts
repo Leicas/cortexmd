@@ -1,3 +1,6 @@
+// MUST stay the first import: under `--stdio` it reroutes process.stdout to
+// stderr before any other module can log, so stdout carries only JSON-RPC.
+import { STDIO_MODE } from './lib/stdio-guard.js';
 import crypto from 'node:crypto';
 import v8 from 'node:v8';
 import { readdir, access, stat } from 'node:fs/promises';
@@ -7,15 +10,15 @@ import express from 'express';
 import type { Request, Response, NextFunction } from 'express';
 import multer from 'multer';
 import { z } from 'zod';
-import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
 
 import { initEmbeddings, persistIndex as persistEmbeddingIndex, isEmbeddingsReady, buildFullIndex, syncIndexIncremental, wasPersistedIndexLoaded } from './lib/embeddings.js';
 import { flushCoRecall } from './lib/co-recall.js';
 import { config } from './config.js';
-import { SERVER_INSTRUCTIONS } from './lib/server-instructions.js';
-import { apiKeyMiddleware, dashboardAuthMiddleware, SESSION_COOKIE_NAME } from './auth.js';
+import { apiKeyMiddleware, dashboardAuthMiddleware, isRequestAuthenticated, SESSION_COOKIE_NAME } from './auth.js';
+import { getIndexState, getIndexProgress } from './lib/index-state.js';
+import { createBackup, backupCron, resolveBackupDir } from './lib/backup.js';
 import { mintDashboardSession } from './oauth.js';
 import { rebuildIndex, getIndexedNoteCount, getDocMeta, getVaultHealth, reindexSourceVaults, getIndexHealth } from './lib/search.js';
 import * as searchLib from './lib/search.js';
@@ -49,34 +52,15 @@ import type { PersistedSession } from './lib/persistence.js';
 import { selectSessionsToEvict, pruneStaleSessionMeta, capSessionRecords } from './lib/session-lru.js';
 import { cleanupExpired, checkRateLimit } from './lib/rate-limit.js';
 import type { RequestCategory } from './lib/metrics.js';
-import { dashboardRouter } from './dashboard/index.js';
+import { dashboardRouter, dashboardSecurityMiddleware } from './dashboard/index.js';
 import { oauthRouter } from './oauth.js';
 
-// Tool registration imports
-import { register as registerNotesSearch } from './tools/notes-search.js';
-import { register as registerToolSearch } from './tools/tool-search.js';
-import { register as registerWorkerRun } from './tools/worker-run.js';
-import { snapshotTools, buildToolEmbeddings } from './lib/tool-meta.js';
-import { applyToolProfile, parseToolProfile } from './lib/tool-profile.js';
-import { register as registerNotesGet } from './tools/notes-get.js';
-import { register as registerGraphNeighbors } from './tools/graph-neighbors.js';
-import { register as registerNotesUpsert } from './tools/notes-upsert.js';
-import { register as registerNotesLinkEntities } from './tools/notes-link-entities.js';
-import { register as registerJournalAppend } from './tools/journal-append.js';
-import { register as registerArtifactIngest } from './tools/artifact-ingest.js';
-import { register as registerTasksCreate } from './tools/tasks-create.js';
-import { register as registerTasksResolve } from './tools/tasks-resolve.js';
-import { register as registerBriefDaily } from './tools/brief-daily.js';
-import { register as registerMemoryTemperature } from './tools/memory-temperature.js';
-import { register as registerMemoryConsolidate } from './tools/memory-consolidate.js';
-import { register as registerNotesArchive } from './tools/notes-archive.js';
-import { register as registerMemoryStore } from './tools/memory-store.js';
-import { register as registerMemoryRecall } from './tools/memory-recall.js';
-import { register as registerNotesList } from './tools/notes-list.js';
-import { register as registerTagsList } from './tools/tags-list.js';
-import { register as registerArtifactUploadToken } from './tools/artifact-upload-token.js';
-import { registerResources } from './resources.js';
-import { registerPrompts } from './prompts.js';
+// Tool registration lives in mcp-server.ts (shared with the stdio transport).
+import { createServer } from './mcp-server.js';
+import { runStdio } from './stdio.js';
+import { rehydrateTransport } from './lib/session-rehydrate.js';
+import { buildToolEmbeddings } from './lib/tool-meta.js';
+import { parseToolProfile } from './lib/tool-profile.js';
 import { setSessionToolHook } from './lib/tool-wrapper.js';
 import { initKnowledgeGraph, shutdownKG, isKgInitialized } from './lib/knowledge-graph.js';
 import { normalizeConversation, autoDetectFormat } from './lib/conversation-normalizer.js';
@@ -87,227 +71,15 @@ import { appendJournalEntry } from './lib/journal.js';
 import { forceFullRebuild } from './lib/search.js';
 import { kgRepair } from './lib/knowledge-graph.js';
 
-// New tool imports (parity plan)
-import { register as registerKgAdd } from './tools/kg-add.js';
-import { register as registerKgQuery } from './tools/kg-query.js';
-import { register as registerKgTimeline } from './tools/kg-timeline.js';
-import { register as registerKgInvalidate } from './tools/kg-invalidate.js';
-import { register as registerCheckDuplicate } from './tools/check-duplicate.js';
-import { register as registerConversationsMine } from './tools/conversations-mine.js';
-import { register as registerEntityDetect } from './tools/entity-detect.js';
-import { register as registerEntityRebuild } from './tools/entity-rebuild.js';
-import { register as registerMemoryWakeup } from './tools/memory-wakeup.js';
-import { register as registerGraphTraverse } from './tools/graph-traverse.js';
-import { register as registerDiaryWrite } from './tools/diary-write.js';
-import { register as registerDiaryRead } from './tools/diary-read.js';
-import { register as registerAgentDiaryAppend } from './tools/agent-diary-append.js';
-import { register as registerAgentDiaryRead } from './tools/agent-diary-read.js';
-import { register as registerBenchmarkRun } from './tools/benchmark-run.js';
-import { register as registerIndexRepair } from './tools/index-repair.js';
-import { register as registerGraphStats } from './tools/graph-stats.js';
-import { register as registerKgStats } from './tools/kg-stats.js';
-import { register as registerVaultStatus } from './tools/vault-status.js';
-import { register as registerVaultTaxonomy } from './tools/vault-taxonomy.js';
-import { register as registerNotesDelete } from './tools/notes-delete.js';
-import { register as registerMemoryDream } from './tools/memory-dream.js';
-import { register as registerMemoryPromote } from './tools/memory-promote.js';
-import { register as registerReasoningSave } from './tools/reasoning-save.js';
-import { register as registerReasoningSearch } from './tools/reasoning-search.js';
-
-// AGENT-A new tool registrations
-import { register as registerMemoryConsolidateSeries } from './tools/memory-consolidate-series.js';
-// END AGENT-A new tool registrations
-
-// AGENT-B new tool registrations
-import { register as registerNotesCategorize } from './tools/notes-categorize.js';
-// END AGENT-B new tool registrations
-
-// AGENT-C new tool registrations
-import { register as registerGraphOrphans } from './tools/graph-orphans.js';
-import { register as registerGraphBrokenLinks } from './tools/graph-broken-links.js';
-import { register as registerTagsHygiene } from './tools/tags-hygiene.js';
 import { registerJob, stopAllJobs } from './lib/scheduler.js';
 import { markActivity, getLastActivityAt, shouldFireIdleDream } from './lib/activity.js';
 import { refreshSourceVaults, sourceVaultTransports } from './lib/vault/registry.js';
 import { decayMemories, autoArchiveColdMemories } from './lib/memory-lifecycle.js';
-// END AGENT-C new tool registrations
-
-// Agents / Teams registry tools
-import { register as registerAgentsList } from './tools/agents-list.js';
-import { register as registerAgentsGet } from './tools/agents-get.js';
-import { register as registerTeamsList } from './tools/teams-list.js';
-import { register as registerTeamsGet } from './tools/teams-get.js';
-import { register as registerTeamDispatch } from './tools/team-dispatch.js';
-import { register as registerSkillsList } from './tools/skills-list.js';
-import { register as registerSkillsGet } from './tools/skills-get.js';
-
-// Code-nav tools (phase 1 + Wave 1 + Wave 2)
-import {
-  registerCodeIndexRepo,
-  registerCodeIngestRepo,
-  registerCodeSyncPull,
-  registerCodeSavingsPush,
-  registerCodeReposSync,
-  registerCodeSymbolSearch,
-  registerCodeSymbolGet,
-  registerCodeSymbolCallers,
-  registerCodeSymbolCallees,
-  registerCodeFileOutline,
-  registerCodeRepoRegister,
-  registerCodeRepoList,
-  registerCodeRepoScan,
-  registerCodeRepoRename,
-  registerCodeRepoDrop,
-  registerCodeProjectSymbol,
-  registerCodeCheckStaleness,
-  registerCodeIndexRequestsPoll,
-  registerCodeChangeImpact,
-  registerCodeCallChain,
-  registerCodeFullContext,
-  registerCodeAuditFile,
-  registerCodeNavStats,
-  registerCodeFindImportCycles,
-  registerCodeFindDeadCode,
-  registerCodeFindSemanticDuplicates,
-  registerCodeDetectBreakingChanges,
-} from './tools/code-nav.js';
 import { loadVaultRegistryIntoDb, getCodeDb } from './lib/code-nav/db.js';
 import { readVaultRegistry } from './lib/code-nav/registry.js';
 import { probeGit } from './lib/code-nav/repos.js';
 import { getCodeNavStats } from './lib/code-nav/stats.js';
 
-const allRegistrations = [
-  registerNotesSearch,
-  registerNotesGet,
-  registerGraphNeighbors,
-  registerNotesUpsert,
-  registerNotesLinkEntities,
-  registerJournalAppend,
-  registerArtifactIngest,
-  registerTasksCreate,
-  registerTasksResolve,
-  registerBriefDaily,
-  registerMemoryTemperature,
-  registerMemoryConsolidate,
-  registerNotesArchive,
-  registerMemoryStore,
-  registerMemoryRecall,
-  registerNotesList,
-  registerTagsList,
-  registerArtifactUploadToken,
-  // Parity plan tools
-  registerKgAdd,
-  registerKgQuery,
-  registerKgTimeline,
-  registerKgInvalidate,
-  registerCheckDuplicate,
-  registerConversationsMine,
-  registerEntityDetect,
-  registerMemoryWakeup,
-  registerGraphTraverse,
-  registerDiaryWrite,
-  registerDiaryRead,
-  registerAgentDiaryAppend,
-  registerAgentDiaryRead,
-  registerBenchmarkRun,
-  registerIndexRepair,
-  registerGraphStats,
-  registerKgStats,
-  registerEntityRebuild,
-  registerVaultStatus,
-  registerVaultTaxonomy,
-  registerNotesDelete,
-  registerMemoryDream,
-  registerMemoryPromote,
-  // Reasoning traces (token-savior parity, Slice 7)
-  registerReasoningSave,
-  registerReasoningSearch,
-  // AGENT-A new tool registrations
-  registerMemoryConsolidateSeries,
-  // END AGENT-A new tool registrations
-  // AGENT-B new tool registrations
-  registerNotesCategorize,
-  // END AGENT-B new tool registrations
-  // AGENT-C new tool registrations
-  registerGraphOrphans,
-  registerGraphBrokenLinks,
-  registerTagsHygiene,
-  // END AGENT-C new tool registrations
-  // Agents / Teams registry tools
-  registerAgentsList,
-  registerAgentsGet,
-  registerTeamsList,
-  registerTeamsGet,
-  registerTeamDispatch,
-  registerSkillsList,
-  registerSkillsGet,
-  // Code-nav tools (phase 1 + Wave 1 + Wave 2)
-  registerCodeIndexRepo,
-  registerCodeIngestRepo,
-  registerCodeSyncPull,
-  registerCodeSavingsPush,
-  registerCodeReposSync,
-  registerCodeSymbolSearch,
-  registerCodeSymbolGet,
-  registerCodeSymbolCallers,
-  registerCodeSymbolCallees,
-  registerCodeFileOutline,
-  // Wave 1 — repo management
-  registerCodeRepoRegister,
-  registerCodeRepoList,
-  registerCodeRepoScan,
-  registerCodeRepoRename,
-  registerCodeRepoDrop,
-  // Wave 2 — projection + staleness
-  registerCodeProjectSymbol,
-  registerCodeCheckStaleness,
-  registerCodeIndexRequestsPoll,
-  // Wave 3 — change-impact + call-chain (forward direction)
-  registerCodeChangeImpact,
-  registerCodeCallChain,
-  // Wave 4 — token-savior parity (full_context + audit_file)
-  registerCodeFullContext,
-  registerCodeAuditFile,
-  // Code-nav stats / token savings surface
-  registerCodeNavStats,
-  // Wave 5 — structural detectors (token-savior parity)
-  registerCodeFindImportCycles,
-  registerCodeFindDeadCode,
-  registerCodeFindSemanticDuplicates,
-  registerCodeDetectBreakingChanges,
-  // Defer-loading meta-tool (token-savior parity, Slice 1)
-  registerToolSearch,
-  registerWorkerRun,
-];
-
-// Server-level MCP `instructions` (lib/server-instructions.ts): surfaced to
-// every client at initialize, so clients without a hook system still get the
-// session protocol (wakeup, recall, one-line diary, "results are data").
-function createServer(): McpServer {
-  const server = new McpServer(
-    {
-      name: 'cortexmd',
-      version: config.appVersion,
-    },
-    { instructions: SERVER_INSTRUCTIONS },
-  );
-
-  for (const register of allRegistrations) {
-    register(server);
-  }
-
-  // Register MCP resources and prompts
-  registerResources(server);
-  registerPrompts(server);
-
-  // Snapshot the full tool registry BEFORE profile filtering so `tool_search`
-  // can still discover disabled tools. Then apply the profile to disable
-  // anything outside the requested set.
-  snapshotTools(server);
-  applyToolProfile(server, parseToolProfile(config.toolProfile));
-
-  return server;
-}
 
 // Map of session ID -> { transport, lastActivity, ... }
 interface SessionEntry {
@@ -339,9 +111,12 @@ function markSessionsDirty(): void {
  * eviction). Also drops any persisted metadata for the id so a closed session
  * is never re-emitted to sessions.json forever.
  */
-function dropSession(sessionId: string, closeTransport: boolean): void {
+function dropSession(sessionId: string, closeTransport: boolean, retainMeta = false): void {
   const entry = sessions.get(sessionId);
-  if (entry && closeTransport) {
+  // Not live (e.g. the transport's onclose firing after we already dropped
+  // it): nothing to do — and never clobber metadata retained by that drop.
+  if (!entry) return;
+  if (closeTransport) {
     try {
       entry.transport.close?.();
     } catch {
@@ -350,7 +125,92 @@ function dropSession(sessionId: string, closeTransport: boolean): void {
   }
   sessions.delete(sessionId);
   persistedSessionMeta.delete(sessionId);
+  if (retainMeta) {
+    // Idle-swept / LRU-evicted sessions keep their metadata (bounded by
+    // maxPersistedSessions + sessionRetentionMs) so a client returning with the
+    // id is rehydrated with its owner check and tool history intact.
+    persistedSessionMeta.set(sessionId, {
+      sessionId,
+      createdAt: entry.createdAt,
+      lastActivity: entry.lastActivity,
+      requestCount: entry.requestCount,
+      clientInfo: entry.clientInfo,
+      ip: entry.ip,
+      toolCounts: { ...entry.toolCounts },
+      lastTools: [...entry.lastTools],
+    });
+    capPersistedSessionMeta();
+  }
   markSessionsDirty();
+}
+
+/** Keep the in-memory persisted-metadata map within config.maxPersistedSessions (newest kept). */
+function capPersistedSessionMeta(): void {
+  const max = config.maxPersistedSessions;
+  if (!(max > 0) || persistedSessionMeta.size <= max) return;
+  const keep = new Set(capSessionRecords([...persistedSessionMeta.values()], max).map((s) => s.sessionId));
+  for (const sid of persistedSessionMeta.keys()) if (!keep.has(sid)) persistedSessionMeta.delete(sid);
+}
+
+/** Register a live session (new, re-initialized or rehydrated) and enforce the LRU cap. */
+function trackSession(
+  sid: string,
+  transport: StreamableHTTPServerTransport,
+  req: Request,
+  res: Response,
+  meta: PersistedSession | undefined,
+): void {
+  evictLruSessions(1);
+  const user = res.locals.user as { sub?: string; clientId?: string } | undefined;
+  const ip = req.headers['x-forwarded-for'] as string | undefined ?? req.socket.remoteAddress;
+  sessions.set(sid, {
+    transport,
+    lastActivity: Date.now(),
+    createdAt: meta?.createdAt ?? Date.now(),
+    requestCount: (meta?.requestCount ?? 0) + 1,
+    clientInfo: user ? { sub: user.sub, clientId: user.clientId } : meta?.clientInfo,
+    ip: typeof ip === 'string' ? ip.split(',')[0].trim() : meta?.ip,
+    toolCounts: { ...(meta?.toolCounts ?? {}) },
+    lastTools: [...(meta?.lastTools ?? [])],
+  });
+  markSessionsDirty();
+  setActiveSessionsCount(sessions.size);
+}
+
+/**
+ * Rehydrate an unknown session id presented by an authenticated client
+ * (see lib/session-rehydrate.ts). Returns the primed transport, now tracked in
+ * `sessions` (so the idle sweep and LRU cap apply), or null → caller sends 404.
+ * Refuses an id whose retained metadata belongs to a different principal.
+ */
+async function adoptSession(
+  sessionId: string,
+  req: Request,
+  res: Response,
+): Promise<StreamableHTTPServerTransport | null> {
+  const meta = persistedSessionMeta.get(sessionId);
+  const user = res.locals.user as { sub?: string } | undefined;
+  if (meta?.clientInfo?.sub && user?.sub && meta.clientInfo.sub !== user.sub) {
+    logger.warn('Session rehydrate refused: principal mismatch', { sessionId });
+    return null;
+  }
+  const protocolHeader = req.headers['mcp-protocol-version'];
+  const primed = await rehydrateTransport(
+    sessionId,
+    () => createServer(),
+    typeof protocolHeader === 'string' ? protocolHeader : undefined,
+  );
+  if (!primed) return null;
+  const { transport } = primed;
+  transport.onclose = () => {
+    // Only drop the map entry if it still points at THIS transport.
+    if (sessions.get(sessionId)?.transport === transport) dropSession(sessionId, false);
+    setActiveSessionsCount(sessions.size);
+  };
+  persistedSessionMeta.delete(sessionId);
+  trackSession(sessionId, transport, req, res, meta);
+  logger.info('Session rehydrated', { sessionId, hadMeta: !!meta });
+  return transport;
 }
 
 /**
@@ -360,7 +220,7 @@ function dropSession(sessionId: string, closeTransport: boolean): void {
 function evictLruSessions(incoming = 1): void {
   const victims = selectSessionsToEvict(sessions, config.maxActiveSessions, incoming);
   if (victims.length === 0) return;
-  for (const sid of victims) dropSession(sid, true);
+  for (const sid of victims) dropSession(sid, true, true);
   setActiveSessionsCount(sessions.size);
   logger.warn('Session LRU eviction', {
     evicted: victims.length,
@@ -571,12 +431,57 @@ app.use((req: Request, res: Response, next: NextFunction) => {
 // /authorize is protected by Authelia via Traefik; others are open.
 app.use(oauthRouter);
 
-// Health check (no auth). Shape is the I-1 contract consumed by the dashboard
-// "Server" card and `cortexmd status` — keep field names stable.
-app.get('/health', (_req, res) => {
-  const metrics = getMetrics();
+// Heap pressure as a share of the V8 heap limit (the container caps the heap
+// via --max-old-space-size). Shared by /health and the periodic log check.
+function heapSnapshot(): { usedMb: number; totalMb: number; rssMb: number; limitMb: number; externalMb: number; pct: number; warnPct: number; warn: boolean } {
   const mem = process.memoryUsage();
+  const limit = v8.getHeapStatistics().heap_size_limit;
   const toMb = (bytes: number): number => Math.round(bytes / 1048576);
+  const pct = limit > 0 ? Math.round((mem.heapUsed / limit) * 1000) / 10 : 0;
+  return {
+    usedMb: toMb(mem.heapUsed),
+    totalMb: toMb(mem.heapTotal),
+    rssMb: toMb(mem.rss),
+    limitMb: toMb(limit),
+    externalMb: toMb(mem.external),
+    pct,
+    warnPct: config.heapWarnPct,
+    warn: pct >= config.heapWarnPct,
+  };
+}
+
+let heapWarned = false;
+/** Log once when heap crosses HEAP_WARN_PCT; re-arm 5 points below it. */
+function checkHeapPressure(): void {
+  const h = heapSnapshot();
+  if (h.warn && !heapWarned) {
+    heapWarned = true;
+    logger.warn('Heap usage high', { usedMb: h.usedMb, limitMb: h.limitMb, pct: h.pct, warnPct: h.warnPct, notes: getIndexedNoteCount() });
+  } else if (heapWarned && h.pct < config.heapWarnPct - 5) {
+    heapWarned = false;
+    logger.info('Heap usage back below warning threshold', { usedMb: h.usedMb, pct: h.pct });
+  }
+}
+
+// Health check. Unauthenticated callers (Docker healthcheck, uptime probes) get
+// a minimal liveness payload: { status, version, commit }. `status` is
+// `indexing` while the boot index build runs (the server listens before it
+// finishes), `degraded` if that build failed, else `ok` — always HTTP 200 so
+// liveness probes don't kill a booting container. The detailed I-1 payload
+// (heap, sessions, last index update, last exit — consumed by the dashboard
+// "Server" card and `cortexmd status`) requires a credential the dashboard
+// accepts: Bearer API key / OAuth JWT, dashboard session cookie, or
+// forward-auth Remote-User when PROXY_AUTH=true. Keep field names stable.
+app.get('/health', async (req, res) => {
+  const state = getIndexState();
+  const status = state === 'indexing' ? 'indexing' : state === 'error' ? 'degraded' : 'ok';
+  const base = { status, version: config.appVersion, commit: config.gitSha };
+  if (!(await isRequestAuthenticated(req))) {
+    res.json(base);
+    return;
+  }
+
+  const metrics = getMetrics();
 
   // lib/search.ts exports getLastIndexUpdate() once DEV-B lands; guard so
   // /health never breaks on an older build.
@@ -591,18 +496,12 @@ app.get('/health', (_req, res) => {
   }
 
   res.json({
-    status: 'ok',
-    version: config.appVersion,
-    commit: config.gitSha,
+    ...base,
     uptime: metrics.uptime,
     activeSessions: sessions.size,
     indexedNotes: getIndexedNoteCount(),
-    heap: {
-      usedMb: toMb(mem.heapUsed),
-      totalMb: toMb(mem.heapTotal),
-      rssMb: toMb(mem.rss),
-      limitMb: toMb(v8.getHeapStatistics().heap_size_limit),
-    },
+    index: { state, progress: getIndexProgress() },
+    heap: heapSnapshot(),
     sessions: {
       active: sessions.size,
       persisted: persistedSessionMeta.size,
@@ -622,7 +521,7 @@ app.get('/health', (_req, res) => {
 /** Render the minimal login form. `error` shows a red banner when set. */
 function renderLoginPage(error?: string): string {
   const banner = error
-    ? `<p style="color:#c0392b;margin:0 0 1rem">${error}</p>`
+    ? `<p role="alert" style="color:#ff8a80;margin:0 0 1rem">${error}</p>`
     : '';
   return `<!DOCTYPE html>
 <html lang="en">
@@ -799,7 +698,7 @@ app.get('/api/hud-stats', apiKeyMiddleware, async (_req, res) => {
       memoryTemperature: { hot, warm, cold },
       aggregateP95Ms,
       uptimeSec: Math.round(m.uptime / 1000),
-      profile: (config.toolProfile as string) ?? 'full',
+      profile: parseToolProfile(config.toolProfile),
     });
   } catch (err: any) {
     logger.error('api/hud-stats failed', { error: err.message });
@@ -834,6 +733,28 @@ app.post('/api/recall', apiKeyMiddleware, async (req: Request, res: Response) =>
     res.status(500).json({ error: err.message });
   }
 });
+
+// GET|POST /api/wakeup — session-boot context without an MCP handshake.
+// Params (query string for GET, JSON body for POST as `cortexmd wakeup`
+// sends): agentName, preset (tiny|standard|full), project, machine. Returns
+// the `memory_wakeup` tool result verbatim ({ content: [{ type, text }] }).
+const handleApiWakeup = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const raw = (req.method === 'POST' ? req.body : req.query) as Record<string, unknown> | undefined;
+    const { parseWakeupParams, wakeupForApi } = await import('./lib/wakeup-api.js');
+    const result = await wakeupForApi(parseWakeupParams(raw ?? {}));
+    res.status(result.isError ? 500 : 200).json(result);
+  } catch (err: any) {
+    if (err && typeof err.status === 'number' && typeof err.message === 'string' && err.status < 500) {
+      res.status(err.status).json({ error: err.message });
+      return;
+    }
+    logger.error('api/wakeup failed', { error: err.message });
+    res.status(500).json({ error: err.message });
+  }
+};
+app.get('/api/wakeup', apiKeyMiddleware, handleApiWakeup);
+app.post('/api/wakeup', apiKeyMiddleware, handleApiWakeup);
 
 // POST /api/store-memory — lightweight memory append for hook-driven capture.
 // Skips the heavy memory_store path (no preference extraction, no entity
@@ -1872,6 +1793,10 @@ app.get('/debug', dashboardAuthMiddleware, async (_req, res) => {
   res.json(results);
 });
 
+// Dashboard CSP + CSRF check for every /dashboard/* request (incl. the
+// source-vault routes below). Must stay BEFORE any /dashboard route.
+app.use('/dashboard', dashboardSecurityMiddleware);
+
 // ── Read-only source-vault management (Component C) ─────────────────────────
 // REST surface for the dashboard "Read-only vaults" panel. All routes require a
 // dashboard session / API-key / forward-auth credential (dashboardAuthMiddleware).
@@ -2037,16 +1962,22 @@ app.post('/mcp', async (req, res) => {
     }
     return;
   } else if (sessionId) {
-    // Unknown session ID on a non-initialize request — return 404 per MCP spec.
-    // The client should drop the stale session and POST a fresh initialize
-    // (with or without the old session ID; both paths are supported).
-    res.status(404).json({
-      jsonrpc: '2.0',
-      error: { code: -32000, message: 'Session expired — please reconnect' },
-      id: null,
-    });
-    if (persistedSessionMeta.delete(sessionId)) markSessionsDirty();
-    return;
+    // Unknown session ID on a non-initialize request (idle-swept, LRU-evicted,
+    // or issued before a restart). The request already passed apiKeyMiddleware,
+    // so instead of a 404 we adopt the id: fresh server + transport primed
+    // under the same id (lib/session-rehydrate.ts), then serve the request.
+    // Falls back to the spec 404 when the id belongs to another principal or
+    // cannot be adopted.
+    const adopted = await adoptSession(sessionId, req, res);
+    if (!adopted) {
+      res.status(404).json({
+        jsonrpc: '2.0',
+        error: { code: -32001, message: 'Session not found — please re-initialize' },
+        id: null,
+      });
+      return;
+    }
+    transport = adopted;
   } else {
     // Create new transport and server for this session
     transport = new StreamableHTTPServerTransport({
@@ -2094,9 +2025,16 @@ app.post('/mcp', async (req, res) => {
 // GET /mcp - SSE stream for notifications
 app.get('/mcp', async (req, res) => {
   const sessionId = req.headers['mcp-session-id'] as string | undefined;
-  if (!sessionId || !sessions.has(sessionId)) {
+  if (!sessionId) {
     res.status(400).json({ error: 'Invalid or missing session ID' });
     return;
+  }
+  if (!sessions.has(sessionId)) {
+    // Stale id on the standalone SSE stream: rehydrate like POST does.
+    if (!(await adoptSession(sessionId, req, res))) {
+      res.status(404).json({ jsonrpc: '2.0', error: { code: -32001, message: 'Session not found' }, id: null });
+      return;
+    }
   }
 
   updateSessionActivity(sessionId);
@@ -2163,7 +2101,7 @@ function cleanupSessions(): void {
 
     for (const [sid, entry] of sessions) {
       if (now - entry.lastActivity > timeout) {
-        dropSession(sid, true);
+        dropSession(sid, true, true);
         cleaned++;
       }
     }
@@ -2202,6 +2140,13 @@ function persistSessionsIfDirty(force = false): void {
 async function main(): Promise<void> {
   console.log('[cortexmd] Starting up...');
   console.log('[cortexmd] Vaults:', JSON.stringify(config.allVaults));
+  if (config.searchBackendRequested !== 'minisearch') {
+    logger.warn('SEARCH_BACKEND is not wired yet — continuing with the MiniSearch backend', {
+      requested: config.searchBackendRequested,
+      active: config.searchBackend,
+      hint: 'sqlite / shadow are reserved for the rollout in docs/ARCHITECTURE.md §6; unset SEARCH_BACKEND to silence this warning',
+    });
+  }
   console.log('[cortexmd] UID:', process.getuid?.() ?? 'N/A', 'GID:', process.getgid?.() ?? 'N/A');
 
   // Start embedding model loading in parallel with index build (model load is I/O-bound)
@@ -2213,8 +2158,18 @@ async function main(): Promise<void> {
     console.log('[cortexmd] Knowledge graph initialized');
   }
 
-  await rebuildIndex();
-  console.log('[cortexmd] Index built, notes:', getIndexedNoteCount());
+  // Listen-first boot: start the index build but do NOT await it here. The
+  // HTTP server starts accepting connections below while files are read
+  // (bounded concurrency); /health says `indexing` and tool calls wait for
+  // readiness (lib/tool-wrapper.ts) until the build completes.
+  const bootStartedAt = Date.now();
+  const initialIndex: Promise<void> = rebuildIndex().then(() => {
+    console.log('[cortexmd] Index built, notes:', getIndexedNoteCount(), `(${Date.now() - bootStartedAt} ms)`);
+  }, (err) => {
+    logger.error('Initial index build failed — retried by the periodic rescan', {
+      error: err instanceof Error ? err.message : String(err),
+    });
+  });
 
   // Hot reindex on runtime source-vault add/remove (Component B). Debounced so a
   // burst of changes coalesces into a single full rebuild; a removed vault's
@@ -2258,9 +2213,12 @@ async function main(): Promise<void> {
   }
 
   // ── Start accepting connections NOW ────────────────────────────────────
-  // Lexical search is ready, sessions are restored. Embeddings, graph,
-  // and benchmark build in the background — search degrades gracefully
-  // (lexical-only) until the semantic index finishes.
+  // Sessions are restored; the lexical index is still building (see above).
+  // Embeddings, graph, and benchmark build in the background once it is —
+  // search degrades gracefully (lexical-only) until the semantic index is up.
+  const server = app.listen(config.port, () => {
+    logger.info(`cortexmd listening on port ${config.port}`, { bootToListenMs: Date.now() - bootStartedAt });
+  });
 
   // Register samplers for dashboard
   registerTemperatureSampler(() => {
@@ -2485,9 +2443,23 @@ async function main(): Promise<void> {
     });
   }
 
-  const server = app.listen(config.port, () => {
-    logger.info(`cortexmd listening on port ${config.port}`);
-  });
+  // Scheduled brain-vault backup (BACKUP_SCHEDULE=on | "M H * * *"; off by default).
+  const backupSchedule = backupCron();
+  if (backupSchedule) {
+    registerJob({
+      name: 'brain_backup',
+      cron: backupSchedule,
+      handler: async () => {
+        await createBackup({ vaultDir: config.brainVault, backupDir: resolveBackupDir(), keep: config.backupKeep });
+      },
+    });
+    logger.info('Brain backup scheduled', { cron: backupSchedule, dir: resolveBackupDir(), keep: config.backupKeep });
+  } else if (config.backupSchedule.toLowerCase() !== 'off' && config.backupSchedule !== '') {
+    logger.warn('BACKUP_SCHEDULE not understood — expected "on", "off" or "M H * * *"', { value: config.backupSchedule });
+  }
+
+  // Heap-pressure warning (HEAP_WARN_PCT of the V8 heap limit).
+  setInterval(checkHeapPressure, 60_000).unref();
 
   // ── Background: heavy I/O that doesn't block request handling ─────────
 
@@ -2501,6 +2473,7 @@ async function main(): Promise<void> {
   // Build embedding index (model load + vectorize 1000+ docs)
   if (config.enableEmbeddings && embeddingsInitPromise) {
     embeddingsInitPromise.then(async () => {
+      await initialIndex; // reconcile against the complete doc set
       const dm = getDocMeta();
       const docTexts = new Map<string, { title: string; content: string }>();
       for (const [p, meta] of dm) {
@@ -2539,6 +2512,7 @@ async function main(): Promise<void> {
 
   // Run retrieval benchmark (non-blocking)
   import('./lib/benchmark.js').then(async ({ runBenchmark, runRescueBenchmark }) => {
+    await initialIndex;
     const summary = await runBenchmark();
     const { setBenchmarkResults, setRescueResults } = await import('./lib/metrics.js');
     setBenchmarkResults(summary);
@@ -2641,7 +2615,18 @@ async function main(): Promise<void> {
   process.on('unhandledRejection', (err) => fatal('unhandledRejection', err));
 }
 
-main().catch((err) => {
+/** Test seam: the Express app and session internals (no listener is started). */
+export const __httpTestInternals = { app, sessions, persistedSessionMeta, cleanupSessions };
+
+// `node dist/index.js --stdio`: MCP over stdin/stdout for a local client
+// (no HTTP listener, auth or dashboard). CORTEXMD_NO_AUTOSTART=1 lets tests
+// import the HTTP app without booting the server.
+const entry = STDIO_MODE
+  ? runStdio(() => createServer())
+  : process.env.CORTEXMD_NO_AUTOSTART === '1'
+    ? Promise.resolve()
+    : main();
+entry.catch((err) => {
   logger.error('Failed to start server', {
     error: err instanceof Error ? err.message : String(err),
   });

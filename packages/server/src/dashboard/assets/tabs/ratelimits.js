@@ -193,7 +193,7 @@ function renderTable(el, ctx) {
       + '<td class="num ' + remClass + '">' + fmt.fmt(r.remaining) + '</td>'
       + '<td>' + resetCell + '</td>'
       + '<td class="num"><button type="button" class="btn btn-danger btn--sm" '
-        + 'onclick="cortex.resetRl(\'' + esc(r.key) + '\')" aria-label="Reset rate limit for ' + esc(ip) + '">Reset</button></td>'
+        + 'data-cx-click="cortex.resetRl(\'' + esc(r.key) + '\')" aria-label="Reset rate limit for ' + esc(ip) + '">Reset</button></td>'
       + '</tr>';
   }).join('');
 }

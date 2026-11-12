@@ -24,6 +24,7 @@ import { recordConsolidation } from './metrics.js';
 import { isProtectedFromConsolidation } from './memory-lifecycle.js';
 import { logger } from './logger.js';
 import { rewriteInboundLinks } from './link-rewrite.js';
+import { diaryProjectSlugs, isDiaryPath, isImplausibleProjectName } from './vault-hygiene/patterns.js';
 
 export interface ColdCluster {
   paths: string[];
@@ -184,6 +185,57 @@ function stripLeadingTitle(body: string): string {
   return body.replace(/^\s*#\s+.*(?:\r?\n)+/, '').trim();
 }
 
+// ---------------------------------------------------------------------------
+// Registry guard: reconcile only into REAL projects
+// ---------------------------------------------------------------------------
+
+/**
+ * Project slugs the agents themselves vouch for: every `[[Projects/<slug>]]`
+ * an agent diary line links (agent_diary_append's project=<git repo slug>).
+ */
+export function diaryProjectSlugSet(): Set<string> {
+  const out = new Set<string>();
+  for (const [p, meta] of getDocMeta()) {
+    if (!isDiaryPath(p)) continue;
+    for (const slug of diaryProjectSlugs(meta.content ?? '')) out.add(slug);
+  }
+  return out;
+}
+
+export interface ProjectGuardResult {
+  ok: boolean;
+  slug: string;
+  reason: 'diary-slug' | 'project-note' | 'tag-pair' | 'implausible-name' | 'unconfirmed' | 'auto-reconciled-only';
+}
+
+/**
+ * Is `name` a registry-confirmed project entity? Confirmed means either
+ *   - a git repo slug some agent diary links as `[[Projects/<slug>]]`, or
+ *   - an existing `Projects/<slug>.md` with `type: project` that a human or a
+ *     diary stub created (NOT one the dream itself auto-reconciled — that is
+ *     how 27 junk projects named after people, filenames and tag pairs were
+ *     born and then kept attracting more notes).
+ * Tag pairs (`a + b`), filenames and dated/email slugs are never projects.
+ */
+export async function checkProjectGuard(
+  name: string,
+  basis = '',
+  diarySlugs: Set<string> = diaryProjectSlugSet(),
+): Promise<ProjectGuardResult> {
+  const slug = slugify(name);
+  if (basis.startsWith('tags:')) return { ok: false, slug, reason: 'tag-pair' };
+  if (!slug || isImplausibleProjectName(name)) return { ok: false, slug, reason: 'implausible-name' };
+  if (diarySlugs.has(slug)) return { ok: true, slug, reason: 'diary-slug' };
+  try {
+    const { data } = parseFrontmatter((await readNote(`Projects/${slug}.md`)).content);
+    if (data.type === 'project' && data.auto_reconciled !== true) return { ok: true, slug, reason: 'project-note' };
+    if (data.type === 'project') return { ok: false, slug, reason: 'auto-reconciled-only' };
+  } catch {
+    // No such note.
+  }
+  return { ok: false, slug, reason: 'unconfirmed' };
+}
+
 /**
  * Tie one cold cluster together via a project note.
  *
@@ -198,15 +250,24 @@ function stripLeadingTitle(body: string): string {
  * originals, making the project note their durable home. Only reachable when a
  * caller explicitly asks for it.
  *
- * Returns null on hard failure or when there is nothing new to add. Respects
- * dryRun (computes the plan, writes/deletes nothing).
+ * Returns null on hard failure, when there is nothing new to add, or when the
+ * cluster's tie is not a registry-confirmed project (see checkProjectGuard —
+ * people, filenames and tag pairs never become projects). Respects dryRun
+ * (computes the plan, writes/deletes nothing).
  */
 export async function reconcileClusterIntoProject(
   cluster: ColdCluster,
   dryRun = false,
   destructive = false,
 ): Promise<ProjectReconciliation | null> {
-  const slug = slugify(cluster.suggestedTitle) || 'project';
+  const guard = await checkProjectGuard(cluster.suggestedTitle, cluster.basis);
+  if (!guard.ok) {
+    logger.info('reconcileClusterIntoProject: skipped — not a confirmed project', {
+      slug: guard.slug, reason: guard.reason, basis: cluster.basis,
+    });
+    return null;
+  }
+  const slug = guard.slug;
   const projectPath = `Projects/${slug}.md`;
   const todayStr = new Date().toISOString().slice(0, 10);
 

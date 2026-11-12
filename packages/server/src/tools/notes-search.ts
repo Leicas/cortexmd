@@ -12,7 +12,7 @@ const IMPORTANCE_ORDER = ['low', 'medium', 'high', 'critical'];
 export function register(server: McpServer): void {
   server.tool(
     "notes_search",
-    "Search notes in the vault by query, with optional filters for scope paths, tags, date range, type, category, temperature, importance, and result limit. Use search results to discover existing notes worth linking to — when creating or updating a note, search for related topics first and add [[wiki-links]] to connect them",
+    "Search vault notes by query with optional filters (paths, tags, dates, type, category, temperature, importance, collections). Search before creating/updating a note to find existing notes to [[wiki-link]].",
     {
       query: z.string().describe("Search query string"),
       scopePaths: z.array(z.string()).optional().describe("Limit search to these vault paths"),

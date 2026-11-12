@@ -6,7 +6,7 @@ import { listFiles, readNote } from './vault.js';
 import { parseFrontmatter } from './frontmatter.js';
 import { setIndexedNotes, recordIndexRebuild } from './metrics.js';
 import { logger } from './logger.js';
-import { isEmbeddingsReady, searchSemantic, embedAndIndex, removeFromVectorIndex } from './embeddings.js';
+import { isEmbeddingsReady, searchSemantic, embedAndIndex, removeFromVectorIndex, enqueueEmbedSync } from './embeddings.js';
 import { classifyPath, getCollectionWeight } from './collections.js';
 import { isRerankerEnabled, rerankResults } from './reranker.js';
 import { isPathIndexable, sourceNameForVault } from './index-allowlist.js';
@@ -14,9 +14,18 @@ import { getVault, pruneStaleVaultTransports } from './vault/registry.js';
 import { listSourceVaultPaths } from './source-vaults.js';
 import { withinWindow, toIso } from './bitemporal.js';
 import { extractWikilinks } from './markdown.js';
+import {
+  docLinks,
+  forEachOrderedConcurrent,
+  getIndexState,
+  setIndexProgress,
+  setIndexState,
+} from './index-state.js';
 import { buildLinkLookup, resolveWikilink } from './link-resolver.js';
 import { detectEntities } from './entity-detector.js';
+import { analyzeTerm, analyzeText, foldText, fuzzyForTerm, prefixForTerm } from './text-analyzer.js';
 import { kgAllMentionTriples } from './knowledge-graph.js';
+import { memoryKindOf, type MemoryKind } from './memory-kind.js';
 import {
   buildRecallGraph,
   runPPR,
@@ -31,13 +40,28 @@ export interface SearchOptions {
   dateFrom?: string;
   dateTo?: string;
   limit?: number;
-  type?: string;
+  /** Frontmatter `type` to keep; an array keeps any of the listed types. */
+  type?: string | string[];
   category?: string;
   temperature?: 'hot' | 'warm' | 'cold';
   minHeatScore?: number;
   importance?: string;
   excludeArchived?: boolean;
   collections?: string[];
+  /**
+   * Memory kinds to keep (episodic / semantic / procedural, see
+   * lib/memory-kind.ts). Omitted or empty: every kind. Applied with the other
+   * scope filters, BEFORE ranking, so an out-of-scope kind never takes a
+   * candidate slot.
+   */
+  kinds?: readonly MemoryKind[];
+  /**
+   * Extra scope predicate, applied with the other filters BEFORE ranking. Use
+   * it when a caller would otherwise drop results afterwards: a note that can
+   * never be returned must not take a candidate slot nor set the scale the
+   * lexical arm is normalised by.
+   */
+  filter?: (path: string, meta: Readonly<DocMeta>) => boolean;
   /**
    * Bitemporal as-of instant (ISO). When set, notes whose validity window
    * `[valid_from, valid_to)` excludes `asOf` are suppressed from results. When
@@ -61,6 +85,12 @@ export interface SearchOptions {
    * reranker is globally enabled (e.g. internal similarity lookups).
    */
   rerank?: boolean;
+  /**
+   * Build the query-aware snippet for each result (default true). Callers that
+   * re-rank and keep only a few results (memory_recall) pass false and build
+   * snippets for the survivors themselves — `snippet` is then ''.
+   */
+  snippets?: boolean;
 }
 
 export interface SearchResult {
@@ -70,11 +100,32 @@ export interface SearchResult {
   score: number;           // keep for backward compat (= fusedScore)
   lexicalScore: number;    // RRF contribution from lexical search
   semanticScore: number;   // RRF contribution from semantic search
-  graphScore: number;      // RRF contribution from the PPR graph arm (0 when the arm is off)
+  graphScore: number;      // contribution from the PPR graph arm (0 when the arm is off)
   fusedScore: number;      // (lexicalScore + semanticScore + graphScore) × collectionBoost
+  /** Raw BM25 score from the lexical arm (undefined when the note was not a lexical hit). */
+  lexicalRaw?: number;
+  /** Cosine similarity from the semantic arm (undefined when not a kNN hit). */
+  semanticSim?: number;
+  /**
+   * IDF-weighted share (0..1) of the analysed query terms this note matches.
+   * Absolute lexical evidence: unlike rank-relative scores it does not saturate
+   * at 1 for the best hit of a query that nothing really answers.
+   */
+  coverage?: number;
+  /**
+   * Raw BM25 ÷ the query's total IDF mass: lexical match strength per unit of
+   * query information, comparable across queries of different lengths (used by
+   * recall's minimum-evidence floor). Undefined when not a lexical hit.
+   */
+  lexicalEvidence?: number;
+  /**
+   * The note's best-matching embedding chunk (semantic arm): offsets into the
+   * note body and its text. Present only for kNN hits with chunk vectors.
+   */
+  chunk?: { index: number; start: number; end: number; text?: string };
 }
 
-interface DocMeta {
+export interface DocMeta {
   date?: string;
   tags: string[];
   content: string;
@@ -88,6 +139,14 @@ interface DocMeta {
   archived?: boolean;
   consolidated_into?: string;
   collection: string;
+  /** Frontmatter `source` (e.g. `hook:PostToolUse:Bash`, `n8n:…`) — marks machine captures. */
+  source?: string;
+  /**
+   * Episodic / semantic / procedural (lib/memory-kind.ts): explicit
+   * `memory_kind` frontmatter, else classified from path, type, category, tags,
+   * source and title at index time. Drives recall's kind scope and tiers.
+   */
+  memory_kind: MemoryKind;
   // Carried so memory_recall can score/filter without re-reading the file:
   related?: string[];
   validity_alpha?: number;
@@ -121,11 +180,18 @@ function toIsoDay(v: unknown): string | undefined {
 
 /** Keep full rebuild and single-note updates on the same metadata contract. */
 function metadataForNote(filePath: string, data: Record<string, any>, body: string): DocMeta {
+  const tags = (Array.isArray(data.tags) ? data.tags : []).map(String);
+  const title = data.title ?? filePath.replace(/\.md$/, '').split('/').pop() ?? filePath;
   return {
     date: toIsoDay(data.date ?? data.created),
-    tags: (Array.isArray(data.tags) ? data.tags : []).map(String),
+    tags,
     content: body,
-    title: data.title ?? filePath.replace(/\.md$/, '').split('/').pop() ?? filePath,
+    title,
+    memory_kind: memoryKindOf(
+      { ...data, tags, title: typeof title === 'string' ? title : String(title), content: body },
+      filePath,
+      { machineSourcePatterns: config.machineCaptureSourcePatterns },
+    ),
     type: typeof data.type === 'string' ? data.type : undefined,
     category: typeof data.category === 'string' ? data.category : undefined,
     temperature: typeof data.temperature === 'string' ? data.temperature : undefined,
@@ -135,6 +201,7 @@ function metadataForNote(filePath: string, data: Record<string, any>, body: stri
     archived: typeof data.archived === 'boolean' ? data.archived : undefined,
     consolidated_into: typeof data.consolidated_into === 'string' ? data.consolidated_into : undefined,
     collection: classifyPath(filePath),
+    source: typeof data.source === 'string' ? data.source : undefined,
     related: Array.isArray(data.related) ? data.related as string[] : undefined,
     validity_alpha: typeof data.validity_alpha === 'number' ? data.validity_alpha : undefined,
     validity_beta: typeof data.validity_beta === 'number' ? data.validity_beta : undefined,
@@ -156,7 +223,37 @@ export interface IndexHealthEntry {
 }
 
 let miniSearch: MiniSearch;
-const docMeta = new Map<string, DocMeta>();
+
+/**
+ * docMeta with a mutation counter. Every index change (full rebuild, single-note
+ * update, removal) goes through set/delete/clear, so `indexVersion` is an exact
+ * invalidation key for caches derived from the index (the recall graph).
+ */
+let indexVersion = 0;
+class VersionedDocMeta extends Map<string, DocMeta> {
+  override set(key: string, value: DocMeta): this { indexVersion++; return super.set(key, value); }
+  override delete(key: string): boolean { indexVersion++; return super.delete(key); }
+  override clear(): void { indexVersion++; super.clear(); }
+}
+const docMeta: Map<string, DocMeta> = new VersionedDocMeta();
+
+/** Monotonic counter bumped on every index mutation (cache invalidation key). */
+export function getIndexVersion(): number {
+  return indexVersion;
+}
+
+let archivedProbe: { version: number; any: boolean } | null = null;
+
+/** Does the index hold at least one archived note? Cached per index version. */
+export function hasArchivedNotes(): boolean {
+  if (archivedProbe && archivedProbe.version === indexVersion) return archivedProbe.any;
+  let any = false;
+  for (const meta of docMeta.values()) {
+    if (meta.archived === true) { any = true; break; }
+  }
+  archivedProbe = { version: indexVersion, any };
+  return any;
+}
 let indexedNoteCount = 0;
 let lastIndexHealth: IndexHealthEntry[] = [];
 
@@ -208,37 +305,86 @@ export function forceFullRebuild(): void {
 }
 
 function createIndex(): MiniSearch {
+  if (!config.lexicalAnalyzer) {
+    // LEXICAL_ANALYZER=legacy: raw MiniSearch tokens, prefix + fuzzy everywhere.
+    return new MiniSearch({
+      fields: ['title', 'content', 'tags'],
+      storeFields: ['title'],
+      idField: 'id',
+      searchOptions: {
+        boost: { title: 3, tags: 2 },
+        prefix: true,
+        fuzzy: 0.2,
+      },
+    });
+  }
   return new MiniSearch({
     fields: ['title', 'content', 'tags'],
     storeFields: ['title'],
     idField: 'id',
+    // Bilingual analyzer (lib/text-analyzer.ts), applied at index AND query
+    // time: accent folding, EN+FR stopwords, light plural stemming.
+    processTerm: (term) => analyzeTerm(term),
     searchOptions: {
       boost: { title: 3, tags: 2 },
-      prefix: true,
-      fuzzy: 0.2,
+      prefix: (term) => prefixForTerm(term),
+      fuzzy: (term) => fuzzyForTerm(term),
     },
   });
 }
+
+/** One file read during a scan (stat + bytes), or a skip for an unchanged file. */
+type ScanRead = { skip: true } | { skip: false; content: string; mtime: number | undefined };
+
+let rebuildInFlight: Promise<void> | null = null;
+let rebuildQueued: Promise<void> | null = null;
 
 /**
  * Rebuild the full-text search index by scanning all vaults.
  * After the first full build, subsequent calls are incremental:
  * only files whose mtime has changed (or new/deleted files) are re-indexed.
+ *
+ * Overlap-guarded: the server now listens before the boot build finishes, so
+ * the 60 s rescan (or a repair) can fire mid-build. A call made while a build
+ * is running waits for it and then runs ONE coalesced follow-up rebuild.
  */
-export async function rebuildIndex(): Promise<void> {
-  const startedAt = Date.now();
-  if (isFirstBuild) {
-    // First build: full scan
-    miniSearch = createIndex();
-    docMeta.clear();
-    fileMtimes.clear();
+export function rebuildIndex(): Promise<void> {
+  if (!rebuildInFlight) {
+    rebuildInFlight = runRebuild().finally(() => { rebuildInFlight = null; });
+    return rebuildInFlight;
   }
+  if (!rebuildQueued) {
+    rebuildQueued = rebuildInFlight
+      .catch(() => undefined)
+      .then(() => { rebuildQueued = null; return rebuildIndex(); });
+  }
+  return rebuildQueued;
+}
 
-  lastIndexHealth = [];
+async function runRebuild(): Promise<void> {
+  const startedAt = Date.now();
+  // A full build (boot, forced repair, source-vault change) scans into FRESH
+  // structures and swaps them in at the end, so readers keep a complete index
+  // for the whole scan instead of an empty-then-growing one.
+  const full = isFirstBuild;
+  // Cleared up-front so a forceFullRebuild() requested DURING this run is kept
+  // for the coalesced follow-up run instead of being reset at the end.
+  isFirstBuild = false;
+  const isBootBuild = full && (getIndexState() === 'not_started' || getIndexState() === 'error');
+  if (isBootBuild) setIndexState('indexing');
+  const ms = full ? createIndex() : miniSearch;
+  const meta: Map<string, DocMeta> = full ? new Map() : docMeta;
+  const links: Map<string, string[]> = full ? new Map() : docLinks;
+  const mtimes: Map<string, number> = full ? new Map() : fileMtimes;
 
-  let fileCount = isFirstBuild ? 0 : docMeta.size;
+  const healthThisScan: IndexHealthEntry[] = [];
+
+  let fileCount = 0;
   let updatedCount = 0;
   let removedCount = 0;
+  // Paths whose text changed this scan → re-embedded in the background (the
+  // rescan used to update MiniSearch only, leaving stale vectors until restart).
+  const changedPaths: string[] = [];
 
   // Track which (vault, relPath) pairs we see this scan (to prune `fileMtimes`).
   const seenFiles = new Set<string>();
@@ -256,186 +402,222 @@ export async function rebuildIndex(): Promise<void> {
   // (env + persisted). Using this rather than the frozen `config.allVaults`
   // means a vault added/removed at runtime is picked up on the next rebuild.
   const vaults = [config.brainVault, ...listSourceVaultPaths()];
+  let listedTotal = 0;
+  let readDone = 0;
 
-  for (const vault of vaults) {
-    // Route source bytes through the IVault read-transport seam (Phase 3).
-    // LocalVault preserves today's filesystem behavior; this is the single
-    // place a future PR swaps a source to git-pull/WebDAV/S3. Refresh first so
-    // a non-local transport sees the latest snapshot (no-op for LocalVault).
-    const transport = getVault(vault);
-    if (transport) {
-      try {
-        await transport.refresh();
-      } catch (err) {
-        logger.warn('Vault refresh failed', { vault, error: String(err) });
-      }
-    }
-
-    let files: string[];
-    try {
+  try {
+    for (const vault of vaults) {
+      // Route source bytes through the IVault read-transport seam (Phase 3).
+      // LocalVault preserves today's filesystem behavior; this is the single
+      // place a future PR swaps a source to git-pull/WebDAV/S3. Refresh first so
+      // a non-local transport sees the latest snapshot (no-op for LocalVault).
+      const transport = getVault(vault);
       if (transport) {
-        files = [];
-        for await (const entry of transport.list()) files.push(entry.relPath);
-      } else {
-        files = await listFiles(vault);
+        try {
+          await transport.refresh();
+        } catch (err) {
+          logger.warn('Vault refresh failed', { vault, error: String(err) });
+        }
       }
-      if (isFirstBuild) {
-        logger.info('Listed vault files', { vault, count: files.length });
-      }
-    } catch (err) {
-      logger.error('Failed to list vault files', { vault, error: String(err) });
-      continue;
-    }
 
-    // Source-vault default-deny allowlist (privacy control). For a source vault
-    // with a non-empty include-glob list, drop any path that isn't allowed
-    // before it is walked/indexed. The brain vault has no source name, so its
-    // files always pass through.
-    const sourceName = sourceNameForVault(vault);
-    if (sourceName) {
-      const before = files.length;
-      files = files.filter((relPath) => isPathIndexable(sourceName, relPath));
-      if (isFirstBuild && files.length !== before) {
-        logger.info('Applied source-vault index allowlist', {
-          vault, kept: files.length, excluded: before - files.length,
-        });
-      }
-    }
-
-    let skippedEnoent = 0;
-    const enoentSamples: string[] = [];
-    let permissionErrors = 0;
-    const permissionSamples: string[] = [];
-    const otherErrors: Array<{ path: string; error: string }> = [];
-
-    for (const relPath of files) {
-      // Cross-vault collision: an earlier vault in this scan already owns this
-      // relPath. Skip it entirely (no stat, no read) so it can neither churn the
-      // index nor shadow the first vault's copy.
-      const owner = claimedBy.get(relPath);
-      if (owner !== undefined && owner !== vault) {
-        collisions++;
-        if (collisionSamples.length < 5) collisionSamples.push(`${relPath} (${sourceName ?? 'brain'} ← ${sourceNameForVault(owner) ?? 'brain'})`);
+      let files: string[];
+      try {
+        if (transport) {
+          files = [];
+          for await (const entry of transport.list()) files.push(entry.relPath);
+        } else {
+          files = await listFiles(vault);
+        }
+        if (full) {
+          logger.info('Listed vault files', { vault, count: files.length });
+        }
+      } catch (err) {
+        logger.error('Failed to list vault files', { vault, error: String(err) });
         continue;
       }
-      claimedBy.set(relPath, vault);
-      const key = mtimeKey(vault, relPath);
-      seenFiles.add(key);
 
-      try {
-        const absPath = path.resolve(vault, relPath);
-
-        // On incremental rebuilds, check mtime to skip unchanged files
-        if (!isFirstBuild) {
-          try {
-            const fileStat = transport
-              ? await transport.stat(relPath)
-              : await stat(absPath);
-            if (fileStat) {
-              const mtime = fileStat.mtimeMs;
-              const prevMtime = fileMtimes.get(key);
-              if (prevMtime !== undefined && mtime === prevMtime) {
-                continue; // file unchanged, skip
-              }
-              fileMtimes.set(key, mtime);
-            }
-          } catch {
-            // If stat fails, re-index the file anyway
-          }
+      // Source-vault default-deny allowlist (privacy control). For a source vault
+      // with a non-empty include-glob list, drop any path that isn't allowed
+      // before it is walked/indexed. The brain vault has no source name, so its
+      // files always pass through.
+      const sourceName = sourceNameForVault(vault);
+      if (sourceName) {
+        const before = files.length;
+        files = files.filter((relPath) => isPathIndexable(sourceName, relPath));
+        if (full && files.length !== before) {
+          logger.info('Applied source-vault index allowlist', {
+            vault, kept: files.length, excluded: before - files.length,
+          });
         }
+      }
 
+      // Claim paths first (cheap, synchronous) so collisions are decided in
+      // vault order exactly as before; only owned paths are read.
+      const owned: string[] = [];
+      for (const relPath of files) {
+        // Cross-vault collision: an earlier vault in this scan already owns this
+        // relPath. Skip it entirely (no stat, no read) so it can neither churn the
+        // index nor shadow the first vault's copy.
+        const owner = claimedBy.get(relPath);
+        if (owner !== undefined && owner !== vault) {
+          collisions++;
+          if (collisionSamples.length < 5) collisionSamples.push(`${relPath} (${sourceName ?? 'brain'} ← ${sourceNameForVault(owner) ?? 'brain'})`);
+          continue;
+        }
+        claimedBy.set(relPath, vault);
+        seenFiles.add(mtimeKey(vault, relPath));
+        owned.push(relPath);
+      }
+      listedTotal += owned.length;
+      if (isBootBuild) setIndexProgress(readDone, listedTotal);
+
+      let skippedEnoent = 0;
+      const enoentSamples: string[] = [];
+      let permissionErrors = 0;
+      const permissionSamples: string[] = [];
+      const otherErrors: Array<{ path: string; error: string }> = [];
+
+      // stat + read with bounded concurrency (the boot pass used to await each
+      // file in turn); results are applied in listing order.
+      const readOne = async (relPath: string): Promise<ScanRead> => {
+        const key = mtimeKey(vault, relPath);
+        const absPath = path.resolve(vault, relPath);
+        let mtime: number | undefined;
+        try {
+          const fileStat = transport ? await transport.stat(relPath) : await stat(absPath);
+          if (fileStat) mtime = fileStat.mtimeMs;
+        } catch {
+          // stat failed: (re-)index the file anyway
+        }
+        if (!full && mtime !== undefined && mtimes.get(key) === mtime) {
+          return { skip: true }; // file unchanged, skip
+        }
         const content = transport
           ? (await transport.read(relPath)).content.toString('utf-8')
           : await readFile(absPath, 'utf-8');
-        const { data, body } = parseFrontmatter(content);
+        return { skip: false, content, mtime };
+      };
 
-        // Coerce every tag element to a string so numeric YAML tags (e.g. `2024`)
-        // can never propagate into docMeta.tags and crash tag tooling downstream.
-        const tags: string[] = (Array.isArray(data.tags) ? data.tags : []).map(String);
-        const title =
-          data.title ?? relPath.replace(/\.md$/, '').split('/').pop() ?? relPath;
+      await forEachOrderedConcurrent(owned, config.indexReadConcurrency, readOne, (relPath, res) => {
+        readDone++;
+        if (isBootBuild && (readDone & 255) === 0) setIndexProgress(readDone, listedTotal);
+        try {
+          if (res.status === 'rejected') throw res.reason;
+          const r = res.value;
+          if (r.skip) return;
+          const { content } = r;
+          const { data, body } = parseFrontmatter(content);
 
-        // On incremental rebuild, remove old entry before re-adding
-        if (!isFirstBuild && docMeta.has(relPath)) {
-          try { miniSearch.discard(relPath); } catch { /* may not exist */ }
+          // Coerce every tag element to a string so numeric YAML tags (e.g. `2024`)
+          // can never propagate into docMeta.tags and crash tag tooling downstream.
+          const tags: string[] = (Array.isArray(data.tags) ? data.tags : []).map(String);
+          const title =
+            data.title ?? relPath.replace(/\.md$/, '').split('/').pop() ?? relPath;
+
+          // On incremental rebuild, remove old entry before re-adding
+          if (!full && meta.has(relPath)) {
+            try { ms.discard(relPath); } catch { /* may not exist */ }
+          }
+
+          meta.set(relPath, metadataForNote(relPath, data, body));
+          links.set(relPath, extractWikilinks(content));
+
+          ms.add({
+            id: relPath,
+            title,
+            content: body,
+            tags: tags.join(' '),
+          });
+
+          // Record the mtime only once the file is actually indexed, so a failed
+          // read is retried on the next tick instead of being marked current.
+          if (r.mtime !== undefined) mtimes.set(mtimeKey(vault, relPath), r.mtime);
+          if (full) {
+            fileCount++;
+          } else {
+            updatedCount++;
+            changedPaths.push(relPath);
+          }
+        } catch (err: any) {
+          const code = err?.code ?? '';
+          const msg = String(err);
+          if (code === 'ENOENT' || msg.includes('ENOENT')) {
+            skippedEnoent++;
+            if (enoentSamples.length < 5) enoentSamples.push(relPath);
+          } else if (code === 'EACCES' || code === 'EPERM' || msg.includes('EACCES') || msg.includes('EPERM')) {
+            permissionErrors++;
+            if (permissionSamples.length < 5) permissionSamples.push(relPath);
+          } else {
+            otherErrors.push({ path: relPath, error: msg });
+          }
         }
+      });
 
-        docMeta.set(relPath, metadataForNote(relPath, data, body));
-
-        miniSearch.add({
-          id: relPath,
-          title,
-          content: body,
-          tags: tags.join(' '),
+      // Log ENOENT as a single summary line with sample paths
+      if (skippedEnoent > 0) {
+        logger.warn('Skipped missing files during indexing', {
+          vault, count: skippedEnoent, samples: enoentSamples,
         });
-
-        if (isFirstBuild) {
-          fileCount++;
-          // Store mtime for future incremental builds
-          try {
-            const fileStat = transport
-              ? await transport.stat(relPath)
-              : await stat(absPath);
-            if (fileStat) fileMtimes.set(key, fileStat.mtimeMs);
-          } catch { /* non-critical */ }
-        } else {
-          updatedCount++;
-        }
-      } catch (err: any) {
-        const code = err?.code ?? '';
-        const msg = String(err);
-        if (code === 'ENOENT' || msg.includes('ENOENT')) {
-          skippedEnoent++;
-          if (enoentSamples.length < 5) enoentSamples.push(relPath);
-        } else if (code === 'EACCES' || code === 'EPERM' || msg.includes('EACCES') || msg.includes('EPERM')) {
-          permissionErrors++;
-          if (permissionSamples.length < 5) permissionSamples.push(relPath);
-        } else {
-          otherErrors.push({ path: relPath, error: msg });
-        }
       }
-    }
+      // Log permission errors separately so they're clearly visible
+      if (permissionErrors > 0) {
+        logger.error('Permission denied during indexing', {
+          vault, count: permissionErrors, samples: permissionSamples,
+        });
+      }
+      for (const e of otherErrors.slice(0, 5)) {
+        logger.warn('Failed to index note', { path: e.path, error: e.error });
+      }
+      if (otherErrors.length > 5) {
+        logger.warn('Additional index errors suppressed', { count: otherErrors.length - 5 });
+      }
 
-    // Log ENOENT as a single summary line with sample paths
-    if (skippedEnoent > 0) {
-      logger.warn('Skipped missing files during indexing', {
-        vault, count: skippedEnoent, samples: enoentSamples,
+      // Store index health for dashboard consumption
+      healthThisScan.push({
+        vault,
+        fileCount: files.length,
+        indexed: full ? fileCount : meta.size,
+        enoent: skippedEnoent,
+        enoentSamples,
+        permissionErrors,
+        permissionSamples,
+        otherErrors: otherErrors.length,
       });
     }
-    // Log permission errors separately so they're clearly visible
-    if (permissionErrors > 0) {
-      logger.error('Permission denied during indexing', {
-        vault, count: permissionErrors, samples: permissionSamples,
-      });
-    }
-    for (const e of otherErrors.slice(0, 5)) {
-      logger.warn('Failed to index note', { path: e.path, error: e.error });
-    }
-    if (otherErrors.length > 5) {
-      logger.warn('Additional index errors suppressed', { count: otherErrors.length - 5 });
-    }
-
-    // Store index health for dashboard consumption
-    lastIndexHealth.push({
-      vault,
-      fileCount: files.length,
-      indexed: isFirstBuild ? fileCount : docMeta.size,
-      enoent: skippedEnoent,
-      enoentSamples,
-      permissionErrors,
-      permissionSamples,
-      otherErrors: otherErrors.length,
-    });
+  } catch (err) {
+    if (full) isFirstBuild = true;
+    if (isBootBuild) setIndexState('error');
+    throw err;
   }
 
-  // Remove deleted files from the index (only on incremental rebuilds). A doc
-  // is gone when NO vault claimed its relPath this scan; per-vault mtime state
-  // is pruned for every (vault, relPath) pair that was not seen.
-  if (!isFirstBuild) {
+  if (full) {
+    // Swap the freshly built structures in. Vectors of docs that vanished are
+    // dropped; every surviving doc is offered to the embedding sync, which skips
+    // unchanged text by hash (the boot build skips this — the boot embedding
+    // sync reconciles the whole vault once embeddings are loaded).
+    const hadPrevious = docMeta.size > 0;
+    if (hadPrevious) {
+      for (const p of docMeta.keys()) {
+        if (!meta.has(p)) { removeFromVectorIndex(p); removedCount++; }
+      }
+    }
+    miniSearch = ms;
+    docMeta.clear();
+    for (const [p, m] of meta) docMeta.set(p, m);
+    docLinks.clear();
+    for (const [p, l] of links) docLinks.set(p, l);
+    fileMtimes.clear();
+    for (const [k, v] of mtimes) fileMtimes.set(k, v);
+    if (hadPrevious) changedPaths.push(...meta.keys());
+  } else {
+    // Remove deleted files from the index. A doc is gone when NO vault claimed
+    // its relPath this scan; per-vault mtime state is pruned for every
+    // (vault, relPath) pair that was not seen.
     for (const existingPath of [...docMeta.keys()]) {
       if (!claimedBy.has(existingPath)) {
         try { miniSearch.discard(existingPath); } catch { /* may not exist */ }
         docMeta.delete(existingPath);
+        docLinks.delete(existingPath);
         removeFromVectorIndex(existingPath);
         removedCount++;
       }
@@ -443,22 +625,31 @@ export async function rebuildIndex(): Promise<void> {
     for (const key of [...fileMtimes.keys()]) {
       if (!seenFiles.has(key)) fileMtimes.delete(key);
     }
-    fileCount = docMeta.size;
+  }
+  fileCount = docMeta.size;
+  lastIndexHealth = healthThisScan;
+
+  // Re-embed changed notes in the background (batched, yielding, hash-skipped).
+  if (changedPaths.length > 0 && isEmbeddingsReady()) {
+    enqueueEmbedSync(changedPaths);
   }
 
-  const wasFirstBuild = isFirstBuild;
-  isFirstBuild = false;
+  const wasFirstBuild = full;
   indexedNoteCount = fileCount;
   setIndexedNotes(fileCount);
   recordIndexRebuild();
+  if (isBootBuild) {
+    setIndexProgress(readDone, listedTotal);
+    setIndexState('ready');
+  }
 
-  const ms = Date.now() - startedAt;
+  const elapsedMs = Date.now() - startedAt;
   const prevCollisions = lastIndexUpdate?.collisions ?? 0;
   lastIndexUpdate = {
     at: new Date().toISOString(),
     updated: updatedCount,
     removed: removedCount,
-    ms,
+    ms: elapsedMs,
     collisions,
   };
 
@@ -476,13 +667,13 @@ export async function rebuildIndex(): Promise<void> {
   }
 
   if (wasFirstBuild) {
-    logger.info('Search index rebuilt', { indexedNotes: fileCount, ms, collisions });
+    logger.info('Search index rebuilt', { indexedNotes: fileCount, ms: elapsedMs, collisions });
   } else if (updatedCount > 0 || removedCount > 0) {
     logger.info('Search index updated (incremental)', {
-      indexedNotes: fileCount, updated: updatedCount, removed: removedCount, ms, collisions,
+      indexedNotes: fileCount, updated: updatedCount, removed: removedCount, ms: elapsedMs, collisions,
     });
   } else {
-    logger.debug('Search index unchanged', { ms });
+    logger.debug('Search index unchanged', { ms: elapsedMs });
   }
 }
 
@@ -530,6 +721,7 @@ export async function indexNote(filePath: string): Promise<void> {
 
   // Update docMeta
   docMeta.set(filePath, metadataForNote(filePath, data, body));
+  docLinks.set(filePath, extractWikilinks(content));
 
   // Add to MiniSearch
   miniSearch.add({
@@ -539,9 +731,11 @@ export async function indexNote(filePath: string): Promise<void> {
     tags: tags.join(' '),
   });
 
-  // Update vector index (non-blocking)
+  // Update vector index (non-blocking). Same text (title + body) and hash as
+  // the boot/rescan paths — see embedTextFor — so an unchanged embed text
+  // (e.g. a frontmatter-only heat/last_accessed update) costs no forward pass.
   if (isEmbeddingsReady()) {
-    embedAndIndex(filePath, body).catch(err => {
+    embedAndIndex(filePath, { title: String(title), content: body }).catch(err => {
       logger.warn('Failed to update vector index', { path: filePath, error: String(err) });
     });
   }
@@ -560,9 +754,135 @@ export function removeFromIndex(filePath: string): void {
     // Document may not exist in the index
   }
   docMeta.delete(filePath);
+  docLinks.delete(filePath);
   removeFromVectorIndex(filePath);
   indexedNoteCount = docMeta.size;
   setIndexedNotes(indexedNoteCount);
+}
+
+const DAY_PREFIX_RE = /^\d{4}-\d{2}-\d{2}/;
+
+function typeMatches(noteType: string | undefined, wanted: string | string[]): boolean {
+  return Array.isArray(wanted) ? noteType !== undefined && wanted.includes(noteType) : noteType === wanted;
+}
+
+/** Shared scope filter: every retrieval arm applies it BEFORE ranking. */
+function passesFilters(id: string, meta: DocMeta, opts: SearchOptions): boolean {
+  const {
+    scopePaths, tags, dateFrom, dateTo, type, category, temperature,
+    minHeatScore, importance, excludeArchived = true, collections, kinds,
+  } = opts;
+  if (excludeArchived && meta.archived === true) return false;
+  if (type && !typeMatches(meta.type, type)) return false;
+  if (kinds && kinds.length > 0 && !kinds.includes(meta.memory_kind)) return false;
+  if (category && meta.category !== category) return false;
+  if (collections && collections.length > 0 && !collections.includes(meta.collection)) return false;
+  if (scopePaths && scopePaths.length > 0 && !scopePaths.some((sp) => id.startsWith(sp))) return false;
+  if (tags && tags.length > 0 && !tags.some((t) => meta.tags.includes(t))) return false;
+  if (meta.date) {
+    // Bounds are inclusive DAYS: a note stamped with a full instant
+    // (`2026-11-08T14:00:00Z`) is still inside `dateTo: 2026-11-08`.
+    const day = DAY_PREFIX_RE.test(meta.date) ? meta.date.slice(0, 10) : meta.date;
+    if (dateFrom && day < dateFrom.slice(0, 10)) return false;
+    if (dateTo && day > dateTo.slice(0, 10)) return false;
+  } else if (dateFrom || dateTo) {
+    return false; // no date metadata — exclude from date-filtered results
+  }
+  if (temperature && meta.temperature !== temperature) return false;
+  if (minHeatScore !== undefined && (meta.heat_score === undefined || meta.heat_score < minHeatScore)) return false;
+  if (importance && meta.importance !== importance) return false;
+  if (opts.filter && !opts.filter(id, meta)) return false;
+  return true;
+}
+
+const defaultTokenize = MiniSearch.getDefault('tokenize') as (text: string) => string[];
+
+/** Document frequency of an analysed term (0 = absent; undefined = unknown). */
+function termDocFrequency(term: string): number | undefined {
+  try {
+    // MiniSearch keeps term → (fieldId → (docId → tf)) with no public df
+    // accessor. Guarded: any shape change degrades to unweighted coverage.
+    const data = (miniSearch as unknown as { _index: { get(t: string): Map<number, Map<number, number>> | undefined } })
+      ._index.get(term);
+    if (!data) return 0;
+    let df = 0;
+    for (const perDoc of data.values()) df = Math.max(df, perDoc.size);
+    return df;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * IDF weight of each distinct analysed query term (BM25 idf, floored so even a
+ * ubiquitous term still counts a little). Empty when the query has no terms.
+ */
+export function queryTermWeights(query: string): Map<string, number> {
+  const out = new Map<string, number>();
+  const n = Math.max(docMeta.size, 1);
+  for (const raw of defaultTokenize(query)) {
+    const term = config.lexicalAnalyzer ? analyzeTerm(raw) : raw.toLowerCase();
+    if (!term || out.has(term)) continue;
+    const df = miniSearch ? termDocFrequency(term) : undefined;
+    out.set(term, df === undefined ? 1 : Math.max(0.1, Math.log(1 + (n - df + 0.5) / (df + 0.5))));
+  }
+  return out;
+}
+
+/** Share of the query's IDF mass carried by `matched` (the hit's matched query terms). */
+function coverageOf(matched: string[] | undefined, weights: Map<string, number>, total: number): number {
+  if (!matched || total <= 0) return 0;
+  let sum = 0;
+  for (const t of new Set(matched)) sum += weights.get(t) ?? 0;
+  return Math.min(1, sum / total);
+}
+
+/** Characters of a note scanned for its best passage. */
+const PASSAGE_SCAN_CHARS = 20_000;
+
+/**
+ * Query-aware snippet: the ~`width`-char window of `content` holding the most
+ * distinct query terms (accent-insensitive), instead of the note's first
+ * characters. Falls back to the head of the note when nothing matches.
+ */
+export function bestPassage(fullContent: string, query: string, width = 200): string {
+  if (fullContent.length <= width) return fullContent;
+  // Bounded scan: folding a 100 kB note per result would dominate query time.
+  const content = fullContent.length > PASSAGE_SCAN_CHARS ? fullContent.slice(0, PASSAGE_SCAN_CHARS) : fullContent;
+  const terms = [...new Set(
+    config.lexicalAnalyzer ? analyzeText(query) : query.toLowerCase().split(/\W+/).filter((t) => t.length > 2),
+  )];
+  if (terms.length === 0) return content.slice(0, width);
+  const folded = foldText(content);
+  if (folded.length !== content.length) return content.slice(0, width); // folding shifted offsets
+  // Term occurrences, capped so a pathological note cannot make this quadratic.
+  const hits: Array<[number, number]> = [];
+  terms.forEach((t, ti) => {
+    let from = 0;
+    for (let n = 0; n < 40; n++) {
+      const i = folded.indexOf(t, from);
+      if (i < 0) break;
+      hits.push([i, ti]);
+      from = i + t.length;
+    }
+  });
+  if (hits.length === 0) return content.slice(0, width);
+  hits.sort((a, b) => a[0] - b[0]);
+  let bestStart = hits[0][0];
+  let bestCount = 0;
+  for (let i = 0; i < hits.length; i++) {
+    const seen = new Set<number>();
+    for (let j = i; j < hits.length && hits[j][0] - hits[i][0] < width; j++) seen.add(hits[j][1]);
+    if (seen.size > bestCount) { bestCount = seen.size; bestStart = hits[i][0]; }
+  }
+  // Start a little before the first hit, on a word boundary when one is near.
+  let start = Math.max(0, bestStart - 30);
+  if (start > 0) {
+    const sp = content.indexOf(' ', start);
+    if (sp >= 0 && sp < bestStart) start = sp + 1;
+  }
+  const end = Math.min(content.length, start + width);
+  return (start > 0 ? '…' : '') + content.slice(start, end).trim() + (end < fullContent.length ? '…' : '');
 }
 
 /**
@@ -572,82 +892,48 @@ export function searchNotes(
   query: string,
   opts: SearchOptions = {},
 ): SearchResult[] {
+  return lexicalSearch(query, opts, true);
+}
+
+/**
+ * Lexical arm. `withSnippets: false` skips the query-aware snippet (hybridSearch
+ * builds it later, only for the notes it returns).
+ */
+function lexicalSearch(query: string, opts: SearchOptions, withSnippets: boolean): SearchResult[] {
   if (!miniSearch) {
     throw new Error(
       'Search index not built. Call rebuildIndex() before searching.',
     );
   }
 
-  const {
-    scopePaths, tags, dateFrom, dateTo, limit = 20,
-    type, category, temperature, minHeatScore, importance,
-    excludeArchived = true, collections,
-  } = opts;
+  const limit = opts.limit ?? 20;
+  const results = miniSearch.search(query);
 
-  let results = miniSearch.search(query);
+  const weights = queryTermWeights(query);
+  let totalWeight = 0;
+  for (const w of weights.values()) totalWeight += w;
 
-  // Post-filter
-  const filtered = results.filter((r) => {
-    const meta = docMeta.get(r.id as string);
-    if (!meta) return false;
-
-    // Exclude archived by default
-    if (excludeArchived && meta.archived === true) return false;
-
-    // Collection filter
-    if (collections && collections.length > 0 && !collections.includes(meta.collection)) return false;
-
-    // Scope paths — prefix match
-    if (scopePaths && scopePaths.length > 0) {
-      const id = r.id as string;
-      if (!scopePaths.some((sp) => id.startsWith(sp))) return false;
-    }
-
-    // Tags filter
-    if (tags && tags.length > 0) {
-      if (!tags.some((t) => meta.tags.includes(t))) return false;
-    }
-
-    // Date range filter
-    if (meta.date) {
-      if (dateFrom && meta.date < dateFrom) return false;
-      if (dateTo && meta.date > dateTo) return false;
-    } else if (dateFrom || dateTo) {
-      // No date metadata — exclude from date-filtered results
-      return false;
-    }
-
-    // Type filter
-    if (type && meta.type !== type) return false;
-
-    // Category filter
-    if (category && meta.category !== category) return false;
-
-    // Temperature filter
-    if (temperature && meta.temperature !== temperature) return false;
-
-    // Minimum heat score filter
-    if (minHeatScore !== undefined && (meta.heat_score === undefined || meta.heat_score < minHeatScore)) return false;
-
-    // Importance filter
-    if (importance && meta.importance !== importance) return false;
-
-    return true;
-  });
-
-  return filtered.slice(0, limit).map((r) => {
-    const meta = docMeta.get(r.id as string)!;
-    return {
-      path: r.id as string,
+  const out: SearchResult[] = [];
+  for (const r of results) {
+    if (out.length >= limit) break;
+    const id = r.id as string;
+    const meta = docMeta.get(id);
+    if (!meta || !passesFilters(id, meta, opts)) continue;
+    out.push({
+      path: id,
       title: meta.title,
-      snippet: meta.content.slice(0, 200),
+      snippet: withSnippets ? bestPassage(meta.content, query) : '',
       score: r.score,
       lexicalScore: r.score,
       semanticScore: 0,
       graphScore: 0,
       fusedScore: r.score,
-    };
-  });
+      lexicalRaw: r.score,
+      coverage: coverageOf(r.queryTerms, weights, totalWeight),
+      lexicalEvidence: totalWeight > 0 ? r.score / totalWeight : undefined,
+    });
+  }
+  return out;
 }
 
 /**
@@ -661,14 +947,14 @@ export function searchNotes(
 function filterByAsOf<T extends { path: string }>(
   results: T[],
   asOf: string,
-  pre: { type?: string; category?: string } = {},
+  pre: { type?: string | string[]; category?: string } = {},
 ): T[] {
   return results.filter((r) => {
     const meta = docMeta.get(r.path);
     if (!meta) return true; // no metadata → don't drop (fail-open, matches non-temporal behavior)
     // Cheap type/category pre-filter first so the window check only runs on
     // candidates that can survive the post-filters anyway.
-    if (pre.type && meta.type !== pre.type) return false;
+    if (pre.type && !typeMatches(meta.type, pre.type)) return false;
     if (pre.category && meta.category !== pre.category) return false;
     const vf = meta.valid_from ?? meta.date;
     return withinWindow(vf, meta.valid_to, asOf);
@@ -715,40 +1001,60 @@ function buildLinkGraphFromDocMeta(): {
   return { linkGraph, titleToPath };
 }
 
+// Recall graph cache. Building the wikilink graph + PPR transition lists costs
+// ~300 ms at 10k notes, so it is built once per index version (exact: every
+// index mutation bumps `indexVersion`) rather than per query. KG mention edges
+// live outside the index, so the cache also expires on a short TTL.
+let cachedRecallGraph: { version: number; at: number; graph: RecallGraph } | null = null;
+const RECALL_GRAPH_KG_TTL_MS = 5 * 60_000;
+
+function getRecallGraph(): RecallGraph {
+  const now = Date.now();
+  if (
+    cachedRecallGraph &&
+    cachedRecallGraph.version === indexVersion &&
+    now - cachedRecallGraph.at < RECALL_GRAPH_KG_TTL_MS
+  ) {
+    return cachedRecallGraph.graph;
+  }
+  const { linkGraph, titleToPath } = buildLinkGraphFromDocMeta();
+  const mentions = kgAllMentionTriples(); // {subject(title), predicate, object(entity)}
+  const graph = buildRecallGraph({ linkGraph, titleToPath, mentions });
+  cachedRecallGraph = { version: indexVersion, at: now, graph };
+  return graph;
+}
+
 /**
- * Compute the PPR graph-recall arm's RRF contribution for a query.
+ * Run the PPR graph-recall arm for a query, seeded from `seedPaths` (the best
+ * direct hits) plus any entities detected in the query.
  *
- * Returns `path -> 1/(k+rank+1)` RRF terms, or an EMPTY map on any failure /
- * no-seed condition — so a caller can unconditionally add it to the fused score
- * (an empty map contributes 0 to every note, preserving byte-identity). Wrapped
- * in try/catch exactly like the semantic-arm fallback: any error means the arm
- * silently contributes nothing.
+ * Returns the ranked PPR note results and the seed set, or an EMPTY result on
+ * any failure / no-seed condition, so a caller can fuse it unconditionally.
  *
  * Synonymy edges are intentionally NOT built here: they would require an
- * O(N) embedding kNN sweep on the query hot path. The wikilink + mention
- * substrate is sufficient for the multi-hop bridges the arm targets; the
- * `synonymyNeighbors` input of buildRecallGraph remains available for the
- * offline eval to exercise.
+ * O(N) embedding kNN sweep. The wikilink + mention substrate is sufficient for
+ * the multi-hop bridges the arm targets; the `synonymyNeighbors` input of
+ * buildRecallGraph remains available for the offline eval to exercise.
  */
-function computeGraphArm(query: string, lexicalTopPaths: string[], k: number): Map<string, number> {
+function computeGraphArm(
+  query: string,
+  seedPaths: string[],
+  limit: number,
+): { results: Array<{ path: string; score: number }>; seeds: Set<string> } {
   try {
-    const { linkGraph, titleToPath } = buildLinkGraphFromDocMeta();
-    const mentions = kgAllMentionTriples(); // {subject(title), predicate, object(entity)}
-    const graph = buildRecallGraph({ linkGraph, titleToPath, mentions });
-
+    const graph = getRecallGraph();
     const detected = detectEntities(query).map((e) => e.name);
-    const seeds = extractSeeds(graph, lexicalTopPaths, detected);
-    if (seeds.length === 0) return new Map();
+    const seeds = extractSeeds(graph, seedPaths, detected);
+    if (seeds.length === 0) return { results: [], seeds: new Set() };
 
     // Capture a cheap seed→spread readout for the dashboard's Graph-Recall panel
     // (reachable-set sizes at 1/2/3 hops from the seeds). BFS over the same
-    // adjacency the PPR walk uses; best-effort, never affects the returned RRF.
+    // adjacency the PPR walk uses; best-effort, never affects the result.
     try { lastSeedSpread = computeSeedSpread(graph, query, seeds); } catch { /* non-critical */ }
 
-    const ppr = runPPR(graph, seeds, { limit: lexicalTopPaths.length + 40 });
-    return pprRrfContribution(ppr, k);
+    return { results: runPPR(graph, seeds, { limit }), seeds: new Set(seeds) };
   } catch {
-    return new Map();
+    return { results: [], seeds: new Set() };
   }
 }
 
@@ -829,9 +1135,7 @@ export function getRecallGraphStats(): RecallGraphStats {
   }
   let stats: RecallGraphStats = { nodes: 0, edges: 0, avgDegree: 0, lastSeedSpread };
   try {
-    const { linkGraph, titleToPath } = buildLinkGraphFromDocMeta();
-    const mentions = kgAllMentionTriples();
-    const graph = buildRecallGraph({ linkGraph, titleToPath, mentions });
+    const graph = getRecallGraph();
     const nodes = graph.noteNodes.size;
     // Count undirected edges once (adjacency is symmetric): sum degrees / 2.
     let edgeEnds = 0;
@@ -850,88 +1154,46 @@ export function getRecallGraphStats(): RecallGraphStats {
   return stats;
 }
 
-/**
- * Fuse the lexical results with the PPR graph arm on the embeddings-OFF (or
- * semantic-fallback) path. Same additive RRF math and post-filters as the
- * three-arm fused path, minus the semantic term. Only called when the graph
- * arm is active AND produced a contribution, so the byte-identical
- * default-path behavior is never affected.
- */
-function fuseLexicalWithGraph(
-  lexicalResults: SearchResult[],
-  graphContribution: Map<string, number>,
-  k: number,
-  limit: number,
-  opts: SearchOptions,
-): SearchResult[] {
-  const fused = new Map<string, { lexical: number; graph: number }>();
-  lexicalResults.forEach((r, rank) => {
-    const e = fused.get(r.path) ?? { lexical: 0, graph: 0 };
-    e.lexical += 1 / (k + rank + 1);
-    fused.set(r.path, e);
-  });
-  for (const [path, rrf] of graphContribution) {
-    const e = fused.get(path) ?? { lexical: 0, graph: 0 };
-    e.graph += rrf;
-    fused.set(path, e);
-  }
-
-  const {
-    scopePaths, tags, dateFrom, dateTo, type, category, temperature,
-    minHeatScore, importance, excludeArchived = true, collections,
-  } = opts;
-
-  const entries = [...fused.entries()].sort(
-    (a, b) => (b[1].lexical + b[1].graph) - (a[1].lexical + a[1].graph),
-  );
-
-  const results: SearchResult[] = [];
-  for (const [fusedPath, e] of entries) {
-    if (results.length >= limit) break;
-    const meta = docMeta.get(fusedPath);
-    if (!meta) continue;
-    if (excludeArchived && meta.archived === true) continue;
-    // Cheap type/category checks BEFORE the as-of window so the (string-slice)
-    // window test only runs on candidates that can survive the post-filters.
-    if (type && meta.type !== type) continue;
-    if (category && meta.category !== category) continue;
-    if (opts.asOf) {
-      const vf = meta.valid_from ?? meta.date;
-      if (!withinWindow(vf, meta.valid_to, opts.asOf)) continue;
-    }
-    if (collections && collections.length > 0 && !collections.includes(meta.collection)) continue;
-    if (scopePaths && scopePaths.length > 0 && !scopePaths.some(sp => fusedPath.startsWith(sp))) continue;
-    if (tags && tags.length > 0 && !tags.some(t => meta.tags.includes(t))) continue;
-    if (meta.date) {
-      if (dateFrom && meta.date < dateFrom) continue;
-      if (dateTo && meta.date > dateTo) continue;
-    } else if (dateFrom || dateTo) {
-      continue;
-    }
-    if (temperature && meta.temperature !== temperature) continue;
-    if (minHeatScore !== undefined && (meta.heat_score === undefined || meta.heat_score < minHeatScore)) continue;
-    if (importance && meta.importance !== importance) continue;
-
-    const collectionBoost = getCollectionWeight(meta.collection);
-    const boostedScore = (e.lexical + e.graph) * collectionBoost;
-    results.push({
-      path: fusedPath,
-      title: meta.title,
-      snippet: meta.content.slice(0, 200),
-      score: boostedScore,
-      lexicalScore: e.lexical,
-      semanticScore: 0,
-      graphScore: e.graph,
-      fusedScore: boostedScore,
-    });
-  }
-  results.sort((a, b) => b.score - a.score);
-  return results;
+/** Per-note accumulator for arm fusion. */
+interface FusedEntry {
+  lexical: number;
+  semantic: number;
+  graph: number;
+  lexicalRaw?: number;
+  semanticSim?: number;
+  coverage?: number;
+  lexicalEvidence?: number;
+  chunk?: SearchResult['chunk'];
 }
 
+/** Query-aware snippet: the lexical passage, or the best chunk for a hit the lexical arm did not find. */
+function snippetFor(content: string, query: string, lexical: number, chunk: SearchResult['chunk']): string {
+  if (lexical <= 0 && chunk?.text) return chunkSnippet(chunk.text);
+  return bestPassage(content, query);
+}
+
+/** Head of a chunk as a one-paragraph snippet (same width as bestPassage). */
+export function chunkSnippet(text: string, width = 200): string {
+  const flat = text.replace(/\s+/g, ' ').trim();
+  return flat.length > width ? `${flat.slice(0, width).trimEnd()}…` : flat;
+}
+
+const RRF_K = 60;
+/** Direct hits (lexical ⊕ semantic) used to seed the PPR walk. */
+const GRAPH_SEED_COUNT = 5;
+
 /**
- * Hybrid search combining lexical (MiniSearch) and semantic (embeddings) results
- * using Reciprocal Rank Fusion. Falls back to lexical-only if embeddings unavailable.
+ * Hybrid search: lexical (MiniSearch BM25) ⊕ semantic (embedding kNN) ⊕ an
+ * optional PPR graph arm. Every arm is scope-filtered BEFORE it is ranked, then
+ * fused per `config.hybridFusion`:
+ *
+ *   score (default)  fused = wLex · bm25/bestBm25
+ *                          + wSem · max(0, (cos − floor) / (1 − floor))
+ *                          + wGraph · ppr/bestPpr          (non-seed notes only)
+ *   rrf   (legacy)   fused = Σ 1/(60 + rank + 1) over the arms
+ *
+ * Falls back to lexical-only (raw BM25 scores) when embeddings are unavailable
+ * and the graph arm contributed nothing.
  */
 export async function hybridSearch(
   query: string,
@@ -939,171 +1201,149 @@ export async function hybridSearch(
 ): Promise<SearchResult[]> {
   const limit = opts.limit ?? 20;
   const overFetch = limit * 2;
+  const rrf = config.hybridFusion === 'rrf';
 
   const embeddingsReady = isEmbeddingsReady();
 
   // Lexical (sync) and semantic (async, includes query-embed) are independent.
   // Kick off the semantic query concurrently so its embedding forward pass
-  // overlaps the lexical search instead of running strictly after it.
+  // overlaps the lexical search instead of running strictly after it. The
+  // vector index holds EVERY note, so fetch a deep candidate list: with a
+  // shallow k a filtered search (type:memory, archived excluded) is starved.
   const semanticPromise = embeddingsReady
-    ? searchSemantic(query, overFetch)
+    ? searchSemantic(query, Math.max(overFetch, config.semanticCandidates))
     : null;
   // Guard against an unhandled rejection if the synchronous lexical call below
   // throws before we reach the await. The real error is still handled at the
   // await (this attached catch does not consume it there).
   if (semanticPromise) semanticPromise.catch(() => {});
 
-  // Lexical results (always available)
-  let lexicalResults = searchNotes(query, { ...opts, limit: overFetch });
+  // Lexical results (always available). Snippets are built later, only for
+  // the notes that are actually returned.
+  const lexFetch = rrf ? overFetch : Math.max(overFetch, config.lexicalCandidates);
+  let lexicalResults = lexicalSearch(query, { ...opts, limit: lexFetch }, false);
 
-  // Bitemporal as-of suppression (ONLY when asOf is passed). Applied to the
-  // lexical list up front so the lexical-only early-return branches below are
-  // filtered too — that is the branch the default (embeddings-off) eval hits.
+  // Bitemporal as-of suppression (ONLY when asOf is passed).
   if (opts.asOf) {
     lexicalResults = filterByAsOf(lexicalResults, opts.asOf, { type: opts.type, category: opts.category });
   }
 
-  // RRF constant, shared by every arm (lexical, semantic, graph).
-  const k = 60;
+  const inScope = (p: string): boolean => {
+    const meta = docMeta.get(p);
+    if (!meta || !passesFilters(p, meta, opts)) return false;
+    if (opts.asOf && !withinWindow(meta.valid_from ?? meta.date, meta.valid_to, opts.asOf)) return false;
+    return true;
+  };
 
-  // PPR graph-recall arm (DORMANT by default). Active only when the config flag
-  // OR the per-call opt is set; with NEITHER set this block is skipped entirely
-  // (no graph build, no PPR) and everything below is byte-identical to today.
-  // The contribution is an additive RRF term map (path -> score); an empty map
-  // (no seeds / arm off / failure) adds 0 to every note, so it can only
-  // re-rank or introduce results, never drop one.
-  const graphArmActive = config.pprRecall || opts.graph === true;
-  const graphContribution: Map<string, number> = graphArmActive
-    ? computeGraphArm(query, lexicalResults.map((r) => r.path), k)
-    : new Map();
-
-  // Semantic results (if available)
-  if (!semanticPromise) {
-    // Lexical-only path. When the graph arm is active, fuse its RRF term in
-    // additively so multi-hop notes surface even without embeddings; otherwise
-    // this is byte-identical to today (graphContribution is empty).
-    if (graphArmActive && graphContribution.size > 0) {
-      return fuseLexicalWithGraph(lexicalResults, graphContribution, k, limit, opts);
+  // Semantic results, scope-filtered so ranks/scores are relative to the
+  // candidate pool the caller asked for. Any failure → arm contributes nothing.
+  let semanticResults: Array<{ path: string; score: number; chunk?: SearchResult['chunk'] }> = [];
+  if (semanticPromise) {
+    try {
+      semanticResults = (await semanticPromise).filter((r) => inScope(r.path));
+    } catch {
+      semanticResults = [];
     }
-    return lexicalResults.slice(0, limit).map(r => ({
-      ...r,
-      lexicalScore: r.lexicalScore,
-      semanticScore: 0,
-      graphScore: 0,
-      fusedScore: r.lexicalScore,
-      score: r.lexicalScore,
-    }));
   }
 
-  let semanticResults: Array<{ path: string; score: number }>;
-  try {
-    semanticResults = await semanticPromise;
-  } catch {
-    if (graphArmActive && graphContribution.size > 0) {
-      return fuseLexicalWithGraph(lexicalResults, graphContribution, k, limit, opts);
-    }
-    return lexicalResults.slice(0, limit);
-  }
-
-  if (semanticResults.length === 0) {
-    if (graphArmActive && graphContribution.size > 0) {
-      return fuseLexicalWithGraph(lexicalResults, graphContribution, k, limit, opts);
-    }
-    return lexicalResults.slice(0, limit);
-  }
-
-
-  // RRF fusion — three additive arms: lexical + semantic + graph (PPR).
-  const fused = new Map<string, { lexical: number; semantic: number; graph: number }>();
-
+  // ── Fuse the two direct arms ──
+  const fused = new Map<string, FusedEntry>();
+  const entry = (p: string): FusedEntry => {
+    let e = fused.get(p);
+    if (!e) { e = { lexical: 0, semantic: 0, graph: 0 }; fused.set(p, e); }
+    return e;
+  };
+  const bestRaw = lexicalResults[0]?.lexicalRaw ?? lexicalResults[0]?.score ?? 0;
+  const useSemantic = semanticResults.length > 0;
   lexicalResults.forEach((r, rank) => {
-    const entry = fused.get(r.path) ?? { lexical: 0, semantic: 0, graph: 0 };
-    entry.lexical += 1 / (k + rank + 1);
-    fused.set(r.path, entry);
+    const e = entry(r.path);
+    const raw = r.lexicalRaw ?? r.score;
+    e.lexicalRaw = raw;
+    e.coverage = r.coverage;
+    e.lexicalEvidence = r.lexicalEvidence;
+    e.lexical = rrf ? 1 / (RRF_K + rank + 1) : (bestRaw > 0 ? config.fusionLexicalWeight * (raw / bestRaw) : 0);
   });
-
+  const floor = Math.min(Math.max(config.fusionSemanticFloor, 0), 0.99);
   semanticResults.forEach((r, rank) => {
-    const entry = fused.get(r.path) ?? { lexical: 0, semantic: 0, graph: 0 };
-    entry.semantic += 1 / (k + rank + 1);
-    fused.set(r.path, entry);
+    const e = entry(r.path);
+    e.semanticSim = r.score;
+    e.chunk = r.chunk;
+    e.semantic = rrf
+      ? 1 / (RRF_K + rank + 1)
+      : config.fusionSemanticWeight * Math.max(0, (r.score - floor) / (1 - floor));
   });
 
-  // Graph arm (additive). graphContribution is empty when the arm is off, so
-  // this loop is a no-op and the fused ordering is byte-identical to today.
-  for (const [path, rrf] of graphContribution) {
-    const entry = fused.get(path) ?? { lexical: 0, semantic: 0, graph: 0 };
-    entry.graph += rrf;
-    fused.set(path, entry);
+  // ── PPR graph-recall arm (DORMANT by default) ──
+  // Seeded from the best DIRECT hits of both arms (not the lexical top alone),
+  // and — under score fusion — credited only to notes that are not seeds: a
+  // seed's own restart mass is the direct evidence it was already scored for,
+  // so adding it again would count that evidence twice.
+  const graphArmActive = config.pprRecall || opts.graph === true;
+  let graphContributed = false;
+  if (graphArmActive) {
+    const direct = [...fused.entries()]
+      .sort((a, b) => (b[1].lexical + b[1].semantic) - (a[1].lexical + a[1].semantic))
+      .map(([p]) => p);
+    const seedPaths = rrf ? lexicalResults.map((r) => r.path) : direct.slice(0, GRAPH_SEED_COUNT);
+    const { results: ppr, seeds } = computeGraphArm(query, seedPaths, lexicalResults.length + 40);
+    if (rrf) {
+      for (const [p, v] of pprRrfContribution(ppr, RRF_K)) {
+        entry(p).graph += v;
+        graphContributed = true;
+      }
+    } else {
+      const spread = ppr.filter((r) => !seeds.has(r.path));
+      const best = spread[0]?.score ?? 0;
+      if (best > 0) {
+        for (const r of spread) {
+          entry(r.path).graph += config.pprWeight * (r.score / best);
+          graphContributed = true;
+        }
+      }
+    }
   }
 
-  // Sort by fused score descending
-  const fusedEntries = [...fused.entries()].sort(
-    (a, b) =>
-      (b[1].lexical + b[1].semantic + b[1].graph) -
-      (a[1].lexical + a[1].semantic + a[1].graph),
-  );
-
-  // Apply post-filters and map to SearchResult
-  const {
-    scopePaths, tags, dateFrom, dateTo, type, category, temperature,
-    minHeatScore, importance, excludeArchived = true, collections,
-  } = opts;
-
-  const results: SearchResult[] = [];
-  for (const [fusedPath, fusedEntry] of fusedEntries) {
-    if (results.length >= limit) break;
-
-    const meta = docMeta.get(fusedPath);
-    if (!meta) continue;
-
-    // Apply same filters as searchNotes
-    if (excludeArchived && meta.archived === true) continue;
-    // Cheap type/category checks first (most recall calls pass type='memory'),
-    // so the as-of window test below only runs on surviving candidates.
-    if (type && meta.type !== type) continue;
-    if (category && meta.category !== category) continue;
-    // Bitemporal as-of suppression on the fused path (semantic results can
-    // reintroduce a note the lexical pre-filter dropped). ONLY when asOf set.
-    if (opts.asOf) {
-      const vf = meta.valid_from ?? meta.date;
-      if (!withinWindow(vf, meta.valid_to, opts.asOf)) continue;
-    }
-    if (collections && collections.length > 0 && !collections.includes(meta.collection)) continue;
-    if (scopePaths && scopePaths.length > 0 && !scopePaths.some(sp => fusedPath.startsWith(sp))) continue;
-    if (tags && tags.length > 0 && !tags.some(t => meta.tags.includes(t))) continue;
-    if (meta.date) {
-      if (dateFrom && meta.date < dateFrom) continue;
-      if (dateTo && meta.date > dateTo) continue;
-    } else if (dateFrom || dateTo) {
-      continue;
-    }
-    if (temperature && meta.temperature !== temperature) continue;
-    if (minHeatScore !== undefined && (meta.heat_score === undefined || meta.heat_score < minHeatScore)) continue;
-    if (importance && meta.importance !== importance) continue;
-
-    // Apply collection weight boost
-    const collectionBoost = getCollectionWeight(meta.collection);
-    const rawFused = fusedEntry.lexical + fusedEntry.semantic + fusedEntry.graph;
-    const boostedScore = rawFused * collectionBoost;
-
-    results.push({
-      path: fusedPath,
-      title: meta.title,
-      snippet: meta.content.slice(0, 200),
-      score: boostedScore,
-      lexicalScore: fusedEntry.lexical,
-      semanticScore: fusedEntry.semantic,
-      graphScore: fusedEntry.graph,
-      fusedScore: boostedScore,
+  // Lexical-only path (embeddings off / failed / empty, no graph contribution):
+  // unchanged raw BM25 scores.
+  if (!useSemantic && !graphContributed) {
+    return lexicalResults.slice(0, limit).map((r) => {
+      const meta = docMeta.get(r.path);
+      return { ...r, snippet: meta && opts.snippets !== false ? bestPassage(meta.content, query) : r.snippet };
     });
   }
 
-  // Re-sort after collection boost (may change ordering)
-  results.sort((a, b) => b.score - a.score);
+  // Sort by fused score, re-check scope (graph-arm notes are unfiltered), apply
+  // the collection weight and map to SearchResult.
+  const total = (e: FusedEntry) => e.lexical + e.semantic + e.graph;
+  const ranked: Array<{ path: string; e: FusedEntry; meta: DocMeta; score: number }> = [];
+  for (const [fusedPath, e] of fused) {
+    const meta = docMeta.get(fusedPath);
+    if (!meta) continue;
+    if (e.graph > 0 && e.lexical === 0 && e.semantic === 0 && !inScope(fusedPath)) continue;
+    ranked.push({ path: fusedPath, e, meta, score: total(e) * getCollectionWeight(meta.collection) });
+  }
+  ranked.sort((a, b) => b.score - a.score || (a.path < b.path ? -1 : 1));
+
+  const results: SearchResult[] = ranked.slice(0, limit).map(({ path: p, e, meta, score }) => ({
+    path: p,
+    title: meta.title,
+    snippet: opts.snippets !== false ? snippetFor(meta.content, query, e.lexical, e.chunk) : '',
+    score,
+    lexicalScore: e.lexical,
+    semanticScore: e.semantic,
+    graphScore: e.graph,
+    fusedScore: score,
+    lexicalRaw: e.lexicalRaw,
+    semanticSim: e.semanticSim,
+    coverage: e.coverage,
+    lexicalEvidence: e.lexicalEvidence,
+    ...(e.chunk ? { chunk: e.chunk } : {}),
+  }));
 
   // LLM reranking pass (if enabled). A caller may force-skip via opts.rerank
   // === false even when the reranker is globally enabled; when opts.rerank is
-  // undefined the global setting decides (preserves existing behavior).
+  // undefined the global setting decides. memory_recall always passes false and
+  // reranks AFTER its own re-scoring (so the reranker's order is the final one).
   if (opts.rerank !== false && isRerankerEnabled() && results.length > 1) {
     try {
       const candidates = results.map((r, i) => ({

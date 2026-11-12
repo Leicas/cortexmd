@@ -12,6 +12,8 @@ import graph from './tabs/graph.js';
 import agents from './tabs/agents.js';
 import code from './tabs/code.js';
 import logs from './tabs/logs.js';
+import memories from './tabs/memories.js';
+import lab from './tabs/lab.js';
 
-[overview, sessions, ratelimits, oauth, vault, retrieval, intelligence, graph, agents, code, logs].forEach(registerTab);
+[overview, sessions, ratelimits, oauth, vault, retrieval, intelligence, graph, agents, code, logs, memories, lab].forEach(registerTab);
 boot();

@@ -152,13 +152,67 @@ pub enum Command {
     /// `contract/symbol-id.md`.
     Contract(ContractArgs),
 
+    /// Fetch the session-start recap (`memory_wakeup`: identity, hot memories,
+    /// last diary lines) and print it. Used by the SessionStart hook to inject
+    /// the recap directly instead of asking the model to call the tool.
+    Wakeup(WakeupArgs),
+
+    /// stdio ↔ Streamable-HTTP MCP bridge: reads JSON-RPC lines on stdin,
+    /// POSTs them to `<server>/mcp` with the CLI's stored token (OAuth
+    /// auto-refresh), writes responses on stdout, logs on stderr. Lets stdio
+    /// clients (Codex, Cursor, Gemini CLI, Windows) reuse `cortexmd auth`
+    /// instead of a second login.
+    Mcp(McpArgs),
+
     // ── editor integration ───────────────────────────────────────────────
-    /// Install cortexmd hooks and instructions for Claude Code (or
-    /// other agents). Modeled on `rtk init`: writes `CORTEXMD.md`,
-    /// registers an `@CORTEXMD.md` reference in `CLAUDE.md`, and
-    /// idempotently patches `settings.json` with the SessionStart hook that
-    /// keeps the HUD-line daemon alive.
+    /// Install cortexmd for an agent client. Claude Code (default): writes
+    /// `CORTEXMD.md` + the `@CORTEXMD.md` reference, the hook scripts and
+    /// settings.json entries, and registers the MCP server (user scope)
+    /// reusing the CLI login. `--client codex|cursor|gemini` writes that
+    /// client's MCP config (and instructions/hooks where supported).
     Init(InitArgs),
+}
+
+#[derive(clap::Args, Debug, Default)]
+pub struct WakeupArgs {
+    /// Diary agent name (default: `Claude Code (<hostname>)`).
+    #[arg(long)]
+    pub agent_name: Option<String>,
+    /// tiny (≈180 tokens) | standard (≈900) | full (≈2000).
+    #[arg(long, default_value = "standard", value_parser = ["tiny", "standard", "full"])]
+    pub preset: String,
+    /// Project slug (as in [[Projects/<slug>]]).
+    #[arg(long)]
+    pub project: Option<String>,
+    /// Machine id (as in [[Machines/<host>]]).
+    #[arg(long)]
+    pub machine: Option<String>,
+    /// `text` (default) or `json` (`{text, agentName, preset, via}`).
+    #[arg(long, default_value = "text", value_parser = ["text", "json"])]
+    pub format: String,
+    /// Overall deadline in milliseconds across every HTTP round-trip
+    /// (hooks pass their own cap). 0 = the client's default timeouts.
+    #[arg(long, default_value_t = 0)]
+    pub timeout_ms: u64,
+    /// MCP server base URL (default: $MCP_URL or persisted config).
+    #[arg(long, env = "MCP_URL")]
+    pub server: Option<String>,
+    /// MCP API key bearer (default: $MCP_API_KEY or persisted config).
+    #[arg(long, env = "MCP_API_KEY", hide_env_values = true)]
+    pub api_key: Option<String>,
+}
+
+#[derive(clap::Args, Debug, Default)]
+pub struct McpArgs {
+    /// MCP server base URL (default: $MCP_URL or persisted config).
+    #[arg(long, env = "MCP_URL")]
+    pub server: Option<String>,
+    /// MCP API key bearer (default: $MCP_API_KEY or persisted config).
+    #[arg(long, env = "MCP_API_KEY", hide_env_values = true)]
+    pub api_key: Option<String>,
+    /// Per-request timeout in seconds (long tool calls such as ingest).
+    #[arg(long, default_value_t = 600)]
+    pub timeout_secs: u64,
 }
 
 #[derive(clap::Args, Debug)]
@@ -208,6 +262,17 @@ pub struct InitArgs {
     /// Patch settings.json + CLAUDE.md ref but skip writing CORTEXMD.md.
     #[arg(long)]
     pub hook_only: bool,
+    /// Client to install for: claude (default), codex, cursor, gemini.
+    #[arg(long, default_value = "claude", value_parser = ["claude", "codex", "cursor", "gemini"])]
+    pub client: String,
+    /// Server base URL. When the CLI has no credentials yet, `init` runs the
+    /// OAuth login against it first (opens a browser) — one command setup.
+    #[arg(long)]
+    pub server: Option<String>,
+    /// Do not register the MCP server in the client's config (hooks and
+    /// instructions only).
+    #[arg(long)]
+    pub no_mcp: bool,
     /// Verbosity (-v, -vv).
     #[arg(short, long, action = clap::ArgAction::Count)]
     pub verbose: u8,
@@ -687,6 +752,18 @@ pub enum AuthCommand {
     },
     /// Print the OAuth token cache path + redacted summary.  Never the token.
     OauthStatus,
+    /// Print `{"Authorization":"Bearer <token>"}` for the resolved credentials
+    /// (OAuth token auto-refreshed). Used as Claude Code's MCP `headersHelper`
+    /// so the client reuses the CLI login instead of a second OAuth via /mcp.
+    /// Prints the bearer on stdout — only for programs that need it.
+    Header {
+        /// MCP server base URL (default: $MCP_URL or persisted config).
+        #[arg(long, env = "MCP_URL")]
+        server: Option<String>,
+        /// MCP API key bearer (default: $MCP_API_KEY or persisted config).
+        #[arg(long, env = "MCP_API_KEY", hide_env_values = true)]
+        api_key: Option<String>,
+    },
     /// Delete the OAuth token cache.
     OauthLogout {
         /// Skip the confirmation prompt.

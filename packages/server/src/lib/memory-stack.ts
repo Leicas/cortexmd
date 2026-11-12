@@ -4,6 +4,7 @@ import { config } from '../config.js';
 import { getDocMeta, getIndexedNoteCount } from './search.js';
 import { logger } from './logger.js';
 import { projectSlug } from './journal.js';
+import { isDigestNote, isEmailNote } from './vault-hygiene/patterns.js';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -98,6 +99,56 @@ interface NarrativeEntry {
   temperature: string;
   heat_score: number;
   last_accessed: string;
+  /** Wakeup rank: heat plus durable-knowledge, importance and project bonuses. */
+  rank: number;
+}
+
+interface NarrativeMeta {
+  type?: string;
+  title?: string;
+  category?: string;
+  importance?: string;
+  heat_score?: number;
+  archived?: boolean;
+  tags?: readonly string[];
+  source?: string;
+}
+
+/** Frontmatter `source` prefixes of machine captures (hooks, n8n automations, mail triage). */
+const MACHINE_SOURCE_RE = /^(hook|n8n|e-?mail|gmail|matrimail)\b/i;
+
+/**
+ * Notes that never belong in the wakeup narrative: archived notes, digests,
+ * email captures, machine captures (hook / n8n sources, `auto-capture` tag)
+ * and structural index notes. They are exhaust — hot because a machine keeps
+ * writing them, not because they orient a session.
+ */
+export function isWakeupNoise(notePath: string, meta: NarrativeMeta): boolean {
+  if (meta.archived) return true;
+  if (meta.type === 'index') return true;
+  const like = { path: notePath, type: meta.type, tags: meta.tags, source: meta.source, title: meta.title };
+  if (isDigestNote(like) || isEmailNote(like)) return true;
+  if (typeof meta.source === 'string' && MACHINE_SOURCE_RE.test(meta.source)) return true;
+  if ((meta.tags ?? []).some((t) => String(t) === 'auto-capture')) return true;
+  return false;
+}
+
+const WAKEUP_CATEGORY_BONUS: Record<string, number> = { decision: 6, preference: 6, fact: 6, insight: 3 };
+const WAKEUP_IMPORTANCE_BONUS: Record<string, number> = { critical: 4, high: 2, medium: 0, low: -2 };
+const WAKEUP_PROJECT_BONUS = 6;
+
+/**
+ * Wakeup rank of a note. Heat is clamped to its 0–16 scale (stale 0–100
+ * fossils cannot squat the list), durable knowledge (decisions, preferences,
+ * facts) and important notes get a bonus, and so do notes linked to the
+ * current project.
+ */
+export function wakeupRank(meta: NarrativeMeta, linkedToProject = false): number {
+  const heat = Math.min(Math.max(meta.heat_score ?? 0, 0), 16);
+  return heat
+    + (WAKEUP_CATEGORY_BONUS[meta.category ?? ''] ?? 0)
+    + (WAKEUP_IMPORTANCE_BONUS[meta.importance ?? 'medium'] ?? 0)
+    + (linkedToProject ? WAKEUP_PROJECT_BONUS : 0);
 }
 
 /** Paths never listed under "this project" (the diary is its own wakeup section). */
@@ -132,7 +183,7 @@ function linksProject(meta: { related?: string[]; tags?: string[]; content?: str
  * global collections so a new session reads about the repo it is in first,
  * and so it survives the 800-token truncation.
  */
-function buildProjectSection(project: string): string[] {
+function buildProjectSection(project: string, perSection = 5): string[] {
   const slug = projectSlug(project);
   if (!slug) return [];
   const target = `projects/${slug}`;
@@ -143,7 +194,7 @@ function buildProjectSection(project: string): string[] {
   for (const [notePath, meta] of docMeta) {
     if (notePath === projectNotePath) continue;
     if (PROJECT_SECTION_EXCLUDE_PREFIXES.some((p) => notePath.startsWith(p))) continue;
-    if (meta.archived) continue;
+    if (isWakeupNoise(notePath, meta)) continue;
     if (!linksProject(meta, target)) continue;
     linked.push({
       path: notePath,
@@ -153,16 +204,17 @@ function buildProjectSection(project: string): string[] {
       temperature: meta.temperature ?? 'unknown',
       heat_score: meta.heat_score ?? 0,
       last_accessed: meta.last_accessed ?? '',
+      rank: wakeupRank(meta, true),
     });
   }
-  linked.sort((a, b) => (b.heat_score - a.heat_score) || b.last_accessed.localeCompare(a.last_accessed));
+  linked.sort((a, b) => (b.rank - a.rank) || b.last_accessed.localeCompare(a.last_accessed));
 
   const lines: string[] = [`### this project — [[Projects/${slug}]]`];
   if (projectNotePath) {
     const meta = docMeta.get(projectNotePath)!;
     lines.push(`- ${noteLink(projectNotePath, meta.title)} -- project note, ${meta.temperature ?? 'unknown'} (${meta.heat_score ?? 0})`);
   }
-  for (const note of linked.slice(0, 5)) {
+  for (const note of linked.slice(0, perSection)) {
     lines.push(`- ${noteLink(note.path, note.title)} -- ${note.category}, ${note.temperature} (${note.heat_score})`);
   }
   if (!projectNotePath && linked.length === 0) {
@@ -173,13 +225,21 @@ function buildProjectSection(project: string): string[] {
 }
 
 /**
- * Build the essential narrative layer: top notes by heat score, grouped
- * by collection, with a "this project" section first when a project is
- * given. Cached for 60 seconds per project (unfocused only).
+ * Build the essential narrative layer: top notes per collection, with a
+ * "this project" section first when a project is given. Exhaust (archived,
+ * digests, email and machine captures) is left out and durable knowledge —
+ * decisions, preferences, facts, notes linked to the project — ranks first
+ * (see {@link isWakeupNoise} / {@link wakeupRank}). Cached for 60 seconds per
+ * project and size (unfocused only).
  */
-async function buildEssentialNarrative(focusCollection?: string, project?: string): Promise<string> {
+async function buildEssentialNarrative(
+  focusCollection?: string,
+  project?: string,
+  perCollection = DEFAULT_PER_COLLECTION,
+  maxTokens = DEFAULT_L1_TOKENS,
+): Promise<string> {
   const now = Date.now();
-  const cacheKey = project ? projectSlug(project) : '';
+  const cacheKey = `${project ? projectSlug(project) : ''}|${perCollection}|${maxTokens}`;
   // Only use cache when there's no collection focus
   if (!focusCollection) {
     const cached = essentialCache.get(cacheKey);
@@ -191,7 +251,9 @@ async function buildEssentialNarrative(focusCollection?: string, project?: strin
   // Collect all notes with their metadata
   const entries: NarrativeEntry[] = [];
 
+  const projectTarget = project && projectSlug(project) ? `projects/${projectSlug(project)}` : undefined;
   for (const [notePath, meta] of docMeta) {
+    if (isWakeupNoise(notePath, meta)) continue;
     entries.push({
       path: notePath,
       title: meta.title,
@@ -200,11 +262,12 @@ async function buildEssentialNarrative(focusCollection?: string, project?: strin
       temperature: meta.temperature ?? 'unknown',
       heat_score: meta.heat_score ?? 0,
       last_accessed: meta.last_accessed ?? '',
+      rank: wakeupRank(meta, projectTarget ? linksProject(meta, projectTarget) : false),
     });
   }
 
-  // Sort by heat_score descending
-  entries.sort((a, b) => b.heat_score - a.heat_score);
+  // Best first: wakeup rank, then most recently accessed.
+  entries.sort((a, b) => (b.rank - a.rank) || b.last_accessed.localeCompare(a.last_accessed));
 
   // Group by collection
   const byCollection = new Map<string, typeof entries>();
@@ -216,9 +279,9 @@ async function buildEssentialNarrative(focusCollection?: string, project?: strin
   }
 
   // Build markdown narrative — project section first.
-  const lines: string[] = project ? buildProjectSection(project) : [];
+  const lines: string[] = project ? buildProjectSection(project, perCollection) : [];
   for (const [collection, notes] of byCollection) {
-    const topNotes = notes.slice(0, 5);
+    const topNotes = notes.slice(0, perCollection);
     if (topNotes.length === 0) continue;
     lines.push(`### ${collection}`);
     for (const note of topNotes) {
@@ -227,8 +290,8 @@ async function buildEssentialNarrative(focusCollection?: string, project?: strin
     lines.push('');
   }
 
-  // Truncate to ~800 tokens (3200 chars) to stay within budget
-  const content = truncateToTokens(lines.join('\n').trim(), 800);
+  // Truncate to the layer's own cap (the caller fits it into its budget).
+  const content = truncateToTokens(lines.join('\n').trim(), maxTokens);
 
   // Cache only the unfocused version (per project key, bounded)
   if (!focusCollection) {
@@ -308,7 +371,14 @@ export async function filteredRecall(
 export interface WakeUpOptions {
   /** Project slug or name: prepends a "### this project" section to L1. */
   project?: string;
+  /** Notes listed per collection (and in the project section). Default 5. */
+  perCollection?: number;
+  /** Cap on the L1 narrative, in tokens. Default 800. */
+  maxL1Tokens?: number;
 }
+
+const DEFAULT_PER_COLLECTION = 5;
+const DEFAULT_L1_TOKENS = 800;
 
 /**
  * Wake-up call: returns L0 (Identity) + L1 (Essential Narrative) layers.
@@ -328,7 +398,9 @@ export async function wakeUp(collection?: string, opts: WakeUpOptions = {}): Pro
     });
 
     // L1: Essential Narrative
-    const narrativeContent = await buildEssentialNarrative(collection, opts.project);
+    const narrativeContent = await buildEssentialNarrative(
+      collection, opts.project, opts.perCollection ?? DEFAULT_PER_COLLECTION, opts.maxL1Tokens ?? DEFAULT_L1_TOKENS,
+    );
     layers.push({
       level: 1,
       tokens: countTokens(narrativeContent),

@@ -69,6 +69,30 @@ describe('explainRecall', () => {
   it('omits validity when tracking is off', () => {
     expect(explainRecall({ ...base, validity: undefined }).validity).toBeUndefined();
   });
+
+  it('labels a graph-only hit as a graph match, not a lexical one', () => {
+    const r = explainRecall({ ...base, lexicalScore: 0, semanticScore: 0, graphScore: 0.08 });
+    expect(r.match).toBe('graph');
+    expect(r.arms).toBeUndefined();
+    expect(r.reason).toContain('graph match');
+    expect(r.reason).not.toContain('lexical');
+  });
+
+  it('lists every contributing arm of a hybrid hit, graph included', () => {
+    const r = explainRecall({ ...base, graphScore: 0.05 });
+    expect(r.match).toBe('hybrid');
+    expect(r.arms).toEqual(['lexical', 'semantic', 'graph']);
+    expect(r.reason).toContain('lexical+semantic+graph match');
+  });
+
+  it('reports the bounded prior and a demoted low-priority tier', () => {
+    const r = explainRecall({ ...base, prior: 0.0712, tier: 'digest', lowTier: true });
+    expect(r.prior).toBe(0.071);
+    expect(r.tier).toBe('digest');
+    expect(r.reason).toContain('digest (low priority)');
+    // A plain memory carries no tier field.
+    expect(explainRecall({ ...base, tier: 'memory' }).tier).toBeUndefined();
+  });
 });
 
 describe('Bayesian validity transitions (Rescue@k mechanism)', () => {

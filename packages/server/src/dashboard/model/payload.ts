@@ -12,7 +12,7 @@ import { getMetrics, getRecentSearchScores, getBenchmarkResults, getRescueResult
 import { getRateLimitSnapshot } from '../../lib/rate-limit.js';
 import { getSessionSnapshots } from '../../index.js';
 import { getOAuthClients } from '../../oauth.js';
-import { getDocMeta, getDocMetaSummary, getCollectionDistribution, getIndexHealth, getRecallGraphStats } from '../../lib/search.js';
+import { getDocMeta, getDocMetaSummary, getCollectionDistribution, getIndexHealth, getRecallGraphStats, getLexicalBackendStatus } from '../../lib/search.js';
 import { getEmbeddingStats, isEmbeddingsReady } from '../../lib/embeddings.js';
 import { getRecentLogs } from '../../lib/logger.js';
 import { wakeUp } from '../../lib/memory-stack.js';
@@ -397,5 +397,8 @@ function buildRetrievalPayload(): RetrievalPayload {
     lastSeedSpread: graphStats.lastSeedSpread,
   };
 
-  return { armMix, armWeights, armsActive, recentArmBreakdown, quality, qualityHistory, bitemporal, graph };
+  let lexicalBackend: RetrievalPayload['lexicalBackend'] = null;
+  try { lexicalBackend = getLexicalBackendStatus(); } catch { /* non-critical */ }
+
+  return { armMix, armWeights, armsActive, recentArmBreakdown, quality, qualityHistory, bitemporal, graph, lexicalBackend };
 }

@@ -157,6 +157,11 @@ pub enum Command {
     /// the recap directly instead of asking the model to call the tool.
     Wakeup(WakeupArgs),
 
+    /// Guidance packs: curated third-party best-practice packs (for example
+    /// GoogleChrome/modern-web-guidance) the server fetches and serves next to
+    /// personal memory. `list | add | sync | remove | search | get`.
+    Guidance(GuidanceArgs),
+
     /// stdio ↔ Streamable-HTTP MCP bridge: reads JSON-RPC lines on stdin,
     /// POSTs them to `<server>/mcp` with the CLI's stored token (OAuth
     /// auto-refresh), writes responses on stdout, logs on stderr. Lets stdio
@@ -200,6 +205,84 @@ pub struct WakeupArgs {
     /// MCP API key bearer (default: $MCP_API_KEY or persisted config).
     #[arg(long, env = "MCP_API_KEY", hide_env_values = true)]
     pub api_key: Option<String>,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct GuidanceArgs {
+    #[command(subcommand)]
+    pub command: GuidanceCommand,
+    /// Print the server's JSON response instead of text.
+    #[arg(long, global = true)]
+    pub json: bool,
+    /// MCP server base URL (default: $MCP_URL or persisted config).
+    #[arg(long, env = "MCP_URL", global = true)]
+    pub server: Option<String>,
+    /// MCP API key bearer (default: $MCP_API_KEY or persisted config).
+    #[arg(long, env = "MCP_API_KEY", hide_env_values = true, global = true)]
+    pub api_key: Option<String>,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum GuidanceCommand {
+    /// Installed and declared packs (source, commit, licence, entries, last sync).
+    List,
+    /// Declare a pack on the server and fetch it. The server only accepts
+    /// https git URLs on its host allowlist (GUIDANCE_PACK_HOSTS, default
+    /// github.com).
+    Add {
+        /// Pack name, e.g. `modern-web-guidance`.
+        name: String,
+        /// Git URL, e.g. https://github.com/GoogleChrome/modern-web-guidance
+        source: String,
+        /// Branch or tag to follow (default: the remote HEAD).
+        #[arg(long = "ref")]
+        git_ref: Option<String>,
+        /// Pin to a full commit sha; sync fails if the fetched commit differs.
+        #[arg(long)]
+        commit: Option<String>,
+        /// Sub-path glob to keep (repeatable), e.g. `skills/**`.
+        #[arg(long)]
+        include: Vec<String>,
+        /// Re-sync interval: `off` (default), `12h`, `7d`, `2w`.
+        #[arg(long)]
+        refresh: Option<String>,
+        /// Only record the declaration; fetch later with `guidance sync`.
+        #[arg(long)]
+        no_sync: bool,
+    },
+    /// Re-fetch a declared pack now.
+    Sync {
+        name: String,
+    },
+    /// Remove a pack (declaration and files) from the server.
+    Remove {
+        name: String,
+    },
+    /// Search guides: prints `pack/id — description` lines.
+    Search {
+        /// 2-5 word query for one capability, e.g. `light dismiss dialog`.
+        #[arg(required = true)]
+        query: Vec<String>,
+        /// Limit to one pack.
+        #[arg(long)]
+        pack: Option<String>,
+        /// Max results (server default 5).
+        #[arg(long)]
+        limit: Option<u32>,
+    },
+    /// Print full guide(s) by id, with the source/licence/commit line.
+    Get {
+        #[arg(required = true)]
+        ids: Vec<String>,
+        #[arg(long)]
+        pack: Option<String>,
+        /// Only the section under this heading.
+        #[arg(long)]
+        section: Option<String>,
+        /// Response cap in tokens (server default 6000).
+        #[arg(long)]
+        max_tokens: Option<u32>,
+    },
 }
 
 #[derive(clap::Args, Debug, Default)]

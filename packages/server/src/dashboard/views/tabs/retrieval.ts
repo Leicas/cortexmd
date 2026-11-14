@@ -165,5 +165,24 @@ export function renderRetrievalTab(): string {
     </div>
   </div>`;
 
-  return sowhat + kpis + zoneArms + zoneQuality + zoneKgGraph;
+  // ── Lexical Backend (col-12) — SEARCH_BACKEND mode + shadow agreement ──────
+  const zoneLexical = `
+  <div class="grid">
+    <div class="col-12 card" id="lexBackendCard">
+      ${sectionHead('Lexical Backend', `<span id="lexModePill"></span>`)}
+      <div class="card-sub" style="margin:0 0 .5rem" id="lexBackendSub">MiniSearch (in memory).</div>
+      <div id="lexDegraded" style="display:none" class="card-sub"></div>
+      <div id="lexShadow" style="display:none">
+        <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:.6rem">
+          <div><div class="card-label">Top-10 overlap</div><div class="card-value mono" id="lexOverlap">—</div></div>
+          <div><div class="card-label">Top-1 agreement</div><div class="card-value mono" id="lexTop1">—</div></div>
+          <div><div class="card-label">p95 MiniSearch / SQLite</div><div class="card-value mono" id="lexP95">—</div></div>
+          <div><div class="card-label">Compared queries</div><div class="card-value mono" id="lexQueries">0</div></div>
+        </div>
+        <div class="card-sub" style="margin:.5rem 0 0" id="lexShadowFoot"></div>
+      </div>
+    </div>
+  </div>`;
+
+  return sowhat + kpis + zoneArms + zoneQuality + zoneKgGraph + zoneLexical;
 }

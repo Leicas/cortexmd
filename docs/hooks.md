@@ -224,7 +224,7 @@ or the other, not both.
 
 `cortexmd init` writes `CORTEXMD.md` next to `settings.json` and adds a single
 `@CORTEXMD.md` line to `CLAUDE.md` (`~/.claude/CLAUDE.md` with `-g`,
-`./CLAUDE.md` otherwise). It is ≤45 lines with five rules, and says the same
+`./CLAUDE.md` otherwise). It is ≤45 lines with six rules (the sixth, guidance packs, only applies when a pack is installed), and says the same
 thing as the plugin SKILL.md and the server's MCP `instructions`:
 
 1. **Session start** — the SessionStart hook injects the wakeup recap; call

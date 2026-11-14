@@ -43,6 +43,8 @@ pub const LEAN_TOOLS: &[&str] = &[
     "code_repo_list", "code_file_outline", "code_symbol_search", "code_symbol_get",
     "code_symbol_callers", "code_symbol_callees", "code_change_impact", "code_call_chain",
     "code_index_repo", "tool_search", "tool_invoke",
+    // Advertised by the server only while a guidance pack is installed.
+    "guidance_search", "guidance_get",
 ];
 
 const AGENTS_TEMPLATE: &str = include_str!("../../../templates/codex/AGENTS.md");

@@ -214,6 +214,12 @@ export function applyToolProfile(
   profile: ToolProfile,
   /** Extra tool names to advertise on top of the profile (e.g. CHATGPT_SEARCH_FETCH). */
   alsoAdvertise: ReadonlyArray<string> = [],
+  /**
+   * Tools advertised on top of the profile only while a runtime condition
+   * holds, evaluated on every `tools/list` (e.g. guidance_* once a guidance
+   * pack is installed). A failing callback advertises nothing extra.
+   */
+  dynamicAdvertise?: () => Promise<ReadonlyArray<string>> | ReadonlyArray<string>,
 ): ToolProfileResult {
   const base = profileMembership(profile);
   const allowed = base && alsoAdvertise.length > 0 ? new Set([...base, ...alsoAdvertise]) : base;
@@ -244,7 +250,15 @@ export function applyToolProfile(
   inner.setRequestHandler(ListToolsRequestSchema, async (request, extra) => {
     const result = (await original(request, extra)) as ListToolsResult;
     if (!result || !Array.isArray(result.tools)) return result;
-    return { ...result, tools: result.tools.filter((t) => allowed.has(t.name)) };
+    let dynamic: ReadonlyArray<string> = [];
+    if (dynamicAdvertise) {
+      try {
+        dynamic = await dynamicAdvertise();
+      } catch {
+        dynamic = [];
+      }
+    }
+    return { ...result, tools: result.tools.filter((t) => allowed.has(t.name) || dynamic.includes(t.name)) };
   });
 
   let kept = 0;

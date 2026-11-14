@@ -1,6 +1,8 @@
 import MiniSearch from 'minisearch';
+import { createHash } from 'node:crypto';
 import { readFile, stat } from 'node:fs/promises';
 import path from 'node:path';
+import { performance } from 'node:perf_hooks';
 import { config } from '../config.js';
 import { listFiles, readNote } from './vault.js';
 import { parseFrontmatter } from './frontmatter.js';
@@ -33,6 +35,8 @@ import {
   pprRrfContribution,
   type RecallGraph,
 } from './graph-recall.js';
+import type { LexicalBackend, LexicalFilters, LexicalHit, ListingEntry, NoteRecord, SyncStats } from './lexical/types.js';
+import { rankOverlap, ShadowStats, type ShadowSnapshot } from './lexical/shadow.js';
 
 export interface SearchOptions {
   scopePaths?: string[];
@@ -179,7 +183,7 @@ function toIsoDay(v: unknown): string | undefined {
 }
 
 /** Keep full rebuild and single-note updates on the same metadata contract. */
-function metadataForNote(filePath: string, data: Record<string, any>, body: string): DocMeta {
+export function metadataForNote(filePath: string, data: Record<string, any>, body: string): DocMeta {
   const tags = (Array.isArray(data.tags) ? data.tags : []).map(String);
   const title = data.title ?? filePath.replace(/\.md$/, '').split('/').pop() ?? filePath;
   return {
@@ -304,6 +308,219 @@ export function forceFullRebuild(): void {
   isFirstBuild = true;
 }
 
+// ── Lexical backend selection (SEARCH_BACKEND, docs/ARCHITECTURE.md §6) ──────
+//   minisearch  MiniSearch answers; no SQLite at all (default).
+//   shadow      MiniSearch answers; the SQLite backend is kept in sync in the
+//               background and sampled queries are replayed against it AFTER
+//               the response to record aggregate agreement/latency only.
+//   sqlite      SQLite answers the lexical arm; MiniSearch is not built.
+// A backend that fails to open (or, in sqlite mode, to sync) degrades to
+// MiniSearch with one error log and a note in getLexicalBackendStatus().
+
+export type SearchBackendMode = 'minisearch' | 'sqlite' | 'shadow';
+
+let lexical: LexicalBackend | null = null;
+let lexicalOpenAttempted = false;
+/** Backend actually answering the lexical arm (or being shadowed, for 'shadow'). */
+let activeMode: SearchBackendMode = 'minisearch';
+let lexicalDegraded: string | null = null;
+/** True once the backend finished one full sync (shadow comparisons start then). */
+let lexicalSynced = false;
+let lexicalSyncChain: Promise<void> = Promise.resolve();
+let lastLexicalSync: (SyncStats & { at: string }) | null = null;
+let lexicalWriteErrors = 0;
+let lexicalFactory: (() => LexicalBackend | Promise<LexicalBackend>) | null = null;
+const shadowStats = new ShadowStats();
+const shadowJobs = new Set<Promise<void>>();
+/** Hits fetched per round when JS-only filters drop SQLite hits (deepened ×4 up to this). */
+const SQLITE_MAX_DEPTH = 4096;
+
+async function openSqliteBackend(): Promise<LexicalBackend> {
+  const { SqliteLexicalBackend } = await import('./lexical-sqlite.js');
+  return new SqliteLexicalBackend({
+    dbPath: config.lexicalDbPath,
+    sliceMs: config.lexicalSyncSliceMs,
+    maxIndexedChars: config.lexicalMaxIndexedKb * 1024,
+    toRecord: noteRecordFor,
+  });
+}
+
+/** Test seam: replace how the SQLite backend is opened (e.g. a throwing factory). */
+export function setLexicalBackendFactoryForTests(f: (() => LexicalBackend | Promise<LexicalBackend>) | null): void {
+  lexicalFactory = f;
+}
+
+/** Open the configured backend once (at the first rebuild). Never throws. */
+async function ensureLexicalBackend(): Promise<void> {
+  if (lexicalOpenAttempted) return;
+  lexicalOpenAttempted = true;
+  const want = config.searchBackend;
+  if (want === 'minisearch') return;
+  if (!config.lexicalAnalyzer) {
+    lexicalDegraded = `SEARCH_BACKEND=${want} needs the shared analyzer (LEXICAL_ANALYZER=legacy is MiniSearch-only); serving MiniSearch`;
+    logger.error('Lexical backend not started — falling back to MiniSearch', { requested: want, reason: lexicalDegraded });
+    return;
+  }
+  try {
+    lexical = await (lexicalFactory ?? openSqliteBackend)();
+    activeMode = want;
+    const s = lexical.stats();
+    logger.info('Lexical backend opened', { mode: want, docs: s.docs, rebuiltOnOpen: s.rebuiltOnOpen ?? false });
+  } catch (err) {
+    lexical = null;
+    activeMode = 'minisearch';
+    lexicalDegraded = `SEARCH_BACKEND=${want}: the SQLite lexical backend failed to open (${err instanceof Error ? err.message : String(err)}); serving MiniSearch`;
+    logger.error('SQLite lexical backend failed to open — falling back to MiniSearch', {
+      requested: want, dbPath: config.lexicalDbPath, error: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
+
+/** sqlite mode only: the backend broke after opening → serve MiniSearch from the next build on. */
+function demoteToMiniSearch(reason: string, err: unknown): void {
+  lexicalDegraded = `SEARCH_BACKEND=sqlite: ${reason} (${err instanceof Error ? err.message : String(err)}); serving MiniSearch`;
+  logger.error('SQLite lexical backend failed — falling back to MiniSearch', { reason, error: String(err) });
+  try { lexical?.close(); } catch { /* ignore */ }
+  lexical = null;
+  lexicalSynced = false;
+  activeMode = 'minisearch';
+}
+
+/** NoteRecord for the lexical backend, on the same metadata contract as docMeta. */
+function recordFromMeta(relPath: string, m: DocMeta): NoteRecord {
+  return {
+    path: relPath,
+    title: String(m.title),
+    body: m.content,
+    tags: m.tags,
+    date: m.date,
+    type: m.type,
+    category: m.category,
+    temperature: m.temperature,
+    heat_score: m.heat_score,
+    importance: m.importance,
+    archived: m.archived,
+    collection: m.collection,
+  };
+}
+
+/** Markdown → NoteRecord via `metadataForNote` (the backend's `toRecord`). */
+export function noteRecordFor(relPath: string, content: string): NoteRecord {
+  const { data, body } = parseFrontmatter(content);
+  return recordFromMeta(relPath, metadataForNote(relPath, data, body));
+}
+
+function sha1(text: string): string {
+  return createHash('sha1').update(text).digest('hex');
+}
+
+function lexicalWriteFailed(op: string, err: unknown): void {
+  lexicalWriteErrors++;
+  // One line per failure would flood the log if the disk is gone; log the first few.
+  if (lexicalWriteErrors <= 5 || lexicalWriteErrors % 100 === 0) {
+    logger.warn('Lexical backend write failed', { op, mode: activeMode, errors: lexicalWriteErrors, error: String(err) });
+  }
+}
+
+/**
+ * indexNote() upserts by time. A note written after a scan listed the vault is
+ * absent from that listing, so the reconcile would delete it again; such notes
+ * are put back right after the sync (`listedAt` = when the scan started).
+ */
+const lexicalUpsertedAt = new Map<string, number>();
+
+/** Reconcile the backend against this scan's listing (unchanged mtime/hash → skipped). */
+async function syncLexical(
+  be: LexicalBackend,
+  listing: ListingEntry[],
+  cache: Map<string, string>,
+  listedAt: number,
+): Promise<void> {
+  const resurrect: string[] = [];
+  const onRemove = (p: string): void => {
+    if ((lexicalUpsertedAt.get(p) ?? 0) >= listedAt) resurrect.push(p);
+  };
+  const load = async (e: ListingEntry): Promise<string> => {
+    const cached = cache.get(e.path);
+    if (cached !== undefined) return cached;
+    const transport = getVault(e.vault);
+    return transport
+      ? (await transport.read(e.path)).content.toString('utf-8')
+      : readFile(path.resolve(e.vault, e.path), 'utf-8');
+  };
+  const st = await be.syncFromListing(listing, load, { concurrency: config.indexReadConcurrency, onRemove });
+  if (be !== lexical) return; // demoted/closed meanwhile
+  for (const p of resurrect) {
+    const m = docMeta.get(p);
+    if (m) be.upsert(recordFromMeta(p, m));
+  }
+  for (const [p, at] of lexicalUpsertedAt) if (at < listedAt) lexicalUpsertedAt.delete(p);
+  lastLexicalSync = { ...st, at: new Date().toISOString() };
+  lexicalSynced = true;
+  if (st.upserted > 0 || st.removed > 0 || st.failed > 0) {
+    logger.info('Lexical backend synced', {
+      mode: activeMode, listed: st.listed, upserted: st.upserted, removed: st.removed, failed: st.failed,
+      ms: Math.round(st.ms), maxSliceMs: Math.round(st.maxSliceMs),
+    });
+  }
+}
+
+/** Resolves once queued background syncs and shadow comparisons have run (tests, eval). */
+export async function whenLexicalIdle(): Promise<void> {
+  await lexicalSyncChain;
+  while (shadowJobs.size > 0) await Promise.all([...shadowJobs]);
+}
+
+/** Close the SQLite backend (shutdown, tests). */
+export function closeLexicalBackend(): void {
+  try { lexical?.close(); } catch { /* ignore */ }
+  lexical = null;
+  lexicalSynced = false;
+}
+
+export interface LexicalBackendStatus {
+  requested: SearchBackendMode;
+  /** Who answers the lexical arm: 'shadow' means MiniSearch answers with SQLite alongside. */
+  active: SearchBackendMode;
+  /** Set when the requested backend could not be used (we fell back to MiniSearch). */
+  degraded: string | null;
+  synced: boolean;
+  docs?: number;
+  dbBytes?: number;
+  lastSync: { at: string; ms: number; listed: number; upserted: number; removed: number; failed: number; maxSliceMs: number } | null;
+  writeErrors: number;
+  /** Aggregate MiniSearch-vs-SQLite agreement (shadow mode only; never query text or paths). */
+  shadow: ShadowSnapshot | null;
+}
+
+let statsCache: { at: number; docs?: number; dbBytes?: number } | null = null;
+
+export function getLexicalBackendStatus(): LexicalBackendStatus {
+  const now = Date.now();
+  if (lexical && (!statsCache || now - statsCache.at > 30_000)) {
+    try {
+      const s = lexical.stats();
+      statsCache = { at: now, docs: s.docs, dbBytes: s.dbBytes };
+    } catch {
+      statsCache = { at: now };
+    }
+  }
+  const ls = lastLexicalSync;
+  return {
+    requested: config.searchBackend,
+    active: activeMode,
+    degraded: lexicalDegraded,
+    synced: lexicalSynced,
+    ...(lexical ? { docs: statsCache?.docs, dbBytes: statsCache?.dbBytes } : {}),
+    lastSync: ls ? {
+      at: ls.at, ms: Math.round(ls.ms), listed: ls.listed, upserted: ls.upserted, removed: ls.removed,
+      failed: ls.failed, maxSliceMs: Math.round(ls.maxSliceMs * 10) / 10,
+    } : null,
+    writeErrors: lexicalWriteErrors,
+    shadow: activeMode === 'shadow' ? shadowStats.snapshot() : null,
+  };
+}
+
 function createIndex(): MiniSearch {
   if (!config.lexicalAnalyzer) {
     // LEXICAL_ANALYZER=legacy: raw MiniSearch tokens, prefix + fuzzy everywhere.
@@ -372,7 +589,14 @@ async function runRebuild(): Promise<void> {
   isFirstBuild = false;
   const isBootBuild = full && (getIndexState() === 'not_started' || getIndexState() === 'error');
   if (isBootBuild) setIndexState('indexing');
-  const ms = full ? createIndex() : miniSearch;
+  await ensureLexicalBackend();
+  // sqlite mode: the SQLite backend is the lexical index, MiniSearch is not built.
+  const ms: MiniSearch | undefined = activeMode === 'sqlite' ? undefined : full ? createIndex() : miniSearch;
+  // shadow / sqlite: the scan's listing (+ the bytes it already read on an
+  // incremental pass) feeds the backend's own mtime/hash reconcile below.
+  const lexBackend = lexical;
+  const lexListing = new Map<string, ListingEntry>();
+  const lexContent = new Map<string, string>();
   const meta: Map<string, DocMeta> = full ? new Map() : docMeta;
   const links: Map<string, string[]> = full ? new Map() : docLinks;
   const mtimes: Map<string, number> = full ? new Map() : fileMtimes;
@@ -467,6 +691,7 @@ async function runRebuild(): Promise<void> {
         claimedBy.set(relPath, vault);
         seenFiles.add(mtimeKey(vault, relPath));
         owned.push(relPath);
+        if (lexBackend) lexListing.set(relPath, { path: relPath, vault });
       }
       listedTotal += owned.length;
       if (isBootBuild) setIndexProgress(readDone, listedTotal);
@@ -488,6 +713,10 @@ async function runRebuild(): Promise<void> {
           if (fileStat) mtime = fileStat.mtimeMs;
         } catch {
           // stat failed: (re-)index the file anyway
+        }
+        if (lexBackend && mtime !== undefined) {
+          const le = lexListing.get(relPath);
+          if (le) le.mtimeMs = mtime;
         }
         if (!full && mtime !== undefined && mtimes.get(key) === mtime) {
           return { skip: true }; // file unchanged, skip
@@ -516,13 +745,14 @@ async function runRebuild(): Promise<void> {
 
           // On incremental rebuild, remove old entry before re-adding
           if (!full && meta.has(relPath)) {
-            try { ms.discard(relPath); } catch { /* may not exist */ }
+            try { ms?.discard(relPath); } catch { /* may not exist */ }
           }
 
           meta.set(relPath, metadataForNote(relPath, data, body));
           links.set(relPath, extractWikilinks(content));
+          if (lexBackend && !full) lexContent.set(relPath, content);
 
-          ms.add({
+          ms?.add({
             id: relPath,
             title,
             content: body,
@@ -601,7 +831,7 @@ async function runRebuild(): Promise<void> {
         if (!meta.has(p)) { removeFromVectorIndex(p); removedCount++; }
       }
     }
-    miniSearch = ms;
+    if (ms) miniSearch = ms;
     docMeta.clear();
     for (const [p, m] of meta) docMeta.set(p, m);
     docLinks.clear();
@@ -626,6 +856,28 @@ async function runRebuild(): Promise<void> {
       if (!seenFiles.has(key)) fileMtimes.delete(key);
     }
   }
+
+  if (lexBackend && lexBackend === lexical) {
+    const listing = [...lexListing.values()];
+    if (activeMode === 'sqlite') {
+      // The backend IS the lexical index: readiness waits for it (a warm boot
+      // skips unchanged files by mtime; a cold one indexes the whole vault).
+      try {
+        await syncLexical(lexBackend, listing, lexContent, startedAt);
+      } catch (err) {
+        demoteToMiniSearch('sync failed', err);
+        isFirstBuild = true;
+        await runRebuild(); // full MiniSearch build, swapped in before we report ready
+      }
+    } else {
+      // shadow: background, serialised, never blocks this build; failures are
+      // logged and cannot reach MiniSearch's results.
+      lexicalSyncChain = lexicalSyncChain
+        .then(() => syncLexical(lexBackend, listing, lexContent, startedAt))
+        .catch((err) => lexicalWriteFailed('sync', err));
+    }
+  }
+
   fileCount = docMeta.size;
   lastIndexHealth = healthThisScan;
 
@@ -712,24 +964,40 @@ export async function indexNote(filePath: string): Promise<void> {
   const title =
     data.title ?? filePath.replace(/\.md$/, '').split('/').pop() ?? filePath;
 
-  // Remove old entry if it exists
-  try {
-    miniSearch.discard(filePath);
-  } catch {
-    // Document may not exist in the index yet — that's fine
+  if (activeMode !== 'sqlite') {
+    // Remove old entry if it exists
+    try {
+      miniSearch.discard(filePath);
+    } catch {
+      // Document may not exist in the index yet — that's fine
+    }
   }
 
   // Update docMeta
-  docMeta.set(filePath, metadataForNote(filePath, data, body));
+  const meta = metadataForNote(filePath, data, body);
+  docMeta.set(filePath, meta);
   docLinks.set(filePath, extractWikilinks(content));
 
-  // Add to MiniSearch
-  miniSearch.add({
-    id: filePath,
-    title,
-    content: body,
-    tags: tags.join(' '),
-  });
+  if (activeMode !== 'sqlite') {
+    // Add to MiniSearch
+    miniSearch.add({
+      id: filePath,
+      title,
+      content: body,
+      tags: tags.join(' '),
+    });
+  }
+
+  // shadow / sqlite: one small synchronous transaction. The hash lets the next
+  // rescan's reconcile skip this note; a failure never affects MiniSearch.
+  if (lexical) {
+    try {
+      lexical.upsert(recordFromMeta(filePath, meta), { hash: sha1(content) });
+      lexicalUpsertedAt.set(filePath, Date.now());
+    } catch (err) {
+      lexicalWriteFailed('upsert', err);
+    }
+  }
 
   // Update vector index (non-blocking). Same text (title + body) and hash as
   // the boot/rescan paths — see embedTextFor — so an unchanged embed text
@@ -752,6 +1020,13 @@ export function removeFromIndex(filePath: string): void {
     miniSearch.discard(filePath);
   } catch {
     // Document may not exist in the index
+  }
+  if (lexical) {
+    try {
+      lexical.remove(filePath);
+    } catch (err) {
+      lexicalWriteFailed('remove', err);
+    }
   }
   docMeta.delete(filePath);
   docLinks.delete(filePath);
@@ -813,6 +1088,15 @@ function termDocFrequency(term: string): number | undefined {
   }
 }
 
+/** Same contract as termDocFrequency, from the SQLite backend (max per-field df). */
+function lexicalDocFrequency(be: LexicalBackend, term: string): number | undefined {
+  try {
+    return be.docFrequency(term);
+  } catch {
+    return undefined;
+  }
+}
+
 /**
  * IDF weight of each distinct analysed query term (BM25 idf, floored so even a
  * ubiquitous term still counts a little). Empty when the query has no terms.
@@ -823,7 +1107,9 @@ export function queryTermWeights(query: string): Map<string, number> {
   for (const raw of defaultTokenize(query)) {
     const term = config.lexicalAnalyzer ? analyzeTerm(raw) : raw.toLowerCase();
     if (!term || out.has(term)) continue;
-    const df = miniSearch ? termDocFrequency(term) : undefined;
+    const df = activeMode === 'sqlite' && lexical
+      ? lexicalDocFrequency(lexical, term)
+      : miniSearch ? termDocFrequency(term) : undefined;
     out.set(term, df === undefined ? 1 : Math.max(0.1, Math.log(1 + (n - df + 0.5) / (df + 0.5))));
   }
   return out;
@@ -900,14 +1186,19 @@ export function searchNotes(
  * builds it later, only for the notes it returns).
  */
 function lexicalSearch(query: string, opts: SearchOptions, withSnippets: boolean): SearchResult[] {
-  if (!miniSearch) {
+  const useSqlite = activeMode === 'sqlite' && lexical !== null;
+  if (useSqlite ? !lexicalSynced : !miniSearch) {
     throw new Error(
       'Search index not built. Call rebuildIndex() before searching.',
     );
   }
 
   const limit = opts.limit ?? 20;
-  const results = miniSearch.search(query);
+  const shadowing = activeMode === 'shadow' && lexicalSynced;
+  const t0 = shadowing ? performance.now() : 0;
+  const results: Iterable<{ id: unknown; score: number; queryTerms?: string[] }> = useSqlite
+    ? sqliteLexicalHits(lexical!, query, opts, limit)
+    : miniSearch.search(query);
 
   const weights = queryTermWeights(query);
   let totalWeight = 0;
@@ -933,7 +1224,92 @@ function lexicalSearch(query: string, opts: SearchOptions, withSnippets: boolean
       lexicalEvidence: totalWeight > 0 ? r.score / totalWeight : undefined,
     });
   }
+  if (shadowing) scheduleShadowQuery(query, opts, limit, out, performance.now() - t0);
   return out;
+}
+
+/** SearchOptions filters with exactly passesFilters' semantics, pushed into SQL. */
+function sqlFiltersFor(opts: SearchOptions): LexicalFilters {
+  // Date bounds stay in JS (day-prefix semantics differ from a string compare);
+  // kinds / filter() are JS-only. Every hit is re-checked by passesFilters.
+  const f: LexicalFilters = { excludeArchived: opts.excludeArchived ?? true };
+  if (opts.type) f.types = Array.isArray(opts.type) ? opts.type : [opts.type];
+  if (opts.category) f.category = opts.category;
+  if (opts.temperature) f.temperature = opts.temperature;
+  if (opts.importance) f.importance = opts.importance;
+  if (opts.minHeatScore !== undefined) f.minHeatScore = opts.minHeatScore;
+  if (opts.collections?.length) f.collections = opts.collections;
+  if (opts.tags?.length) f.tagsAny = opts.tags;
+  if (opts.scopePaths?.length) f.pathPrefixes = opts.scopePaths;
+  return f;
+}
+
+/**
+ * Ranked SQLite hits as `{ id, score, queryTerms }` (MiniSearch's result
+ * shape). Deepens the fetch when JS-only filters (dates, kinds, filter())
+ * drop hits, so a filtered query is not starved.
+ */
+function sqliteLexicalHits(
+  be: LexicalBackend,
+  query: string,
+  opts: SearchOptions,
+  limit: number,
+): Array<{ id: string; score: number; queryTerms: string[] }> {
+  const filters = sqlFiltersFor(opts);
+  const toResult = (h: LexicalHit) => ({ id: h.path, score: h.score, queryTerms: h.queryTerms });
+  let want = Math.max(limit, 1);
+  for (;;) {
+    const hits = be.search(query, { limit: want, filters });
+    if (hits.length < want || want >= SQLITE_MAX_DEPTH) return hits.map(toResult);
+    let kept = 0;
+    for (const h of hits) {
+      const meta = docMeta.get(h.path);
+      if (meta && passesFilters(h.path, meta, opts) && ++kept >= limit) return hits.map(toResult);
+    }
+    want = Math.min(want * 4, SQLITE_MAX_DEPTH);
+  }
+}
+
+/**
+ * shadow mode: replay a sampled lexical query against SQLite AFTER the caller
+ * got MiniSearch's answer (setImmediate), with a bounded queue. Records only
+ * aggregates (top-10 overlap, top-1 agreement, latency); never the query.
+ */
+function scheduleShadowQuery(query: string, opts: SearchOptions, limit: number, primary: SearchResult[], primaryMs: number): void {
+  try {
+    const be = lexical;
+    if (!be || Math.random() >= config.searchShadowSampleRate) return;
+    if (shadowJobs.size >= config.searchShadowMaxPending) {
+      shadowStats.recordDropped();
+      return;
+    }
+    const primaryTop = primary.slice(0, 10).map((r) => r.path);
+    const job = new Promise<void>((resolve) => {
+      setImmediate(() => {
+        try {
+          if (be !== lexical) return;
+          const t = performance.now();
+          const hits = sqliteLexicalHits(be, query, opts, limit);
+          const shadowTop: string[] = [];
+          for (const h of hits) {
+            if (shadowTop.length >= 10) break;
+            const meta = docMeta.get(h.id);
+            if (meta && passesFilters(h.id, meta, opts)) shadowTop.push(h.id);
+          }
+          shadowStats.record(rankOverlap(primaryTop, shadowTop), primaryMs, performance.now() - t);
+          if (shadowStats.n >= 500) logger.info('Lexical shadow comparison', shadowStats.flush() ?? {});
+        } catch {
+          shadowStats.recordError();
+        } finally {
+          resolve();
+        }
+      });
+    });
+    shadowJobs.add(job);
+    void job.then(() => shadowJobs.delete(job));
+  } catch {
+    // never let shadow bookkeeping reach the caller
+  }
 }
 
 /**

@@ -241,10 +241,13 @@ describe('SqliteLexicalBackend — incremental sync', () => {
     const st = await b.syncFromListing(listing(), load);
     expect(st.upserted).toBe(1500 + Object.keys(NOTES).length);
     expect(st.slices).toBeGreaterThan(1);
-    // One item can overshoot the budget; allow generous headroom for slow CI.
-    expect(st.maxSliceMs).toBeLessThan(200);
+    // Wall-clock slices include CPU descheduling when the whole suite runs in
+    // parallel, so assert the shape, not one worst case: almost every slice
+    // stays under 50 ms, and none approaches an unsliced bulk load (seconds).
+    expect(st.slowSlices / st.slices).toBeLessThan(0.1);
+    expect(st.maxSliceMs).toBeLessThan(1000);
     b.close();
-  });
+  }, 30_000);
 });
 
 describe('SqliteLexicalBackend — schema + crash safety', () => {

@@ -2,11 +2,14 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { listSkills } from '../lib/agents.js';
 import { wrapToolHandler } from '../lib/tool-wrapper.js';
+import { listPackSkills } from '../lib/guidance-packs/skills-bridge.js';
 
 export function register(server: McpServer): void {
   server.tool(
     'skills_list',
     `List skill definitions declared under Ops/Skills/ in the vault. Each entry summarises name, description, trigger, and tags so a coordinator can pick relevant skills to inject into an agent or team prompt.
+
+Skills shipped by installed guidance packs are listed too, named pack:<pack>/<skill> (tag guidance-pack).
 
 Optionally filter by tag, or by a case-insensitive substring match against the trigger field.`,
     {
@@ -20,7 +23,11 @@ Optionally filter by tag, or by a case-insensitive substring match against the t
       const tag = params.tag as string | undefined;
       const trigger = (params.trigger as string | undefined)?.trim().toLowerCase();
 
-      const all = await listSkills(tag ? { tag } : undefined);
+      // Vault skills first (unchanged); pack skills are appended and can never
+      // shadow a vault skill because of the `pack:` prefix.
+      const vault = await listSkills(tag ? { tag } : undefined);
+      const packSkills = await listPackSkills(tag ? { tag } : undefined).catch(() => []);
+      const all = [...vault, ...packSkills];
       const skills = trigger
         ? all.filter((s) => s.trigger.toLowerCase().includes(trigger))
         : all;

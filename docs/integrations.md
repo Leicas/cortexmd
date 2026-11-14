@@ -4,7 +4,8 @@ cortexmd's behaviour in an agent is the sum of two things: **the MCP tools** (av
 any MCP client) and **the hook/instruction template** that makes the agent reach for them
 at the right moment. Claude Code gets the full template from `cortexmd init` or the plugin;
 every other client gets a ready-to-copy template under [`templates/`](../templates/) that
-encodes the same five rules:
+encodes the same rules (plus one optional rule, [guidance packs](./guidance-packs.md): call
+`guidance_search` before front-end / web-platform work when a pack is installed):
 
 1. **Session start** — `memory_wakeup(agentName, preset)` once (`tiny` after compaction).
 2. **Code in an indexed repo** — `code_file_outline` → `code_symbol_search` →

@@ -78,6 +78,12 @@ import { register as registerTeamDispatch } from './tools/team-dispatch.js';
 import { register as registerSkillsList } from './tools/skills-list.js';
 import { register as registerSkillsGet } from './tools/skills-get.js';
 
+// Guidance packs (third-party best-practice packs stored outside the vault)
+import { register as registerGuidanceSearch, GUIDANCE_DYNAMIC_TOOLS } from './tools/guidance-search.js';
+import { register as registerGuidanceGet } from './tools/guidance-get.js';
+import { register as registerGuidancePacks } from './tools/guidance-packs.js';
+import { hasInstalledPacks } from './lib/guidance-packs/store.js';
+
 // Code-nav tools (phase 1 + Wave 1 + Wave 2)
 import {
   registerCodeIndexRepo,
@@ -169,6 +175,10 @@ const allRegistrations: ReadonlyArray<(server: McpServer) => void> = [
   registerTeamDispatch,
   registerSkillsList,
   registerSkillsGet,
+  // Guidance packs
+  registerGuidanceSearch,
+  registerGuidanceGet,
+  registerGuidancePacks,
   // Code-nav tools (phase 1 + Wave 1 + Wave 2)
   registerCodeIndexRepo,
   registerCodeIngestRepo,
@@ -248,7 +258,12 @@ export function createServer(opts: CreateServerOptions = {}): McpServer {
   // can discover tools the profile does not advertise. The profile then only
   // trims `tools/list`; every tool stays callable (directly or via tool_invoke).
   snapshotTools(server);
-  applyToolProfile(server, profile, withSearchFetch ? SEARCH_FETCH_TOOL_NAMES : []);
+  // guidance_search / guidance_get join the advertised list only while at
+  // least one guidance pack is installed (checked per tools/list, cached 10 s);
+  // otherwise they stay reachable through tool_search + tool_invoke.
+  applyToolProfile(server, profile, withSearchFetch ? SEARCH_FETCH_TOOL_NAMES : [], async () =>
+    profile !== 'tiny' && profile !== 'nav' && (await hasInstalledPacks()) ? GUIDANCE_DYNAMIC_TOOLS : [],
+  );
 
   return server;
 }

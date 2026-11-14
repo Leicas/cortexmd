@@ -55,7 +55,9 @@ ENV APP_VERSION=$APP_VERSION \
 
 # Production deps need the toolchain to rebuild native addons, then it is
 # purged to keep the runtime image small. git stays for git-backed source
-# vaults (git+https:// transport); see docs/transports.md.
+# vaults (git+https:// transport) and guidance packs; see docs/transports.md.
+# ca-certificates is required: --no-install-recommends leaves it out, and
+# without it git cannot verify any https remote ("CAfile: none").
 RUN apt-get update \
   && apt-get install -y --no-install-recommends python3 make g++ git \
   && rm -rf /var/lib/apt/lists/*
@@ -64,7 +66,7 @@ RUN npm ci --omit=dev \
   && apt-get purge -y python3 make g++ \
   && apt-get autoremove -y \
   && apt-get update \
-  && apt-get install -y --no-install-recommends git \
+  && apt-get install -y --no-install-recommends git ca-certificates \
   && rm -rf /var/lib/apt/lists/*
 
 COPY --from=build /app/dist ./dist

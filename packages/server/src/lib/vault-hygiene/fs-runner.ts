@@ -15,6 +15,30 @@ import type { PlannedChange } from './model.js';
 
 const SKIP_DIRS = new Set(['node_modules']);
 
+/**
+ * Move a file. Union filesystems (mergerfs) and bind mounts return EXDEV when
+ * source and destination resolve to different underlying devices, even inside
+ * one vault; fall back to copy + verify + unlink so the move still happens.
+ */
+export async function moveFile(
+  src: string,
+  dest: string,
+  rename: (a: string, b: string) => Promise<void> = fs.rename,
+): Promise<void> {
+  try {
+    await rename(src, dest);
+  } catch (err: any) {
+    if (err?.code !== 'EXDEV') throw err;
+    await fs.copyFile(src, dest);
+    const [a, b] = await Promise.all([fs.readFile(src), fs.readFile(dest)]);
+    if (!a.equals(b)) {
+      await fs.rm(dest, { force: true });
+      throw new Error(`cross-device move verification failed for ${src}`);
+    }
+    await fs.unlink(src);
+  }
+}
+
 async function walk(root: string, rel = ''): Promise<string[]> {
   const out: string[] = [];
   const entries = await fs.readdir(path.join(root, rel), { withFileTypes: true });
@@ -120,7 +144,7 @@ export async function applyPlan(
     } else {
       const dest = path.join(vaultRoot, c.to!);
       await fs.mkdir(path.dirname(dest), { recursive: true });
-      await fs.rename(src, dest);
+      await moveFile(src, dest);
       if (c.newContent !== undefined) await fs.writeFile(dest, c.newContent, 'utf8');
       entry.sha256After = sha256(await fs.readFile(dest));
     }

@@ -99,8 +99,10 @@ export async function atomicWriteFile(
     await renameWithRetry(tmp, real, opts.renameAttempts ?? 6);
   } catch (err: any) {
     await unlink(tmp).catch(() => undefined);
-    if (opts.noFallback || !RETRYABLE.has(err?.code)) throw err;
-    // Last resort (Windows file held open): non-atomic in-place write.
+    // EXDEV: union filesystems (mergerfs) can place the temp file on a
+    // different underlying device than the target, so rename cannot work.
+    if (opts.noFallback || !(RETRYABLE.has(err?.code) || err?.code === 'EXDEV')) throw err;
+    // Last resort (Windows file held open, cross-device): non-atomic in-place write.
     await writeFile(real, data);
   }
 }

@@ -143,6 +143,10 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
   const search = await import('../lib/search.js');
   let t0 = Date.now();
   await search.rebuildIndex();
+  await search.whenLexicalIdle(); // shadow mode: wait for the background SQLite sync
+  const lexStatus = search.getLexicalBackendStatus();
+  log(`lexical backend: ${lexStatus.active}${lexStatus.degraded ? ` (DEGRADED: ${lexStatus.degraded})` : ''}` +
+    (lexStatus.lastSync ? `, sync ${lexStatus.lastSync.ms} ms (${lexStatus.lastSync.upserted} upserted)` : ''));
   const docMeta = search.getDocMeta();
   const nMemory = [...docMeta.values()].filter((m) => m.type === 'memory').length;
   log(`indexed ${docMeta.size} notes (${nMemory} type:memory) in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
@@ -228,6 +232,11 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
     else log('semantic arm skipped (embeddings not loaded)');
   }
 
+  // ── Lexical backend (shadow aggregates once the queued replays have run) ──
+  await search.whenLexicalIdle();
+  const lexicalBackend = search.getLexicalBackendStatus();
+  if (lexicalBackend.shadow) log(`shadow (MiniSearch vs SQLite, all arms): ${JSON.stringify(lexicalBackend.shadow)}`);
+
   // ── Vault write guard ──
   const touched = modifiedSince(args.vault, startedMs);
 
@@ -248,6 +257,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
     dataset: { path: args.dataset, files: ds.files, nTotal: ds.queries.length, n: queries.length, byCategory: byCat, warnings: ds.warnings },
     goldIssues: { missingRows, outOfScopeGold, outOfScopeByCategory: outOfScopeByCat, totalResolvedGold: totalGold },
     vaultWrites: touched,
+    lexicalBackend,
     arms: reports,
   };
   const outPath = path.join(resultsDir, `${args.label}.json`);

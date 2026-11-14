@@ -10,11 +10,13 @@ import { registerSseRoutes } from './routes/sse.js';
 import { registerActionRoutes } from './routes/actions.js';
 import { registerDataRoutes } from './routes/data.js';
 import { registerLabRoutes } from './routes/lab.js';
+import { registerGuidanceDashboardRoutes } from './routes/guidance.js';
 
 export const dashboardRouter = Router();
 
 registerActionRoutes(dashboardRouter);
 registerLabRoutes(dashboardRouter);
+registerGuidanceDashboardRoutes(dashboardRouter);
 registerDataRoutes(dashboardRouter);
 registerSseRoutes(dashboardRouter);
 registerPageRoutes(dashboardRouter);

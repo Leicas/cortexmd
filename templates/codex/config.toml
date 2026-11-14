@@ -45,6 +45,7 @@ enabled_tools = [
   "code_repo_list", "code_file_outline", "code_symbol_search", "code_symbol_get",
   "code_symbol_callers", "code_symbol_callees", "code_change_impact", "code_call_chain",
   "code_index_repo", "tool_search", "tool_invoke",
+  "guidance_search", "guidance_get",
 ]
 
 [features]

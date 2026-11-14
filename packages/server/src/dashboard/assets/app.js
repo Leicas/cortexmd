@@ -14,6 +14,7 @@ import code from './tabs/code.js';
 import logs from './tabs/logs.js';
 import memories from './tabs/memories.js';
 import lab from './tabs/lab.js';
+import guidance from './tabs/guidance.js';
 
-[overview, sessions, ratelimits, oauth, vault, retrieval, intelligence, graph, agents, code, logs, memories, lab].forEach(registerTab);
+[overview, sessions, ratelimits, oauth, vault, retrieval, intelligence, graph, agents, code, logs, memories, lab, guidance].forEach(registerTab);
 boot();

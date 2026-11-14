@@ -17,11 +17,12 @@ import { renderLogsTab } from './tabs/logs.js';
 import { renderOAuthTab } from './tabs/oauth.js';
 import { renderMemoriesTab } from './tabs/memories.js';
 import { renderLabTab } from './tabs/lab.js';
+import { renderGuidanceTab } from './tabs/guidance.js';
 
 export type TabId =
   | 'overview' | 'sessions' | 'ratelimits' | 'oauth' | 'vault'
   | 'retrieval' | 'intelligence' | 'graph' | 'agents' | 'code' | 'logs'
-  | 'memories' | 'lab';
+  | 'memories' | 'lab' | 'guidance';
 
 /** Visual cluster a tab belongs to (REVAMP.md §4). Does NOT affect the SSE/tab contract. */
 export type TabGroup = 'ops' | 'knowledge' | 'build';
@@ -50,6 +51,7 @@ export const TABS: readonly TabDef[] = [
   { id: 'graph',        label: 'Graph',          group: 'knowledge', render: renderGraphTab },
   { id: 'agents',       label: 'Agents',         group: 'build',     render: renderAgentsTab },
   { id: 'code',         label: 'Code',           group: 'build',     render: renderCodeTab },
+  { id: 'guidance',     label: 'Guidance Packs', group: 'build',     render: renderGuidanceTab },
 ] as const;
 
 /** Human label for each cluster caption, in render order. */

@@ -5,9 +5,9 @@
  * The markdown files stay the source of truth; this DB is a derived cache that
  * can be deleted at any time (it is rebuilt from the vault on the next sync).
  *
- * Layout (SCHEMA_VERSION 1):
+ * Layout (SCHEMA_VERSION 2):
  *   notes     one row per note: path, vault, mtime, content hash, filter columns,
- *             body, caller JSON `extra`
+ *             body, caller JSON `extra`, per-field lengths (see `Lens`)
  *   note_tags (tag, note_id) — tag filter
  *   f_title / f_content / f_tags   one contentless FTS5 table PER FIELD over
  *             PRE-ANALYSED text (the shared bilingual analyzer runs in JS, like
@@ -45,6 +45,7 @@ import {
   isFuzzyVocabTerm,
   maxEditDistance,
   paddedTrigrams,
+  SPACE_OR_PUNCTUATION,
 } from './lexical/analyzer.js';
 import { noteRecordFromMarkdown } from './lexical/record.js';
 import type {
@@ -59,7 +60,7 @@ import type {
   SyncStats,
 } from './lexical/types.js';
 
-export const LEXICAL_SCHEMA_VERSION = 1;
+export const LEXICAL_SCHEMA_VERSION = 2;
 
 /** MiniSearch defaults (`searchOptions.weights`, `bm25`) and today's field boosts. */
 const PREFIX_WEIGHT = 0.375;
@@ -70,8 +71,27 @@ const FIELDS = [
   { name: 'tags', boost: 2 },
 ] as const;
 type FieldName = (typeof FIELDS)[number]['name'];
-/** MiniSearch BM25+ `d`. */
+/** MiniSearch BM25+ `d`, `k`, `b` (its defaults). */
 const BM25_D = 0.5;
+const MS_K = 1.2;
+const MS_B = 0.7;
+/** FTS5 bm25() constants (k1, b). */
+const FTS_K1 = 1.2;
+const FTS_B = 0.75;
+/**
+ * Per-note field lengths: [0..2] = FTS5 token count (title, content, tags) —
+ * what FTS5's bm25() normalises by — and [3..5] = MiniSearch's field length,
+ * the number of UNIQUE raw tokens. MiniSearch's milder length normalisation is
+ * why it ranks long notes much higher; exact-term scores are re-normalised
+ * with these so both backends score a note alike (LEXICAL_SCHEMA_VERSION 2).
+ */
+type Lens = [number, number, number, number, number, number];
+const LEN_COLS = ['nt', 'nc', 'ng', 'ut', 'uc', 'ug'] as const;
+
+/** MiniSearch's field length: unique raw tokens of its default tokenizer. */
+function uniqueRawTokens(text: string): number {
+  return new Set(text.split(SPACE_OR_PUNCTUATION)).size;
+}
 
 export type AnalyzerMode =
   /** Shared JS analyzer (default): exact parity with MiniSearch's term stream. */
@@ -105,7 +125,7 @@ const PIECE = 64 * 1024;
 /** Pages of work per FTS5 'merge' step. */
 const MERGE_PAGES = 16;
 
-interface Analysed { title: string; content: string; tags: string }
+interface Analysed { title: string; content: string; tags: string; lens: Lens | null }
 type Prepared =
   | { kind: 'touch'; id: number; e: ListingEntry }
   | { kind: 'upsert'; rec: NoteRecord; an: Analysed; sig: { vault?: string; mtimeMs?: number; hash?: string } };
@@ -173,6 +193,9 @@ export class SqliteLexicalBackend implements LexicalBackend {
   private nDocs: number | undefined;
   /** Archived note ids (small) — lets unfiltered queries skip the notes join. */
   private readonly archivedIds = new Set<number>();
+  /** Field lengths per note id (see `Lens`) and their running sums. */
+  private readonly lens = new Map<number, Lens>();
+  private readonly lenSum: Lens = [0, 0, 0, 0, 0, 0];
   private ckptWorker: Worker | null = null;
   private ckptBusy = false;
   private s!: ReturnType<SqliteLexicalBackend['prepare']>;
@@ -181,15 +204,18 @@ export class SqliteLexicalBackend implements LexicalBackend {
     this.dbPath = opts.dbPath;
     const mode: AnalyzerMode = opts.analyzer ?? { kind: 'shared' };
     this.native = mode.kind === 'native';
+    // The indexed-body cap changes what is searchable, so it is part of the
+    // fingerprint: changing LEXICAL_MAX_INDEXED_KB rebuilds the DB on open.
+    const capId = `max${opts.maxIndexedChars ?? 256 * 1024}`;
     if (mode.kind === 'shared') {
       this.analyze = mode.analyze ?? bilingualAnalyzer;
       this.analyzed = mode.analyzed ?? true;
-      this.analyzerId = `shared:${mode.id ?? 'custom'}:${analyzerFingerprint(this.analyze)}`;
+      this.analyzerId = `shared:${mode.id ?? 'custom'}:${analyzerFingerprint(this.analyze)}:${capId}`;
     } else {
       // Query-side approximation of unicode61 (fold + split); FTS re-tokenizes anyway.
       this.analyze = (t) => foldText(t).split(/[^\p{L}\p{N}]+/u).filter(Boolean);
       this.analyzed = false;
-      this.analyzerId = mode.porter ? 'native:porter-unicode61-rd2' : 'native:unicode61-rd2';
+      this.analyzerId = `${mode.porter ? 'native:porter-unicode61-rd2' : 'native:unicode61-rd2'}:${capId}`;
     }
     this.sliceMs = opts.sliceMs ?? 25;
     this.storeBodies = opts.storeBodies ?? true;
@@ -217,6 +243,11 @@ export class SqliteLexicalBackend implements LexicalBackend {
     this.s = this.prepare();
     for (const r of this.db.prepare('SELECT id FROM notes WHERE archived = 1').all() as Array<{ id: number }>) {
       this.archivedIds.add(r.id);
+    }
+    if (!this.native) {
+      for (const r of this.db.prepare(`SELECT id, ${LEN_COLS.join(', ')} FROM notes`).raw().all() as number[][]) {
+        this.setLens(r[0], [r[1], r[2], r[3], r[4], r[5], r[6]]);
+      }
     }
     if (this.dbPath !== ':memory:') this.startCheckpointer();
   }
@@ -313,7 +344,8 @@ export class SqliteLexicalBackend implements LexicalBackend {
         importance  TEXT,
         archived    INTEGER NOT NULL DEFAULT 0,
         collection  TEXT,
-        extra       TEXT
+        extra       TEXT,
+        ${LEN_COLS.map((c) => `${c} INTEGER NOT NULL DEFAULT 0`).join(', ')}
       );
       CREATE INDEX notes_type ON notes(type);
       CREATE INDEX notes_category ON notes(category);
@@ -392,15 +424,15 @@ export class SqliteLexicalBackend implements LexicalBackend {
       byPath: db.prepare('SELECT id, hash FROM notes WHERE path = ?'),
       upsertNote: db.prepare(`
         INSERT INTO notes (path, vault, mtime, hash, title, body, date, type, category, temperature,
-                           heat_score, importance, archived, collection, extra)
+                           heat_score, importance, archived, collection, extra, ${LEN_COLS.join(', ')})
         VALUES (@path, @vault, @mtime, @hash, @title, @body, @date, @type, @category, @temperature,
-                @heat_score, @importance, @archived, @collection, @extra)
+                @heat_score, @importance, @archived, @collection, @extra, ${LEN_COLS.map((c) => '@' + c).join(', ')})
         ON CONFLICT(path) DO UPDATE SET
           vault = excluded.vault, mtime = excluded.mtime, hash = excluded.hash, title = excluded.title,
           body = excluded.body, date = excluded.date, type = excluded.type, category = excluded.category,
           temperature = excluded.temperature, heat_score = excluded.heat_score,
           importance = excluded.importance, archived = excluded.archived, collection = excluded.collection,
-          extra = excluded.extra
+          extra = excluded.extra, ${LEN_COLS.map((c) => `${c} = excluded.${c}`).join(', ')}
         RETURNING id`),
       touch: db.prepare('UPDATE notes SET mtime = ?, vault = ? WHERE id = ?'),
       delNote: db.prepare('DELETE FROM notes WHERE id = ?'),
@@ -430,6 +462,12 @@ export class SqliteLexicalBackend implements LexicalBackend {
     return this.analyze(s).map(encodeTerm).join(' ');
   }
 
+  /** Encoded FTS text + its token count (one FTS5 token per analysed term). */
+  private textN(s: string): { t: string; n: number } {
+    const terms = this.analyze(s);
+    return { t: terms.map(encodeTerm).join(' '), n: terms.length };
+  }
+
   /**
    * The part of the body that is indexed: the first `maxIndexedChars` (cut on
    * whitespace). Only multi-hundred-KB dumps/exports are affected; their FTS
@@ -443,7 +481,16 @@ export class SqliteLexicalBackend implements LexicalBackend {
   }
 
   private analyzeRecord(rec: NoteRecord): Analysed {
-    return { title: this.text(rec.title), content: this.text(this.indexedBody(rec.body)), tags: this.text(rec.tags.join(' ')) };
+    const body = this.indexedBody(rec.body);
+    const tags = rec.tags.join(' ');
+    if (this.native) return { title: rec.title, content: body, tags, lens: null };
+    const t = this.textN(rec.title);
+    const c = this.textN(body);
+    const g = this.textN(tags);
+    return {
+      title: t.t, content: c.t, tags: g.t,
+      lens: [t.n, c.n, g.n, uniqueRawTokens(rec.title), uniqueRawTokens(body), uniqueRawTokens(tags)],
+    };
   }
 
   /**
@@ -455,6 +502,8 @@ export class SqliteLexicalBackend implements LexicalBackend {
     const body = this.indexedBody(rec.body);
     if (this.native || body.length <= BIG_TEXT) return this.analyzeRecord(rec);
     const parts: string[] = [];
+    let nContent = 0;
+    const rawTokens = new Set<string>();
     let off = 0;
     while (off < body.length) {
       const start = performance.now();
@@ -463,13 +512,23 @@ export class SqliteLexicalBackend implements LexicalBackend {
         const ws = body.slice(off, end).search(/\s\S*$/);
         if (ws > 0) end = off + ws + 1;
       }
-      parts.push(this.text(body.slice(off, end)));
+      const piece = body.slice(off, end);
+      const a = this.textN(piece);
+      parts.push(a.t);
+      nContent += a.n;
+      for (const tok of piece.split(SPACE_OR_PUNCTUATION)) rawTokens.add(tok);
       off = end;
       const dur = performance.now() - start;
       noteSlice(st, dur);
       await yieldTick();
     }
-    return { title: this.text(rec.title), content: parts.filter(Boolean).join(' '), tags: this.text(rec.tags.join(' ')) };
+    const tags = rec.tags.join(' ');
+    const t = this.textN(rec.title);
+    const g = this.textN(tags);
+    return {
+      title: t.t, content: parts.filter(Boolean).join(' '), tags: g.t,
+      lens: [t.n, nContent, g.n, uniqueRawTokens(rec.title), rawTokens.size, uniqueRawTokens(tags)],
+    };
   }
 
   /** Upsert inside the caller's transaction. */
@@ -490,8 +549,11 @@ export class SqliteLexicalBackend implements LexicalBackend {
       archived: rec.archived === true ? 1 : 0,
       collection: rec.collection ?? null,
       extra: rec.extra === undefined ? null : JSON.stringify(rec.extra),
+      nt: an.lens?.[0] ?? 0, nc: an.lens?.[1] ?? 0, ng: an.lens?.[2] ?? 0,
+      ut: an.lens?.[3] ?? 0, uc: an.lens?.[4] ?? 0, ug: an.lens?.[5] ?? 0,
     }) as { id: number };
     const id = row.id;
+    this.setLens(id, an.lens);
     if (rec.archived === true) this.archivedIds.add(id);
     else this.archivedIds.delete(id);
     const texts = [an.title, an.content, an.tags];
@@ -529,7 +591,20 @@ export class SqliteLexicalBackend implements LexicalBackend {
     }
   }
 
+  /** Keep the in-memory field lengths + their sums (averages) in step with the rows. */
+  private setLens(id: number, lens: Lens | null): void {
+    const old = this.lens.get(id);
+    if (old) for (let i = 0; i < 6; i++) this.lenSum[i] -= old[i];
+    if (lens) {
+      this.lens.set(id, lens);
+      for (let i = 0; i < 6; i++) this.lenSum[i] += lens[i];
+    } else {
+      this.lens.delete(id);
+    }
+  }
+
   private removeRow(id: number): void {
+    this.setLens(id, null);
     this.archivedIds.delete(id);
     for (const st of this.s.delFts) st.run(id);
     this.nDocs = undefined;
@@ -881,8 +956,8 @@ export class SqliteLexicalBackend implements LexicalBackend {
     const fsql = noJoin ? null : fsql0;
     const params = noJoin ? [] : params0;
     const stmts = FIELDS.map((f) => this.groupStmt(f.name, fsql));
-    const fetch = (i: number, expr: string) => {
-      const rows = stmts[i].all(expr, ...params, dropArchived ? depth + this.archivedIds.size : depth) as Array<{ id: number; s: number }>;
+    const fetch = (i: number, expr: string, lim = depth) => {
+      const rows = stmts[i].all(expr, ...params, dropArchived ? lim + this.archivedIds.size : lim) as Array<{ id: number; s: number }>;
       return dropArchived ? rows.filter((r) => !this.archivedIds.has(r.id)) : rows;
     };
     const N = Math.max(1, this.docCount());
@@ -896,17 +971,35 @@ export class SqliteLexicalBackend implements LexicalBackend {
       e.score += score;
       if (!e.terms.includes(qt)) e.terms.push(qt);
     };
-    // Exact term: recover the tf part per field and re-score with MiniSearch BM25+.
+    // Exact term: every note containing it (FTS5 scores them all anyway to
+    // sort; a depth cut would drop long notes, which FTS5's length
+    // normalisation ranks far below MiniSearch). The term frequency is
+    // recovered from bm25() and re-scored with MiniSearch's BM25+ and its
+    // field length (unique raw tokens), so both backends score a note alike.
     const exact = (t: string) => {
       FIELDS.forEach((f, i) => {
         const n = this.fieldDf(i, t);
         if (n === 0 && !this.native) return;
-        const rows = fetch(i, `"${t.replace(/"/g, '""')}"`);
+        const rows = fetch(i, `"${t.replace(/"/g, '""')}"`, this.native ? depth : Math.max(depth, n));
         if (rows.length === 0) return;
         const nn = n || rows.length; // porter: query term ≠ stored stem → approximate
         const iF = idfFts(nn);
         const iM = idfMs(nn);
-        for (const r of rows) credit(r.id, f.boost * iM * (BM25_D + -r.s / iF), t);
+        const avgF = this.lenSum[i] / N;
+        const avgM = this.lenSum[3 + i] / N;
+        for (const r of rows) {
+          const tfPartF = -r.s / iF;
+          const L = this.lens.get(r.id);
+          if (!L || !(avgF > 0) || !(avgM > 0)) {
+            credit(r.id, f.boost * iM * (BM25_D + tfPartF), t);
+            continue;
+          }
+          // FTS5: tfPart = tf·(k1+1) / (tf + K), K = k1·(1 − b + b·dl/avgdl) → solve for tf.
+          const K = FTS_K1 * (1 - FTS_B + FTS_B * L[i] / avgF);
+          const tf = tfPartF >= FTS_K1 + 1 - 1e-9 ? 1e6 : Math.max(1, Math.round((tfPartF * K) / (FTS_K1 + 1 - tfPartF)));
+          const tfPartM = (tf * (MS_K + 1)) / (tf + MS_K * (1 - MS_B + MS_B * L[3 + i] / avgM));
+          credit(r.id, f.boost * iM * (BM25_D + tfPartM), t);
+        }
       });
     };
     // Expansion group: one OR query per field; FTS5 bm25 sums per-expansion

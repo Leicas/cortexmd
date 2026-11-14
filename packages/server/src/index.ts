@@ -20,7 +20,7 @@ import { apiKeyMiddleware, dashboardAuthMiddleware, isRequestAuthenticated, SESS
 import { getIndexState, getIndexProgress } from './lib/index-state.js';
 import { createBackup, backupCron, resolveBackupDir } from './lib/backup.js';
 import { mintDashboardSession } from './oauth.js';
-import { rebuildIndex, getIndexedNoteCount, getDocMeta, getVaultHealth, reindexSourceVaults, getIndexHealth } from './lib/search.js';
+import { rebuildIndex, getIndexedNoteCount, getDocMeta, getVaultHealth, reindexSourceVaults, getIndexHealth, getLexicalBackendStatus, closeLexicalBackend } from './lib/search.js';
 import * as searchLib from './lib/search.js';
 import {
   onSourceVaultsChanged,
@@ -72,6 +72,7 @@ import { forceFullRebuild } from './lib/search.js';
 import { kgRepair } from './lib/knowledge-graph.js';
 
 import { registerJob, stopAllJobs } from './lib/scheduler.js';
+import { registerGuidanceRoutes } from './lib/guidance-packs/rest.js';
 import { markActivity, getLastActivityAt, shouldFireIdleDream } from './lib/activity.js';
 import { refreshSourceVaults, sourceVaultTransports } from './lib/vault/registry.js';
 import { decayMemories, autoArchiveColdMemories } from './lib/memory-lifecycle.js';
@@ -509,9 +510,20 @@ app.get('/health', async (req, res) => {
       timeoutMs: config.sessionTimeoutMs,
     },
     lastIndexUpdate,
+    // Lexical backend (SEARCH_BACKEND): mode, fallback note, sync + shadow
+    // aggregates (never query text or paths).
+    searchBackend: safeLexicalStatus(),
     restarts: { lastExit: lastExitInfo },
   });
 });
+
+function safeLexicalStatus(): unknown {
+  try {
+    return getLexicalBackendStatus();
+  } catch {
+    return null;
+  }
+}
 
 // ── Dashboard login (Component A) — server-managed password + session cookie.
 // PUBLIC routes (no auth). On success we mint a short-lived signed JWT and
@@ -755,6 +767,10 @@ const handleApiWakeup = async (req: Request, res: Response): Promise<void> => {
 };
 app.get('/api/wakeup', apiKeyMiddleware, handleApiWakeup);
 app.post('/api/wakeup', apiKeyMiddleware, handleApiWakeup);
+
+// GET /api/guidance/search|get|packs + admin POST/DELETE /api/guidance/packs —
+// third-party guidance packs (lib/guidance-packs). Same auth as /api/recall.
+registerGuidanceRoutes(app, '/api/guidance', apiKeyMiddleware);
 
 // POST /api/store-memory — lightweight memory append for hook-driven capture.
 // Skips the heavy memory_store path (no preference extraction, no entity
@@ -2140,12 +2156,13 @@ function persistSessionsIfDirty(force = false): void {
 async function main(): Promise<void> {
   console.log('[cortexmd] Starting up...');
   console.log('[cortexmd] Vaults:', JSON.stringify(config.allVaults));
-  if (config.searchBackendRequested !== 'minisearch') {
-    logger.warn('SEARCH_BACKEND is not wired yet — continuing with the MiniSearch backend', {
+  if (config.searchBackendRequested !== config.searchBackend) {
+    logger.warn('Unknown SEARCH_BACKEND — using minisearch', {
       requested: config.searchBackendRequested,
-      active: config.searchBackend,
-      hint: 'sqlite / shadow are reserved for the rollout in docs/ARCHITECTURE.md §6; unset SEARCH_BACKEND to silence this warning',
+      expected: 'minisearch | shadow | sqlite',
     });
+  } else if (config.searchBackend !== 'minisearch') {
+    console.log('[cortexmd] Lexical backend:', config.searchBackend, `(${config.lexicalDbPath})`);
   }
   console.log('[cortexmd] UID:', process.getuid?.() ?? 'N/A', 'GID:', process.getgid?.() ?? 'N/A');
 
@@ -2323,6 +2340,17 @@ async function main(): Promise<void> {
     });
   }, config.indexRebuildIntervalMs);
   sessionCleanupInterval = setInterval(cleanupSessions, 60_000);
+
+  // Guidance packs with a `refresh` interval are re-synced by an hourly tick
+  // (no run at start: a pack fetch must never sit on the boot path).
+  registerJob({
+    name: 'guidance_packs_refresh',
+    intervalMs: 60 * 60 * 1000,
+    handler: async () => {
+      const { refreshDuePacks } = await import('./lib/guidance-packs/store.js');
+      await refreshDuePacks();
+    },
+  });
 
   // ── Source-vault refresh (git-pull transport) ─────────
   // Periodically re-pull source vaults so the next index rebuild sees upstream
@@ -2546,6 +2574,9 @@ async function main(): Promise<void> {
     if (isEmbeddingsReady()) {
       persistEmbeddingIndex();
     }
+
+    // Checkpoint + close the SQLite lexical DB (shadow / sqlite modes; no-op otherwise)
+    try { closeLexicalBackend(); } catch { /* ignore */ }
 
     // Persist session metadata for restoration after restart
     try { persistSessionsIfDirty(true); } catch { /* best-effort during shutdown */ }

@@ -259,6 +259,30 @@ cosine runs higher and 0.55–0.6 gives the same split:
 Four of the negatives are real topics that the snapshot happens not to hold;
 they match strongly and are not expected to abstain.
 
+### Held-out check — read this before quoting the numbers above
+
+The ranking parameters were tuned on the same labelled queries they are scored
+on, so those scores are optimistic. A second, independent set (122 queries on
+notes the tuning set never used, written without consulting the search engine)
+was run once against the released v1.21.1 code:
+
+| `memory_recall` (v1.21.1) | Tuning set (262) | Held-out set (122) |
+|---|---|---|
+| Recall@5 | 91.6% | 77.7% |
+| MRR | 0.884 | 0.700 |
+| Top-1 | 82.6% | 62.7% |
+| Noise in top 5 | 0.7% | 2.5% |
+| No-answer queries abstained | 7 / 20 | 0 / 12 |
+
+Weakest held-out categories: paraphrase (45.0% Recall@5; most of its gold notes
+are diaries and project notes rather than `type: memory`) and multi-hop
+(68.8%). The abstention floor did not generalise.
+
+Keep the two sets apart: tune on a dev set (`--dataset .realvault-eval/queries`)
+and report on the held-out one (`--dataset .realvault-eval/heldout`). Never
+adjust parameters against the held-out set; when it has been looked at too
+often, label a new one.
+
 ## Where this sits vs. the competition
 
 - **vs. iai-pme** — iai reports Rescue@10 = 1.000 driven by contradiction edges

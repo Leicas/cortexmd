@@ -40,8 +40,53 @@ export default {
     renderQuality(el, ctx, d);
     renderBitemporal(el, ctx, d);
     renderGraph(el, ctx, d);
+    renderLexicalBackend(ctx, d);
   },
 };
+
+// ── Lexical Backend (SEARCH_BACKEND) ─────────────────────────────────────────
+// Aggregates only: the server never sends shadow query text or paths.
+
+var LEX_MODE_LABEL = {
+  minisearch: 'MiniSearch (in memory) answers the lexical arm.',
+  shadow: 'MiniSearch answers; SQLite/FTS5 replays sampled queries after the response.',
+  sqlite: 'SQLite/FTS5 (on disk) answers the lexical arm.',
+};
+
+function renderLexicalBackend(ctx, d) {
+  var $ = ctx.$;
+  var lb = d.lexicalBackend;
+  if (!lb) return;
+  var degraded = !!lb.degraded;
+  setHtml($, 'lexModePill', degraded
+    ? pillHtml('warn', lb.requested + ' → minisearch')
+    : pillHtml(lb.active === 'minisearch' ? 'muted' : 'ok', lb.active));
+  var sub = LEX_MODE_LABEL[lb.active] || '';
+  if (lb.active !== 'minisearch') {
+    if (lb.docs != null) sub += ' ' + ctx.fmt.fmt(lb.docs) + ' notes';
+    if (lb.dbBytes != null) sub += ' · ' + (lb.dbBytes / 1048576).toFixed(1) + ' MB on disk';
+    if (lb.lastSync) sub += ' · last sync ' + ctx.fmt.fmtAgo(lb.lastSync.at) + ' (' + lb.lastSync.ms + ' ms, max slice ' + lb.lastSync.maxSliceMs + ' ms)';
+    else if (!lb.synced) sub += ' · first sync running';
+    if (lb.writeErrors) sub += ' · ' + lb.writeErrors + ' write errors';
+  }
+  setText($, 'lexBackendSub', sub);
+  var deg = $('lexDegraded');
+  if (deg) {
+    deg.style.display = degraded ? '' : 'none';
+    deg.textContent = degraded ? lb.degraded : '';
+  }
+  var sh = lb.shadow;
+  var box = $('lexShadow');
+  if (box) box.style.display = sh ? '' : 'none';
+  if (!sh) return;
+  setText($, 'lexOverlap', sh.queries ? PCT(sh.overlapAt10) : '—');
+  setText($, 'lexTop1', sh.queries ? PCT(sh.top1Agreement) : '—');
+  setText($, 'lexP95', sh.queries ? sh.primaryP95Ms.toFixed(1) + ' / ' + sh.shadowP95Ms.toFixed(1) + ' ms' : '—');
+  setText($, 'lexQueries', ctx.fmt.fmt(sh.queries));
+  setText($, 'lexShadowFoot', 'identical top-10 ' + PCT(sh.exactTop10) +
+    ' · p50 ' + sh.primaryP50Ms.toFixed(1) + ' / ' + sh.shadowP50Ms.toFixed(1) + ' ms' +
+    ' · max ' + sh.shadowMaxMs.toFixed(1) + ' ms · errors ' + sh.errors + ' · dropped ' + sh.dropped);
+}
 
 // ── shared bits ──────────────────────────────────────────────────────────────
 

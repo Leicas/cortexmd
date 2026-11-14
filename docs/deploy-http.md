@@ -193,6 +193,10 @@ SOURCE_VAULTS="notes=git+https://git.example.com/me/notes.git#main:Public/**"
 | `MAX_ACTIVE_SESSIONS` | no | Cap on live MCP sessions; the least-recently-active one is evicted first (default `200`, `0` disables). |
 | `MAX_PERSISTED_SESSIONS` | no | Max records kept in `sessions.json` (default `500`, newest first). `SESSION_RETENTION_MS` (default 7 d) ages the rest out. |
 | `MAX_REQUEST_SIZE` | no | JSON body limit (default `10mb`); oversized bodies get a `413 {"error":"Payload too large","limit":…}`. |
+| `SEARCH_BACKEND` | no | Lexical index: `minisearch` (default, in RAM), `shadow` (MiniSearch answers; an on-disk SQLite/FTS5 copy is synced in the background and sampled queries are replayed against it after the response — aggregates only), `sqlite` (SQLite answers the lexical arm; MiniSearch is not built). See [Lexical backend](#lexical-backend). |
+| `SEARCH_SHADOW_SAMPLE_RATE` / `SEARCH_SHADOW_MAX_PENDING` | no | `shadow` only: share of lexical queries replayed (default `0.25`) and max queued replays (default `2`; extra samples are dropped and counted). |
+| `LEXICAL_DB_PATH` | no | SQLite lexical DB (default `<DATA_DIR>/lexical.sqlite`). **Local disk only** (WAL does not work on NFS/SMB). Derived; safe to delete. |
+| `LEXICAL_MAX_INDEXED_KB` | no | Body KiB indexed per note (default `256`; the rest is stored, not searchable). Changing it rebuilds the DB on the next boot. |
 
 ### Health endpoint
 
@@ -215,11 +219,41 @@ or `Remote-User` when `PROXY_AUTH=true`) it returns the detail the dashboard
             "externalMb": 20, "pct": 30.3, "warnPct": 80, "warn": false },
   "sessions": { "active": 3, "persisted": 12, "maxActive": 200, "timeoutMs": 1800000 },
   "lastIndexUpdate": { "at": "…", "updated": 2, "removed": 0, "ms": 140, "collisions": 0 },
+  "searchBackend": { "requested": "shadow", "active": "shadow", "degraded": null, "synced": true,
+                     "docs": 4200, "dbBytes": 25000000, "writeErrors": 0,
+                     "lastSync": { "at": "…", "ms": 35, "listed": 4200, "upserted": 1, "removed": 0, "failed": 0, "maxSliceMs": 12.5 },
+                     "shadow": { "queries": 812, "overlapAt10": 0.93, "top1Agreement": 0.95, "exactTop10": 0.4,
+                                 "primaryP50Ms": 9, "primaryP95Ms": 24, "shadowP50Ms": 14, "shadowP95Ms": 40,
+                                 "shadowMaxMs": 90, "errors": 0, "dropped": 3, "since": "…" } },
   "restarts": { "lastExit": { "at": "…", "reason": "SIGTERM", "signal": "SIGTERM", "heapUsedMb": 300 } } }
 ```
 
 `heap.warn` turns true (and a `Heap usage high` warning is logged once) when the
 heap passes `HEAP_WARN_PCT` (default 80) % of the V8 heap limit.
+
+### Lexical backend
+
+`SEARCH_BACKEND` (details: [`ARCHITECTURE.md` §6](./ARCHITECTURE.md)):
+
+- **`minisearch`** (default) — the in-RAM index; nothing below applies.
+- **`shadow`** — a safe way to evaluate SQLite on your own vault. MiniSearch
+  keeps answering every query; the SQLite DB is built in the background (the
+  first build reads the whole vault once and takes longer than the MiniSearch
+  build; later boots only re-read changed files) and a sample of lexical queries
+  is replayed against it after the response. Cost: CPU for each replayed query
+  (SQLite is slower than MiniSearch at ~10k notes) plus the DB on disk. Read
+  `searchBackend.shadow` in `/health` or the dashboard Retrieval tab: top-10
+  overlap and top-1 agreement near 1 mean both backends rank alike; compare
+  `shadowP95Ms` with `primaryP95Ms` for the latency cost; `errors` should stay 0.
+- **`sqlite`** — SQLite answers the lexical arm and MiniSearch is not built, so
+  the heap drops by the size of the MiniSearch index. The boot waits for the
+  SQLite sync (long on the very first boot, about a second when the DB is warm).
+
+Keep `LEXICAL_DB_PATH` (default `DATA_DIR/lexical.sqlite`) on a **local disk**,
+never an NFS/SMB volume. If the DB cannot be opened the server logs one error,
+keeps serving MiniSearch and shows the reason in `searchBackend.degraded`.
+**Roll back** by unsetting `SEARCH_BACKEND` and restarting; deleting
+`lexical.sqlite*` is always safe (it is rebuilt from the vault).
 
 `restarts.lastExit` comes from `DATA_DIR/last-exit.json`, written on graceful
 shutdown and on `uncaughtException` / `unhandledRejection` (reason, message,

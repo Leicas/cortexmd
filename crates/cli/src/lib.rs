@@ -10,6 +10,7 @@ pub mod clients;
 pub mod hook_stats;
 pub mod contract;
 pub mod git;
+pub mod guidance;
 pub mod indexer;
 pub mod init;
 pub mod inspect;
@@ -95,6 +96,7 @@ fn dispatch(cli: Cli) -> Result<()> {
         Some(Command::Contract(args)) => contract::cmd_contract(args.command),
         Some(Command::Init(args)) => init::cmd_init(args),
         Some(Command::Wakeup(args)) => wakeup::cmd_wakeup(args),
+        Some(Command::Guidance(args)) => guidance::cmd_guidance(args),
         Some(Command::Mcp(args)) => bridge::cmd_mcp(args),
         None => run_index(cli.index),
     }

@@ -123,6 +123,10 @@ export interface RetrievalPayload {
       hop1: number; hop2: number; hop3: number;
     } | null;
   };
+
+  // ── lexical backend (Lexical Backend panel) — SEARCH_BACKEND mode, fallback
+  // note, last sync and shadow aggregates (never query text or paths) ──
+  lexicalBackend?: import('../lib/search.js').LexicalBackendStatus | null;
 }
 
 /**

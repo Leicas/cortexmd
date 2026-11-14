@@ -251,6 +251,14 @@ function envInt(name: string, fallback: number): number {
   const v = parseInt(process.env[name] ?? '', 10);
   return Number.isFinite(v) && v > 0 ? v : fallback;
 }
+/** SEARCH_BACKEND → mode; anything unknown falls back to minisearch (index.ts warns). */
+function parseSearchBackend(v: string | undefined): 'minisearch' | 'sqlite' | 'shadow' {
+  const s = (v ?? '').trim().toLowerCase();
+  return s === 'sqlite' || s === 'shadow' ? s : 'minisearch';
+}
+function clampUnit(v: number, fallback: number): number {
+  return Number.isFinite(v) ? Math.min(1, Math.max(0, v)) : fallback;
+}
 
 export const config = {
   port: parseInt(process.env.API_PORT ?? '3000', 10),
@@ -299,15 +307,21 @@ export const config = {
   dataDir: process.env.DATA_DIR ?? '/app/data',
 
   // ── Lexical index backend (lib/lexical-sqlite.ts, docs/ARCHITECTURE.md §6) ──
-  // ONLY 'minisearch' (in-RAM MiniSearch index + note bodies in docMeta) is
-  // active today. 'sqlite' (on-disk SQLite/FTS5) and 'shadow' (MiniSearch
-  // answers, SQLite runs alongside for rank-overlap logging) are RESERVED for
-  // the follow-up rollout documented in ARCHITECTURE.md §6: the backend
-  // exists and is tested, but search.ts does not use it yet. Setting either
-  // value logs one warning at boot (searchBackendRequested) and the server
-  // keeps running on MiniSearch.
-  searchBackend: 'minisearch' as 'minisearch' | 'sqlite' | 'shadow',
+  //   minisearch (default) in-RAM MiniSearch index + note bodies in docMeta.
+  //   shadow   MiniSearch answers every query; the SQLite backend is kept in
+  //            sync in the background and a sample of lexical queries is
+  //            replayed against it after the response to record aggregate
+  //            top-10 overlap / top-1 agreement / latency (/health, dashboard).
+  //   sqlite   SQLite/FTS5 answers the lexical arm; MiniSearch is not built
+  //            (docMeta still holds note bodies in this release).
+  // If the DB cannot be opened the server logs one error and serves MiniSearch
+  // (/health `searchBackend.degraded`). Unknown values → minisearch + warning.
+  searchBackend: parseSearchBackend(process.env.SEARCH_BACKEND),
   searchBackendRequested: (process.env.SEARCH_BACKEND ?? 'minisearch').trim().toLowerCase() || 'minisearch',
+  // shadow mode: share of lexical queries replayed against SQLite (0..1) and
+  // the max queued replays (excess samples are dropped and counted).
+  searchShadowSampleRate: clampUnit(parseFloat(process.env.SEARCH_SHADOW_SAMPLE_RATE ?? '0.25'), 0.25),
+  searchShadowMaxPending: Math.max(1, parseInt(process.env.SEARCH_SHADOW_MAX_PENDING ?? '2', 10) || 2),
   // Derived, deletable cache; rebuilt automatically on schema/analyzer change.
   // Keep it on a LOCAL disk: SQLite WAL needs shared memory (no NFS/SMB).
   lexicalDbPath: process.env.LEXICAL_DB_PATH

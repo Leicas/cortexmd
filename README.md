@@ -164,6 +164,7 @@ All off-by-default-friendly; none required for a working local install.
 | `ENABLE_EMBEDDINGS` | `true` | Semantic search. Set `false` for a lexical-only fast path (skips the first-run model download) on low-resource machines. |
 | `ENABLE_RERANKER` | `false` | Optional LLM reranker; no default host/model. |
 | `DREAM_SCHEDULE` | (empty) | Cron expression for memory "dream" consolidation. |
+| `GUIDANCE_PACKS` | (empty) | Guidance packs: serve curated third-party best-practice packs (e.g. [modern-web-guidance](https://github.com/GoogleChrome/modern-web-guidance)) through `guidance_search` / `guidance_get`, stored outside the vault. See [`docs/guidance-packs.md`](./docs/guidance-packs.md). |
 
 See [`packages/server/.env.example`](./packages/server/.env.example) for the
 authoritative list.
@@ -186,6 +187,7 @@ optional forward-auth), reverse-proxy setup, and `SOURCE_VAULTS` over git-pull.
 ## Docs
 
 - [`docs/workers.md`](./docs/workers.md) — optional smaller-model investigators with scoped read-only tools, evidence and budgets
+- [`docs/guidance-packs.md`](./docs/guidance-packs.md) — guidance packs: third-party best-practice packs served next to personal memory
 
 - [`docs/deploy-local.md`](./docs/deploy-local.md) — local-stdio quickstart (start here)
 - [`docs/deploy-http.md`](./docs/deploy-http.md) — self-hosted HTTP (advanced / team)
